@@ -1,0 +1,23 @@
+# Игнорировать папку .venv
+.venv/
+
+# Игнорировать папку .idea
+.idea/
+
+# Игнорировать все файлы с расширением .iml (файлы конфигурации IntelliJ IDEA)
+*.iml
+
+# Игнорировать файлы конфигурации IDE
+*.swp
+*.swo
+*.log
+*.pyc
+*.pyo
+*.pyd
+*.db
+
+dist/main_wavelets/_internal/
+
+
+dist/main_wavelets/__pycache__/
+
