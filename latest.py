@@ -1,20 +1,22 @@
 import datetime
+import math
 import os
 import time
 import tkinter as tk
+from multiprocessing import Pool, freeze_support
 from tkinter import filedialog
+from tkinter import messagebox as mb
+
+import customtkinter as ctk
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
-from Gram_Shmidt import change_channels
 from numba import jit
-import math
-import sys
-from tkinter import messagebox as mb
-import matplotlib.pyplot as plt
-import customtkinter as ctk
-from multiprocessing import Pool, freeze_support
-from clusterization import clusterization, find_centroids, graphic_clusters, graphic_graph
+
+import points
+from Gram_Shmidt import change_channels
+from image_cropper_app import run_cropper
 from pipette import pipette
 
 
@@ -63,11 +65,13 @@ class ImageProcessor:
     def __init__(self):
         self.image_path = ""
         self.folder_path = ""
+        self.original_image = None
         self.data = []
         self.data_copy = []
         self.num_scale = 0
         self.scales = np.array([])
         self.result = []
+        self.current_image_path = None
 
     @staticmethod
     def convert_to_png(image_file_path):
@@ -82,19 +86,15 @@ class ImageProcessor:
             print(f"Error: {e}")
             return None
 
-    def load_image(self):
-        filetypes = (("Image files", "*.jpeg *.jpg *.png *.bmp *.gif"), ("All files", "*.*"))
-        filename = tk.filedialog.askopenfilename(
-            title="Open an image file",
-            initialdir="/",
-            filetypes=filetypes)
-
+    def load_image(self, master_window=None):  # Добавьте параметр master_window
+        filename = run_cropper(master_window)  # Передаем корневое окно
         if filename:
             self.image_path = self.convert_to_png(filename)
             if self.image_path:
                 print('Selected image file converted to:', self.image_path)
                 # split image channels to rgb
                 image = cv2.imread(self.image_path)
+                self.original_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 b, g, r = cv2.split(image)
                 self.data = [r, g, b]
                 self.data_copy = self.data
@@ -120,13 +120,13 @@ class ImageProcessor:
                 print(f"Saved to file: {file_path}")
 
     def gram_shmidt_transform(self):
-        # with open("color_tone.txt", 'r') as file:
-            # content = file.readlines()
-            # color1 = np.array(content[0].strip('\n').split(' '), dtype=np.int16)
-            # color2 = np.array(content[1].strip('\n').split(' '), dtype=np.int16)
+        with open("color_tone.txt", 'r') as file:
+            content = file.readlines()
+            color1 = np.array(content[0].strip('\n').split(' '), dtype=np.int16)
+            color2 = np.array(content[1].strip('\n').split(' '), dtype=np.int16)
 
-        color1 = np.array([54, 28, 99], dtype=np.int16)  # blue
-        color2 = np.array([150, 122, 147], dtype=np.int16)  # pink
+        # color1 = np.array([54, 28, 99], dtype=np.int16)  # blue
+        # color2 = np.array([150, 122, 147], dtype=np.int16)  # pink
         self.data = change_channels(color1, color2, self.data)
         print("Использовано преобразование Грамма-Шмидта")
 
@@ -148,7 +148,8 @@ class ImageProcessor:
         return scale_folder_path
 
     def wavelets(self, type_data, data_3_channel):
-        """ type_data - флажок для транспонирования матриц (0 - построчно, 1 - транспонированный по столбцам) """
+        """ type_data - флажок для транспонирования матриц
+        (0 - построчно, 1 - транспонированный по столбцам) """
         t_compute_wavelet_start = time.time()
 
         if type_data == 0:
@@ -221,7 +222,7 @@ class ImageProcessor:
 
                 if info_out == 0 or info_out == 1:  # Сохранение графиков при 0 и 1
                     plt.figure()
-                    plt.imshow(array_2d, cmap='binary')
+                    plt.imshow(array_2d, cmap='grey')
                     plt.title(f'Wavelets: Scale = {self.scales[scale]}, Channel = {colors[channel]}')
                     plt.colorbar()
                     plt.savefig(os.path.join(scale_folder_path,
@@ -235,9 +236,8 @@ class ImageProcessor:
         print(f"Папка '{folder_name}' создана в папке 'Загрузки'.")
         print(f"Путь к папке: {self.folder_path}")
 
-
     @staticmethod
-    def find_extremes(coefs, row_var, col_var, min_var, max_var):
+    def find_extremes(coefs, row_var, col_var, max_var, min_var):
         points_max_by_row = []
         points_min_by_row = []
         points_max_by_column = []
@@ -273,47 +273,47 @@ class ImageProcessor:
                     points_min_by_column.append(min_indices)
         return points_max_by_row, points_max_by_column, points_min_by_row, points_min_by_column
 
-    def compute_points(self, row_var, col_var, max_var, min_var):
+
+    def compute_points(self, row_var, col_var, max_var, min_var, knn_var):
         extremes = []
         for type_data in range(2):
             for channel in range(3):
                 for scale in range(self.num_scale):
                     pmaxr, pmaxc, pminr, pminc = self.find_extremes(
                         self.result[type_data][channel][scale], row_var, col_var, max_var, min_var)
-                    extremes.append({
+                    small_extremes = {
+                        'type_data': type_data,
+                        'channel': channel,
+                        'scale': self.scales[scale],
                         'max_by_row': pmaxr,
                         'max_by_column': pmaxc,
                         'min_by_row': pminr,
                         'min_by_column': pminc
-                    })
+                    }
+
+                    extremes.append(small_extremes)
                     colors = ['Красный', 'Зелёный', 'Синий']
                     if type_data == 0:
                         type_matrix_str = "Str_"
                     else:
-                        type_matrix_str = "Transpose_"
+                        type_matrix_str = "Tr_"
 
                     titles = [f"{type_matrix_str}_Точки_максимума_по_строкам_масштаб_{self.scales[scale]}_{colors[channel]}",
-                              f"{type_matrix_str}_Точки_максимума_по_cтолбцам_масштаб_{self.scales[scale]}_{colors[channel]}_",
+                              f"{type_matrix_str}_Точки_максимума_по_cтолбцам_масштаб_{self.scales[scale]}_{colors[channel]}",
                               f"{type_matrix_str}_Точки_минимума_по_строкам_масштаб_{self.scales[scale]}_{colors[channel]}",
                               f"{type_matrix_str}_Точки_минимума_по_cтолбцам_масштаб_{self.scales[scale]}_{colors[channel]}"]
 
                     i = 0
+                    scale_folder = self.find_scale_folder(self.scales[scale])
                     for p in [pmaxr, pmaxc, pminr, pminc]:
-                        p = np.array(p)
-                        scale_folder = self.find_scale_folder(self.scales[scale])
-                        print(f"Project_dir:{self.folder_path}")
-                        print(scale_folder)
                         self.graphic(scale_folder, titles[i], p)
-                        pred, clusters_length = clusterization(data=p, eps=45)
-                        centroids_ = find_centroids(p, pred, clusters_length)
-                        graphic_clusters(scale_folder, titles[i], p, pred, centroids_)
-                        graphic_graph(scale_folder, titles[i], self.result[type_data][channel][scale], centroids_)
                         i += 1
+                    points.process_extremes_with_knn(small_extremes, scale_folder, knn_var, self.original_image)
         return extremes
 
     @staticmethod
-    def graphic(path, title, points):
-        data = np.array(points)
+    def graphic(path, title, points_local):
+        data = np.array(points_local)
         x = data[:, 0]
         y = data[:, 1]
         plt.figure(figsize=(7, 8))
@@ -322,6 +322,7 @@ class ImageProcessor:
         plt.gca().invert_yaxis()
         name = path + title + '.png'
         plt.savefig(name)
+        print(f"File {name} saved.")
         plt.close()
         return
 
@@ -334,7 +335,7 @@ class ImageProcessor:
             print(f"Directory {scale_folder_path} is not found")
             return None
 
-    def compute(self, wp_var1, wp_var2, print_channels_txt_var, row_var, col_var, max_var, min_var, p_ex_var1, p_ex_var2):
+    def compute(self, wp_var1, wp_var2, print_channels_txt_var, row_var, col_var, max_var, min_var, p_ex_var1, p_ex_var2, k_neighbors=5):
         current_date = datetime.datetime.now()
         date_str = current_date.strftime("%d_%m_%Y_%H_%M_%S")
         folder_name = f"Вейвлет_преобразования_{date_str}"
@@ -350,24 +351,20 @@ class ImageProcessor:
             self.compute_wavelets(11)
 
         if (p_ex_var1.get() is True) and (p_ex_var2.get() is True):
-            self.compute_points(row_var, col_var, max_var, min_var)
-
-        mb.showinfo(title="Информация", message="Вычисления выполнены успешно. \n"
-                                                "Все файлы сохранены в папку: \n" + self.folder_path + ".")
-        sys.exit(0)
+            self.compute_points(row_var, col_var, max_var, min_var, k_neighbors)
 
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.geometry("950x750")
+        self.geometry("1000x800")
         self.title("Wavelets and other")
         self.resizable(False, False)
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
         self.image_processor = ImageProcessor()
 
-        self.label_load = ctk.CTkLabel(self, text="Загрузить изображение")
+        self.label_load = ctk.CTkLabel(self, text="Загрузить и изменить изображение")
         self.label_load.grid(row=0, column=0, padx=20, sticky="w")
         self.label_load.configure(font=ctk.CTkFont(size=14, weight="bold"))
         self.load_button = ctk.CTkButton(self, text="Загрузить",
@@ -435,15 +432,12 @@ class App(ctk.CTk):
         self.max_checkbox.grid(row=16, column=1, padx=20, sticky="w")
         self.min_checkbox = ctk.CTkCheckBox(self, text="Минимум", variable=self.min_var, onvalue=True, offvalue=False)
         self.min_checkbox.grid(row=17, column=1, padx=20, sticky="w")
-        self.plane_checkbox = ctk.CTkCheckBox(self, text="По плоскости", variable=self.plane_var, onvalue=True,
-                                              offvalue=False)
-        self.plane_checkbox.grid(row=18, column=0, padx=20, pady=20, sticky="w")
 
-        self.num_near_point = ctk.CTkLabel(self, text="Введите количество ближайших точек")
+        self.num_near_point = ctk.CTkLabel(self, text="Количество ближайших точек")
         self.num_near_point.grid(row=19, column=0, padx=20, pady=10, sticky="w")
-        self.entry_var = tk.StringVar()
-        self.entry_var.set("n (ex. 5)")
-        self.entry_near_point = ctk.CTkEntry(self, textvariable=self.entry_var)
+        self.knn_text_var = tk.StringVar()
+        self.knn_text_var.set("n (ex. 5)")
+        self.entry_near_point = ctk.CTkEntry(self, textvariable=self.knn_text_var)
         self.entry_near_point.grid(row=19, column=1, sticky="w")
         self.entry_near_point.configure(text_color="gray")
         self.entry_near_point.bind("<Button-1>", self.on_entry_click)
@@ -470,21 +464,21 @@ class App(ctk.CTk):
 
         self.p_ex_label = ctk.CTkLabel(self, text="Точки экстремума:")
         self.p_ex_label.grid(row=5, column=3, padx=20, sticky="w")
-        self.p_ex1_checkbox = ctk.CTkCheckBox(self, text="В виде .txt файла (по 1 .txt на каждый масштаб)",
+        self.p_ex1_checkbox = ctk.CTkCheckBox(self, text="Вывести текстовым файлом",
                                               variable=self.p_ex_var1)
         self.p_ex1_checkbox.grid(row=6, column=3, padx=40, sticky="w")
-        self.p_ex2_checkbox = ctk.CTkCheckBox(self, text="В виде изображений (по 1 .jpg на каждый масштаб)",
+        self.p_ex2_checkbox = ctk.CTkCheckBox(self, text="Вывести изображением",
                                               variable=self.p_ex_var2)
         self.p_ex2_checkbox.grid(row=7, column=3, padx=40, sticky="w")
 
-        self.dist_angle_label = ctk.CTkLabel(self, text="Алгоритм нахождения расстояний и углов")
+        self.dist_angle_label = ctk.CTkLabel(self, text="Расчет k-ближайших соседей точек экстремумов")
         self.dist_angle_label.grid(row=8, column=3, padx=20, sticky="w")
-        self.dist_angle_checkbox = ctk.CTkCheckBox(self, text="В виде .txt файла (по 1 .txt на каждый масштаб)",
+        self.dist_angle_checkbox = ctk.CTkCheckBox(self, text="Вывести текстовым файлом",
                                                    variable=self.dist_angle_var)
         self.dist_angle_checkbox.grid(row=9, column=3, padx=40, sticky="w")
 
-        self.dist_angle_label = ctk.CTkLabel(self, text="Промежуточные вычисления")
-        self.dist_angle_label.grid(row=10, column=3, padx=20, sticky="w")
+        self.image_channel_label = ctk.CTkLabel(self, text="Промежуточные вычисления")
+        self.image_channel_label.grid(row=10, column=3, padx=20, sticky="w")
         self.print_channels_txt_var = tk.BooleanVar(value=False)
         self.print_channels_txt_checkbox = ctk.CTkCheckBox(self,
                                                            text="Исходные матрицы каналов rgb виде текстового файла",
@@ -496,7 +490,7 @@ class App(ctk.CTk):
         self.app_start_button.configure(width=200, height=50, border_width=3, border_color="black")
 
     def load_image_callback(self):
-        if self.image_processor.load_image():
+        if self.image_processor.load_image(self):  # Передаем self (корневое окно) как master_window
             self.load_button.configure(text="Загружено", text_color="black", fg_color="white", border_color="black",
                                        border_width=2)
             text = "Выбранный файл:\n" + self.image_processor.image_path
@@ -546,19 +540,70 @@ class App(ctk.CTk):
         self.button_save_scales.configure(text="Сохранено", text_color="black", fg_color="white", border_color="black",
                                           border_width=2)
 
-    def on_entry_click(self):
+    def on_entry_click(self, event=None):
         self.entry_near_point.delete(0, ctk.END)
+        self.entry_near_point.configure(text_color="black")
 
     def compute(self):
+        timer = time.time()
         # Сбор параметров для передачи в метод compute()
         wp_var1 = self.wp_var1
         wp_var2 = self.wp_var2
         print_channels_txt_var = self.print_channels_txt_var.get()
         p_ex_var1 = self.p_ex_var1
         p_ex_var2 = self.p_ex_var2
-        self.image_processor.compute(wp_var1, wp_var2, print_channels_txt_var,
-                                     self.row_var, self.col_var, self.max_var, self.min_var, p_ex_var1, p_ex_var2)
+        k = int(self.knn_text_var.get()) if self.knn_text_var.get().isdigit() else 5
 
+        try:
+            self.image_processor.compute(wp_var1, wp_var2, print_channels_txt_var,
+                                         self.row_var, self.col_var, self.max_var, self.min_var,
+                                         p_ex_var1, p_ex_var2, k_neighbors=k)
+
+            msg_box = tk.Toplevel()
+            msg_box.title("Вычисления завершены")
+            msg_box.geometry("500x500")
+            msg_box.resizable(False, False)
+
+            # Центрируем окно относительно главного окна
+            x = self.winfo_x() + (self.winfo_width() // 2) - 200
+            y = self.winfo_y() + (self.winfo_height() // 2) - 75
+            msg_box.geometry(f"+{x}+{y}")
+
+            # Текст сообщения
+            label = ctk.CTkLabel(msg_box,
+                                 text=f"Вычисления выполнены успешно."
+                                      f"\nВсе файлы сохранены в папку:"
+                                      f"\n{self.image_processor.folder_path}"
+                                      f"\nПотрачено времени: {format_time(time.time()-timer)}"
+                                 )
+            label.pack(pady=10)
+
+            button_frame = ctk.CTkFrame(msg_box)
+            button_frame.pack(pady=10)
+
+            restart_btn = ctk.CTkButton(button_frame, text="Перезапустить",
+                                        command=lambda: [msg_box.destroy(), self.restart_app()])
+            restart_btn.pack(side=tk.LEFT, padx=10)
+
+            close_btn = ctk.CTkButton(button_frame, text="Закрыть",
+                                      command=lambda: [msg_box.destroy(), self.destroy()])
+            close_btn.pack(side=tk.LEFT, padx=10)
+
+        except Exception as e:
+            mb.showerror("Ошибка", f"Произошла ошибка:\n{str(e)}")
+
+    def restart_app(self):
+        """Перезапуск приложения"""
+        self.destroy()
+        # Создаем новое окно приложения
+        new_app = App()
+        new_app.mainloop()
+
+def format_time(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = int(seconds % 60)
+    return f"{hours} ч {minutes:02d} м {seconds:02d} с"
 
 if __name__ == '__main__':
     freeze_support()  # for multiprocess
