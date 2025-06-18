@@ -1,4 +1,5 @@
 import customtkinter as ctk
+import tkinter as tk
 from tkinter import filedialog
 from PIL import Image, ImageTk
 import cv2
@@ -8,17 +9,14 @@ import os
 global drawing, points, img, img_copy
 
 
-class ImageCropperApp(ctk.CTkToplevel):  # Изменяем наследование на CTkToplevel
+class ImageCropperApp(ctk.CTkToplevel):
     def __init__(self, master=None):
         super().__init__(master)
         self.title("Advanced Image Cropper")
         self.geometry("1000x700")
-
-        # Блокируем взаимодействие с родительским окном
         self.grab_set()
         self.focus_set()
 
-        # Переменные состояния
         self.image = None
         self.original_image = None
         self.tk_image = None
@@ -26,9 +24,6 @@ class ImageCropperApp(ctk.CTkToplevel):  # Изменяем наследован
         self.rect_coords = None
         self.rect_id = None
 
-        self.create_widgets()
-
-    def create_widgets(self):
         self.main_frame = ctk.CTkFrame(self)
         self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -94,7 +89,6 @@ class ImageCropperApp(ctk.CTkToplevel):  # Изменяем наследован
         img = cv2.imread(image_path)
         img_copy = img.copy()
 
-        # Создаем панель для инструкций
         instruction_panel = np.zeros((60, img.shape[1], 3), dtype=np.uint8)
         instructions = [
             "Instructions:",
@@ -153,14 +147,13 @@ class ImageCropperApp(ctk.CTkToplevel):  # Изменяем наследован
                     pts = np.array([points], dtype=np.int32)
                     cv2.fillPoly(mask, pts, 255)
 
-                    # Создаем белый фон
-                    white_bg = np.ones_like(img) * 255
+                    # создаем черный фон
+                    black_bg = np.zeros_like(img)
 
-                    # Копируем только выбранную область
-                    result = white_bg.copy()
+                    # копируем только выбранную область
+                    result = black_bg.copy()
                     result[mask == 255] = img[mask == 255]
 
-                    # Конвертируем обратно в PIL Image
                     self.image = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
                     self.update_canvas()
                     self.btn_save.configure(state="normal")
@@ -171,7 +164,7 @@ class ImageCropperApp(ctk.CTkToplevel):  # Изменяем наследован
             elif key == ord("r"):  # Сбросить контур
                 points.clear()
                 img_copy = img.copy()
-                img_copy = np.vstack([img_copy, instruction_panel])  # Добавляем инструкции
+                img_copy = np.vstack([img_copy, instruction_panel])
                 cv2.imshow("Polygon Cropper", img_copy)
                 print("Контур сброшен")
 
@@ -194,6 +187,7 @@ class ImageCropperApp(ctk.CTkToplevel):  # Изменяем наследован
             self.btn_rect_crop.configure(state="normal")
             self.btn_poly_crop.configure(state="normal")
             self.btn_reset.configure(state="normal")
+            self.btn_save.configure(state="normal")
         except Exception as e:
             print(f"Error loading image: {e}")
 
@@ -240,9 +234,9 @@ class ImageCropperApp(ctk.CTkToplevel):  # Изменяем наследован
         if not self.image or not self.rect_id:
             return
 
-        # Проверяем, что область выделения достаточно большая
+        # проверяем, что область выделения достаточно большая
         if abs(self.rect_coords[2] - self.rect_coords[0]) > 10 and abs(self.rect_coords[3] - self.rect_coords[1]) > 10:
-            # Применяем обрезку сразу после выделения
+            # применяем обрезку сразу после выделения
             self.apply_rectangle_crop()
 
     def apply_rectangle_crop(self):
@@ -285,34 +279,29 @@ class ImageCropperApp(ctk.CTkToplevel):  # Изменяем наследован
                 self.image.save(file_path)
                 with open("image_paths.txt", "w") as f:
                     f.write(file_path)
-                self.destroy()  # Закрываем окно обрезки
+                self.destroy()
                 return file_path
             except Exception as e:
                 print(f"Error saving image: {e}")
                 return None
 
     def get_cropped_filename(self):
-        """ Добавление 'cropped_image' перед расширением"""
         if hasattr(self, 'original_file_path'):
             path, ext = os.path.splitext(self.original_file_path)
             return f"{path}_cropped_image{ext}"
 
 
 def run_cropper(master=None):
-    if master is None:
-        import tkinter as tk
-        root = tk.Tk()
-        root.withdraw()
-        cropper_window = ImageCropperApp(root)
-    else:
-        cropper_window = ImageCropperApp(master)
-
-    # Ждем, пока окно не закроется
-    cropper_window.wait_window()
-
-    # После закрытия окна читаем путь из файла
     try:
-        with open("image_paths.txt", "r") as f:
-            return f.readline().strip('\n')
-    except FileNotFoundError:
+        if master is None:
+            root = tk.Tk()
+            root.withdraw()
+            cropper_window = ImageCropperApp(root)
+        else:
+            cropper_window = ImageCropperApp(master)
+
+        cropper_window.wait_window()
+        return cropper_window.save_and_exit()
+    except Exception as e:
+        print(f"Error saving image: {e}")
         return None

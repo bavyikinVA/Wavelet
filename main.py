@@ -6,7 +6,6 @@ import tkinter as tk
 from multiprocessing import Pool, freeze_support
 from tkinter import filedialog
 from tkinter import messagebox as mb
-
 import customtkinter as ctk
 import cv2
 import matplotlib.pyplot as plt
@@ -15,9 +14,10 @@ from PIL import Image
 from numba import jit
 
 import points
+import interpol
 from Gram_Shmidt import change_channels
 from image_cropper_app import run_cropper
-from pipette import pipette
+from pipette import run_pipette
 
 
 # Morlet wavelet transform functions
@@ -72,6 +72,8 @@ class ImageProcessor:
         self.scales = np.array([])
         self.result = []
         self.current_image_path = None
+        self.color1 = []
+        self.color2 = []
 
     @staticmethod
     def convert_to_png(image_file_path):
@@ -86,8 +88,8 @@ class ImageProcessor:
             print(f"Error: {e}")
             return None
 
-    def load_image(self, master_window=None):  # Добавьте параметр master_window
-        filename = run_cropper(master_window)  # Передаем корневое окно
+    def load_image(self, master_window=None):
+        filename = run_cropper(master_window)
         if filename:
             self.image_path = self.convert_to_png(filename)
             if self.image_path:
@@ -107,7 +109,7 @@ class ImageProcessor:
             return False
 
     def pipette_channel(self):
-        pipette(self.image_path)
+        self.color1, self.color2 = run_pipette(master=None, image_path=self.image_path)
 
     def save_orig_channels_txt(self, print_channels_txt):
         if print_channels_txt:
@@ -120,14 +122,7 @@ class ImageProcessor:
                 print(f"Saved to file: {file_path}")
 
     def gram_shmidt_transform(self):
-        with open("color_tone.txt", 'r') as file:
-            content = file.readlines()
-            color1 = np.array(content[0].strip('\n').split(' '), dtype=np.int16)
-            color2 = np.array(content[1].strip('\n').split(' '), dtype=np.int16)
-
-        # color1 = np.array([54, 28, 99], dtype=np.int16)  # blue
-        # color2 = np.array([150, 122, 147], dtype=np.int16)  # pink
-        self.data = change_channels(color1, color2, self.data)
+        self.data = change_channels(self.color1, self.color2, self.data)
         print("Использовано преобразование Грамма-Шмидта")
 
     def load_scales(self, start, end, step):
@@ -217,16 +212,17 @@ class ImageProcessor:
                 if info_out == 0 or info_out == 10:  # Сохранение текстовых файлов при 0 и 10
                     filename = f"Расчет_вейвлетов_{type_matrix_str}_Масштаб_{self.scales[scale]}_{colors[channel]}.txt"
                     file_path = os.path.join(scale_folder_path, filename)
-                    np.savetxt(file_path, array_2d, fmt='%.15f', delimiter=",")
+                    np.savetxt(file_path, array_2d, fmt='%.3f', delimiter=",")
                     print(f"Сохранено в файл: {file_path}")
 
                 if info_out == 0 or info_out == 1:  # Сохранение графиков при 0 и 1
                     plt.figure()
-                    plt.imshow(array_2d, cmap='grey')
+                    plt.imshow(array_2d, cmap='viridis')
                     plt.title(f'Wavelets: Scale = {self.scales[scale]}, Channel = {colors[channel]}')
                     plt.colorbar()
                     plt.savefig(os.path.join(scale_folder_path,
-                                             f'График_расчетов_В_П_{type_matrix_str}_Масштаб_{self.scales[scale]}_{colors[channel]}.png'))
+                                f'График_расчетов_В_П_{type_matrix_str}_Масштаб_{self.scales[scale]}_{colors[channel]}.png'),
+                                dpi=300, bbox_inches='tight')
                     plt.close()
 
     def create_downloads_folder(self, folder_name):
@@ -237,94 +233,186 @@ class ImageProcessor:
         print(f"Путь к папке: {self.folder_path}")
 
     @staticmethod
-    def find_extremes(coefs, row_var, col_var, max_var, min_var):
+    def delete_edge_points(coefs_2d, scale, type_wavelet):
+        wavelet_length = 7 * scale
+        rows, cols = coefs_2d.shape
+
+        mask = np.ones((rows, cols), dtype=np.float32)
+        if type_wavelet == 0:
+            # обнуление краевых зон по горизонтали (столбцы слева и справа)
+            if int(wavelet_length) < cols // 2:
+                mask[:, :int(wavelet_length)] = 0  # Левый край
+                mask[:, cols - int(wavelet_length):] = 0  # Правый край
+
+        # обнуление краевых зон по вертикали (строки сверху и снизу)
+        if type_wavelet == 1:
+            if int(wavelet_length) < rows // 2:
+                mask[:int(wavelet_length), :] = 0  # Верхний край
+                mask[rows - int(wavelet_length):, :] = 0  # Нижний край
+
+        return coefs_2d * mask  # Применяем маску
+
+    def find_extremes(self, coefs, scale, row_var, col_var, max_var, min_var, type_wavelet):
+        # удаляем коэффициенты с краевыми эффектами
+        coefs = self.delete_edge_points(np.array(coefs, dtype=np.float32), scale, type_wavelet)
+
         points_max_by_row = []
         points_min_by_row = []
         points_max_by_column = []
         points_min_by_column = []
 
-        if row_var:
-            for i in range(len(coefs)):
-                row = coefs[i]
+        # Экстремумы построчно
+        if row_var and (max_var or min_var):
+            left = coefs[:, :-2]
+            center = coefs[:, 1:-1]
+            right = coefs[:, 2:]
 
-                if max_var:
-                    max_indices = np.where(row == row.max())
-                    max_indices = [max_indices[0][0], i]
-                    points_max_by_row.append(max_indices)
+            if max_var:
+                max_mask = (center > left) & (center > right)
+                max_coords = np.where(max_mask)
+                points_max_by_row = [[x + 1, y] for y, x in zip(max_coords[0], max_coords[1])]
 
-                if min_var:
-                    min_indices = np.where(row == row.min())
-                    min_indices = [min_indices[0][0], i]
-                    points_min_by_row.append(min_indices)
+            if min_var:
+                min_mask = (center < left) & (center < right)
+                min_coords = np.where(min_mask)
+                points_min_by_row = [[x + 1, y] for y, x in zip(min_coords[0], min_coords[1])]
 
-        # Обработка столбцов
-        if col_var:
-            for i in range(len(coefs[0])):
-                column = coefs[:, i]
+        # Экстремумы по столбцам
+        if col_var and (max_var or min_var):
+            up = coefs[:-2, :]
+            center = coefs[1:-1, :]
+            down = coefs[2:, :]
 
-                if max_var:
-                    max_indices = np.where(column == column.max())
-                    max_indices = [i, max_indices[0][0]]
-                    points_max_by_column.append(max_indices)
+            if max_var:
+                max_mask = (center > up) & (center > down)
+                max_coords = np.where(max_mask)
+                points_max_by_column = [[x, y + 1] for y, x in zip(max_coords[0], max_coords[1])]
 
-                if min_var:
-                    min_indices = np.where(column == column.min())
-                    min_indices = [i, min_indices[0][0]]
-                    points_min_by_column.append(min_indices)
-        return points_max_by_row, points_max_by_column, points_min_by_row, points_min_by_column
+            if min_var:
+                min_mask = (center < up) & (center < down)
+                min_coords = np.where(min_mask)
+                points_min_by_column = [[x, y + 1] for y, x in zip(min_coords[0], min_coords[1])]
+
+        return coefs, points_max_by_row, points_max_by_column, points_min_by_row, points_min_by_column
 
 
-    def compute_points(self, row_var, col_var, max_var, min_var, knn_var):
+    def compute_points(self, row_var, col_var, max_var, min_var,
+                       knn_var, knn_bool_text_var, knn_bool_image_var, print_text_var, print_graphic, pipette_state):
         extremes = []
         for type_data in range(2):
-            for channel in range(3):
+            channels_to_process = [0] if pipette_state == 'normal' else range(3)
+            for channel in channels_to_process:
                 for scale in range(self.num_scale):
-                    pmaxr, pmaxc, pminr, pminc = self.find_extremes(
-                        self.result[type_data][channel][scale], row_var, col_var, max_var, min_var)
-                    small_extremes = {
+                    coefs_2d = self.result[type_data][channel][scale]
+                    coefs_2d = np.round(coefs_2d, decimals=3)
+                    coefs_2d, pmaxr, pmaxc, pminr, pminc = self.find_extremes(
+                        coefs_2d, self.scales[scale],
+                        row_var, col_var, max_var, min_var, type_data)
+
+                    colors = ['Красный', 'Зелёный', 'Синий']
+                    type_matrix_str = "Str" if type_data == 0 else "Tr"
+
+                    upper_max_row_points, lower_min_row_points = interpol.get_row_envelopes(coefs_2d, pmaxr, pminr)
+                    upper_max_col_points, lower_min_col_points = interpol.get_column_envelopes(coefs_2d, pmaxc, pminc)
+
+                    # массив для выгрузки массивов точек экстремумов
+                    extremes_to_process = []
+                    # массив названий заголовков файлов
+                    titles = []
+
+                    if max_var:
+                        if row_var:
+                            extremes_to_process.append(pmaxr)
+                            titles.append(
+                                f"{type_matrix_str}_Точки_максимума_по_строкам_масштаб_{self.scales[scale]}_{colors[channel]}")
+                        if col_var:
+                            extremes_to_process.append(pmaxc)
+                            titles.append(
+                                f"{type_matrix_str}_Точки_максимума_по_cтолбцам_масштаб_{self.scales[scale]}_{colors[channel]}")
+                    if min_var:
+                        if row_var:
+                            extremes_to_process.append(pminr)
+                            titles.append(
+                                f"{type_matrix_str}_Точки_минимума_по_строкам_масштаб_{self.scales[scale]}_{colors[channel]}")
+                        if col_var:
+                            extremes_to_process.append(pminc)
+                            titles.append(
+                                f"{type_matrix_str}_Точки_минимума_по_cтолбцам_масштаб_{self.scales[scale]}_{colors[channel]}")
+
+                    scale_folder = self.find_scale_folder(self.scales[scale])
+                    for i, p in enumerate(extremes_to_process):
+                        if len(p) > 0:
+                            if print_text_var:
+                                self.save_extremes_to_file(scale_folder, titles[i], p)
+                            if print_graphic:
+                                self.graphic(scale_folder, titles[i], p, coefs_2d.shape)
+
+                    # словарь с отфильтрованными экстремумами
+                    knn_extremes = {
                         'type_data': type_data,
                         'channel': channel,
                         'scale': self.scales[scale],
-                        'max_by_row': pmaxr,
-                        'max_by_column': pmaxc,
-                        'min_by_row': pminr,
-                        'min_by_column': pminc
+                        'max_by_row': upper_max_row_points if (row_var and max_var) else [],
+                        'max_by_column': upper_max_col_points if (col_var and max_var) else [],
+                        'min_by_row': lower_min_row_points if (row_var and min_var) else [],
+                        'min_by_column': lower_min_col_points if (col_var and min_var) else []
                     }
+                    extremes.append(knn_extremes)
 
-                    extremes.append(small_extremes)
-                    colors = ['Красный', 'Зелёный', 'Синий']
-                    if type_data == 0:
-                        type_matrix_str = "Str_"
-                    else:
-                        type_matrix_str = "Tr_"
+                    if knn_bool_text_var or knn_bool_image_var:
+                        points.process_extremes_with_knn(knn_extremes, scale_folder, knn_var,
+                                                         self.original_image, knn_bool_text_var, knn_bool_image_var)
 
-                    titles = [f"{type_matrix_str}_Точки_максимума_по_строкам_масштаб_{self.scales[scale]}_{colors[channel]}",
-                              f"{type_matrix_str}_Точки_максимума_по_cтолбцам_масштаб_{self.scales[scale]}_{colors[channel]}",
-                              f"{type_matrix_str}_Точки_минимума_по_строкам_масштаб_{self.scales[scale]}_{colors[channel]}",
-                              f"{type_matrix_str}_Точки_минимума_по_cтолбцам_масштаб_{self.scales[scale]}_{colors[channel]}"]
-
-                    i = 0
-                    scale_folder = self.find_scale_folder(self.scales[scale])
-                    for p in [pmaxr, pmaxc, pminr, pminc]:
-                        self.graphic(scale_folder, titles[i], p)
-                        i += 1
-                    points.process_extremes_with_knn(small_extremes, scale_folder, knn_var, self.original_image)
         return extremes
 
     @staticmethod
-    def graphic(path, title, points_local):
+    def save_extremes_to_file(path, title, local_points):
+        if not local_points:
+            print(f"Нет точек для сохранения в {title}")
+            return
+
+        file_path = os.path.join(path, f"{title}.txt")
+        try:
+            with open(file_path, 'w', encoding='utf-8') as file:
+                for point in local_points:
+                    file.write(f"{point[0]}, {point[1]}\n")
+            print(f"Файл сохранён: {file_path}")
+        except Exception as e:
+            print(f"Ошибка при сохранении файла {file_path}: {str(e)}")
+
+    @staticmethod
+    def graphic(path, title, points_local, original_img_shape):
+        if not points_local:
+            print(f"Нет точек для отображения: {title}")
+            return
+
+        plt.figure(figsize=(10, 10))
+
         data = np.array(points_local)
         x = data[:, 0]
         y = data[:, 1]
-        plt.figure(figsize=(7, 8))
+
+        # оси с сохранением пропорций
+        ax = plt.gca()
+
+        if original_img_shape is not None:
+            height, width = original_img_shape[:2]
+            ax.set_xlim(0, width)
+            ax.set_ylim(height, 0)  # инвертируем ось Y
+            ax.set_aspect('equal')  # фиксируем соотношение сторон 1:1
+
+        # рисуем точки
+        plt.scatter(x, y, s=1, alpha=0.6)
         plt.title(title)
-        plt.scatter(x, y, s=1)
-        plt.gca().invert_yaxis()
-        name = path + title + '.png'
-        plt.savefig(name)
-        print(f"File {name} saved.")
+
+        plt.grid(True)
+        plt.xlabel('X (пиксели)')
+        plt.ylabel('Y (пиксели)')
+
+        filename = os.path.join(path, f"{title}.png")
+        plt.savefig(filename, bbox_inches='tight', dpi=96)
         plt.close()
-        return
+        print(f"График сохранён: {filename}")
 
     def find_scale_folder(self, scale):
         scale_folder_name = f"Scale_{scale}"
@@ -335,7 +423,8 @@ class ImageProcessor:
             print(f"Directory {scale_folder_path} is not found")
             return None
 
-    def compute(self, wp_var1, wp_var2, print_channels_txt_var, row_var, col_var, max_var, min_var, p_ex_var1, p_ex_var2, k_neighbors=5):
+    def compute(self, wp_var1, wp_var2, print_channels_txt_var, row_var, col_var, max_var, min_var,
+                p_ex_var1, p_ex_var2, k_neighbors, knn_bool_text_var, knn_bool_image_var,  pipette_state):
         current_date = datetime.datetime.now()
         date_str = current_date.strftime("%d_%m_%Y_%H_%M_%S")
         folder_name = f"Вейвлет_преобразования_{date_str}"
@@ -350,15 +439,16 @@ class ImageProcessor:
         if (wp_var1.get() is False) and (wp_var2.get() is False):
             self.compute_wavelets(11)
 
-        if (p_ex_var1.get() is True) and (p_ex_var2.get() is True):
-            self.compute_points(row_var, col_var, max_var, min_var, k_neighbors)
+        if p_ex_var1.get() or p_ex_var2.get():
+            self.compute_points(row_var, col_var, max_var, min_var,
+                                k_neighbors, knn_bool_text_var.get(), knn_bool_image_var.get(), p_ex_var1.get(), p_ex_var2.get(), pipette_state)
 
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.geometry("1000x800")
-        self.title("Wavelets and other")
+        self.geometry("1000x700")
+        self.title("Wavelets")
         self.resizable(False, False)
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -369,6 +459,7 @@ class App(ctk.CTk):
         self.label_load.configure(font=ctk.CTkFont(size=14, weight="bold"))
         self.load_button = ctk.CTkButton(self, text="Загрузить",
                                          command=self.load_image_callback)
+        self.load_button.configure(font=ctk.CTkFont(size=18), width=200, height=50)
         self.load_button.grid(row=1, column=0, padx=20, pady=10, sticky="w")
         self.print_load_image = ctk.CTkLabel(self, text="")
         self.print_load_image.grid(row=2, column=0, padx=20, pady=10, sticky="w")
@@ -389,18 +480,18 @@ class App(ctk.CTk):
         self.gram_shmidt_button.grid(row=5, column=1, padx=20, sticky="w")
 
         self.label_scales = ctk.CTkLabel(self, text="Масштабы")
-        self.label_scales.configure(font=ctk.CTkFont(size=16, weight="bold"))
-        self.label_scales.grid(row=6, column=0, sticky="w", padx=15, pady=10)
+        self.label_scales.configure(font=ctk.CTkFont(size=14, weight="bold"))
+        self.label_scales.grid(row=6, column=0, sticky="w", padx=20, pady=10)
         self.label_start = ctk.CTkLabel(self, text="От:")
-        self.label_start.grid(row=7, column=0, padx=15, sticky="w")
+        self.label_start.grid(row=7, column=0, padx=20, sticky="w")
         self.entry_start = ctk.CTkEntry(self)
         self.entry_start.grid(row=7, column=0, padx=45, sticky="w")
         self.label_end = ctk.CTkLabel(self, text="До:")
-        self.label_end.grid(row=8, column=0, padx=15, sticky="w")
+        self.label_end.grid(row=8, column=0, padx=20, sticky="w")
         self.entry_end = ctk.CTkEntry(self)
         self.entry_end.grid(row=8, column=0, padx=45, sticky="w")
         self.label_step = ctk.CTkLabel(self, text="Шаг:")
-        self.label_step.grid(row=9, column=0, padx=15, sticky="w")
+        self.label_step.grid(row=9, column=0, padx=20, sticky="w")
         self.entry_step = ctk.CTkEntry(self)
         self.entry_step.grid(row=9, column=0, padx=45, sticky="w")
         self.button_save_scales = ctk.CTkButton(self, text="Сохранить значения", command=self.load_scales)
@@ -410,17 +501,16 @@ class App(ctk.CTk):
         self.label_custom_scale.grid(row=11, column=0, sticky="w")
         self.button_load_scales_file = ctk.CTkButton(self, text="Загрузить из файла",
                                                      command=self.load_scales_from_file)
-        self.button_load_scales_file.grid(row=12, column=0, padx=45, pady=10, sticky="w")
+        self.button_load_scales_file.grid(row=12, column=0, padx=45, sticky="w")
 
         self.label_t_extr = ctk.CTkLabel(self, text="Точки экстремумов:")
         self.label_t_extr.grid(row=13, column=0, padx=20, pady=10, sticky="w")
-        self.label_t_extr.configure(font=ctk.CTkFont(size=16, weight="bold"))
+        self.label_t_extr.configure(font=ctk.CTkFont(size=14, weight="bold"))
 
         self.row_var = tk.BooleanVar(value=False)
         self.col_var = tk.BooleanVar(value=False)
         self.max_var = tk.BooleanVar(value=False)
         self.min_var = tk.BooleanVar(value=False)
-        self.plane_var = tk.BooleanVar(value=False)
 
         self.row_checkbox = ctk.CTkCheckBox(self, text="По строкам", variable=self.row_var, onvalue=True,
                                             offvalue=False)
@@ -434,6 +524,7 @@ class App(ctk.CTk):
         self.min_checkbox.grid(row=17, column=1, padx=20, sticky="w")
 
         self.num_near_point = ctk.CTkLabel(self, text="Количество ближайших точек")
+        self.num_near_point.configure(font=ctk.CTkFont(size=14, weight="bold"))
         self.num_near_point.grid(row=19, column=0, padx=20, pady=10, sticky="w")
         self.knn_text_var = tk.StringVar()
         self.knn_text_var.set("n (ex. 5)")
@@ -451,10 +542,12 @@ class App(ctk.CTk):
         self.wp_var2 = tk.BooleanVar(value=False)
         self.p_ex_var1 = tk.BooleanVar(value=False)
         self.p_ex_var2 = tk.BooleanVar(value=False)
-        self.dist_angle_var = tk.BooleanVar(value=False)
+        self.knn_bool_text_var = tk.BooleanVar(value=False)
+        self.knn_bool_image_var = tk.BooleanVar(value=False)
 
         self.wp_label = ctk.CTkLabel(self, text="Вейвлет преобразование (Морле)")
         self.wp_label.grid(row=1, column=3, padx=20, sticky="w")
+        self.wp_label.configure(font=ctk.CTkFont(size=14, weight="bold"))
         self.wp1_checkbox = ctk.CTkCheckBox(self, text="Вывести изображением",
                                             variable=self.wp_var1)
         self.wp1_checkbox.grid(row=2, column=3, padx=40, sticky="w")
@@ -463,6 +556,7 @@ class App(ctk.CTk):
         self.wp2_checkbox.grid(row=3, column=3, padx=40, sticky="w")
 
         self.p_ex_label = ctk.CTkLabel(self, text="Точки экстремума:")
+        self.p_ex_label.configure(font=ctk.CTkFont(size=14, weight="bold"))
         self.p_ex_label.grid(row=5, column=3, padx=20, sticky="w")
         self.p_ex1_checkbox = ctk.CTkCheckBox(self, text="Вывести текстовым файлом",
                                               variable=self.p_ex_var1)
@@ -471,26 +565,33 @@ class App(ctk.CTk):
                                               variable=self.p_ex_var2)
         self.p_ex2_checkbox.grid(row=7, column=3, padx=40, sticky="w")
 
-        self.dist_angle_label = ctk.CTkLabel(self, text="Расчет k-ближайших соседей точек экстремумов")
-        self.dist_angle_label.grid(row=8, column=3, padx=20, sticky="w")
-        self.dist_angle_checkbox = ctk.CTkCheckBox(self, text="Вывести текстовым файлом",
-                                                   variable=self.dist_angle_var)
-        self.dist_angle_checkbox.grid(row=9, column=3, padx=40, sticky="w")
+        self.knn_label = ctk.CTkLabel(self, text="Расчет k-ближайших соседей точек экстремумов")
+        self.knn_label.configure(font=ctk.CTkFont(size=14, weight="bold"))
+        self.knn_label.grid(row=8, column=3, padx=20, sticky="w")
+        self.knn_text_checkbox = ctk.CTkCheckBox(self, text="Вывести текстовым файлом",
+                                                   variable=self.knn_bool_text_var)
+        self.knn_text_checkbox.grid(row=9, column=3, padx=40, sticky="w")
+        self.knn_image_checkbox = ctk.CTkCheckBox(self, text="Вывести изображением",
+                                                   variable=self.knn_bool_image_var)
+        self.knn_image_checkbox.grid(row=10, column=3, padx=40, sticky="w")
+
+
 
         self.image_channel_label = ctk.CTkLabel(self, text="Промежуточные вычисления")
-        self.image_channel_label.grid(row=10, column=3, padx=20, sticky="w")
+        self.image_channel_label.configure(font=ctk.CTkFont(size=14, weight="bold"))
+        self.image_channel_label.grid(row=11, column=3, padx=20, sticky="w")
         self.print_channels_txt_var = tk.BooleanVar(value=False)
         self.print_channels_txt_checkbox = ctk.CTkCheckBox(self,
-                                                           text="Исходные матрицы каналов rgb виде текстового файла",
+                                                           text="Исходные матрицы RGB текстовым файлом",
                                                            variable=self.print_channels_txt_var)
-        self.print_channels_txt_checkbox.grid(row=11, column=3, padx=40, sticky="w")
+        self.print_channels_txt_checkbox.grid(row=12, column=3, padx=40, sticky="w")
 
         self.app_start_button = ctk.CTkButton(self, text="Вычислить", command=self.compute)
         self.app_start_button.grid(row=16, column=3, sticky="s")
-        self.app_start_button.configure(width=200, height=50, border_width=3, border_color="black")
+        self.app_start_button.configure(width=200, height=70, border_width=4, border_color="black", font=ctk.CTkFont(size=20))
 
     def load_image_callback(self):
-        if self.image_processor.load_image(self):  # Передаем self (корневое окно) как master_window
+        if self.image_processor.load_image(self):
             self.load_button.configure(text="Загружено", text_color="black", fg_color="white", border_color="black",
                                        border_width=2)
             text = "Выбранный файл:\n" + self.image_processor.image_path
@@ -546,25 +647,30 @@ class App(ctk.CTk):
 
     def compute(self):
         timer = time.time()
-        # Сбор параметров для передачи в метод compute()
+        # сбор параметров для передачи в метод compute()
         wp_var1 = self.wp_var1
         wp_var2 = self.wp_var2
         print_channels_txt_var = self.print_channels_txt_var.get()
         p_ex_var1 = self.p_ex_var1
         p_ex_var2 = self.p_ex_var2
         k = int(self.knn_text_var.get()) if self.knn_text_var.get().isdigit() else 5
+        pipette_button_state = self.pipette_button.cget('state')
 
         try:
             self.image_processor.compute(wp_var1, wp_var2, print_channels_txt_var,
-                                         self.row_var, self.col_var, self.max_var, self.min_var,
-                                         p_ex_var1, p_ex_var2, k_neighbors=k)
+                                         self.row_var.get(), self.col_var.get(),
+                                         self.max_var.get(), self.min_var.get(),
+                                         p_ex_var1, p_ex_var2, k_neighbors=k,
+                                         knn_bool_text_var=self.knn_bool_text_var,
+                                         knn_bool_image_var=self.knn_bool_image_var,
+                                         pipette_state=pipette_button_state)
 
             msg_box = tk.Toplevel()
             msg_box.title("Вычисления завершены")
-            msg_box.geometry("500x500")
-            msg_box.resizable(False, False)
+            msg_box.geometry("500x200")
+            msg_box.resizable(True, True)
 
-            # Центрируем окно относительно главного окна
+            # центрируем окно относительно главного окна
             x = self.winfo_x() + (self.winfo_width() // 2) - 200
             y = self.winfo_y() + (self.winfo_height() // 2) - 75
             msg_box.geometry(f"+{x}+{y}")
@@ -593,9 +699,7 @@ class App(ctk.CTk):
             mb.showerror("Ошибка", f"Произошла ошибка:\n{str(e)}")
 
     def restart_app(self):
-        """Перезапуск приложения"""
         self.destroy()
-        # Создаем новое окно приложения
         new_app = App()
         new_app.mainloop()
 

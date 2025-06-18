@@ -1,5 +1,5 @@
 import numpy as np
-import matplotlib.pyplot as plt
+
 
 def change_channels(v1, v2, data):
     def gram_schmidt(v1_, v2_):
@@ -35,6 +35,7 @@ def change_channels(v1, v2, data):
     data_new = np.transpose(data_new, (1, 2, 0))
 
     # Save channel images
+    """
     for ch in range(0, 3):
         plt.figure()
         plt.imshow(data_new[ch], cmap='binary')
@@ -42,5 +43,5 @@ def change_channels(v1, v2, data):
         plt.colorbar()
         plt.savefig(f"GRSH-{ch}.png")
         plt.close()
-
+    """
     return data_new
