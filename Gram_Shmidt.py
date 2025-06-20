@@ -34,14 +34,4 @@ def change_channels(v1, v2, data):
     data_new = p @ data_transposed
     data_new = np.transpose(data_new, (1, 2, 0))
 
-    # Save channel images
-    """
-    for ch in range(0, 3):
-        plt.figure()
-        plt.imshow(data_new[ch], cmap='binary')
-        plt.title(f'Channel {ch} after Gram-Schmidt Transformation')
-        plt.colorbar()
-        plt.savefig(f"GRSH-{ch}.png")
-        plt.close()
-    """
     return data_new

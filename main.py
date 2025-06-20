@@ -10,7 +10,6 @@ import customtkinter as ctk
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image
 from numba import jit
 
 import points
@@ -75,37 +74,18 @@ class ImageProcessor:
         self.color1 = []
         self.color2 = []
 
-    @staticmethod
-    def convert_to_png(image_file_path):
-        png_file_path = os.path.splitext(image_file_path)[0] + '.png'
-        try:
-            img = Image.open(image_file_path)
-            img_converted = img.convert("RGB")
-            img_converted.save(png_file_path, "PNG")
-            print(f"Image saved as {png_file_path}")
-            return png_file_path
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
     def load_image(self, master_window=None):
-        filename = run_cropper(master_window)
-        if filename:
-            self.image_path = self.convert_to_png(filename)
-            if self.image_path:
-                print('Selected image file converted to:', self.image_path)
-                # split image channels to rgb
-                image = cv2.imread(self.image_path)
-                self.original_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                b, g, r = cv2.split(image)
-                self.data = [r, g, b]
-                self.data_copy = self.data
-                return True
-            else:
-                print('Image conversion failed')
-                return False
+        self.image_path = run_cropper(master_window)
+        if self.image_path:
+            print('Selected image file converted to:', self.image_path)
+            image = cv2.imread(self.image_path)
+            self.original_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            b, g, r = cv2.split(image)
+            self.data = [r, g, b]
+            self.data_copy = self.data
+            return True
         else:
-            print('No file selected')
+            print('Image conversion failed')
             return False
 
     def pipette_channel(self):

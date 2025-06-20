@@ -1,13 +1,8 @@
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog
-from PIL import Image, ImageTk
-import cv2
-import numpy as np
+from PIL import Image, ImageTk, ImageDraw
 import os
-
-global drawing, points, img, img_copy
-
 
 class ImageCropperApp(ctk.CTkToplevel):
     def __init__(self, master=None):
@@ -23,6 +18,9 @@ class ImageCropperApp(ctk.CTkToplevel):
         self.original_file_path = None
         self.rect_coords = None
         self.rect_id = None
+        self.polygon_points = []
+        self.polygon_mode = False
+        self.polygon_lines = []
 
         self.main_frame = ctk.CTkFrame(self)
         self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
@@ -37,7 +35,7 @@ class ImageCropperApp(ctk.CTkToplevel):
         self.btn_rect_crop.pack(side="left", padx=5)
         self.btn_rect_crop.configure(state="disabled")
 
-        self.btn_poly_crop = ctk.CTkButton(self.button_frame, text="Polygon Crop", command=self.start_polygon_crop)
+        self.btn_poly_crop = ctk.CTkButton(self.button_frame, text="Polygon Crop", command=self.set_polygon_mode)
         self.btn_poly_crop.pack(side="left", padx=5)
         self.btn_poly_crop.configure(state="disabled")
 
@@ -49,128 +47,176 @@ class ImageCropperApp(ctk.CTkToplevel):
         self.btn_save.pack(side="right", padx=5)
         self.btn_save.configure(state="disabled")
 
-        # Фрейм для canvas с прокруткой
         self.canvas_frame = ctk.CTkFrame(self.main_frame)
         self.canvas_frame.pack(fill="both", expand=True)
 
-        # Canvas с прокруткой
         self.canvas = ctk.CTkCanvas(self.canvas_frame, bg="gray20", cursor="cross")
         self.canvas.pack(side="left", fill="both", expand=True)
 
-        # Вертикальная прокрутка
         self.scroll_y = ctk.CTkScrollbar(self.canvas_frame, orientation="vertical", command=self.canvas.yview)
         self.scroll_y.pack(side="right", fill="y")
         self.canvas.configure(yscrollcommand=self.scroll_y.set)
 
-        # Горизонтальная прокрутка
         self.scroll_x = ctk.CTkScrollbar(self.main_frame, orientation="horizontal", command=self.canvas.xview)
         self.scroll_x.pack(fill="x")
         self.canvas.configure(xscrollcommand=self.scroll_x.set)
 
-        # Привязка событий мыши
         self.canvas.bind("<ButtonPress-1>", self.on_button_press)
         self.canvas.bind("<B1-Motion>", self.on_move_press)
         self.canvas.bind("<ButtonRelease-1>", self.on_button_release)
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)
 
-    def start_polygon_crop(self):
-        if not self.original_file_path:
+        self.polygon_control_frame = ctk.CTkFrame(self.main_frame)
+        self.polygon_control_frame.pack(fill="x", pady=5)
+
+        self.btn_poly_confirm = ctk.CTkButton(
+            self.polygon_control_frame,
+            text="Confirm Polygon",
+            command=self.apply_polygon_crop,
+            state="disabled"
+        )
+        self.btn_poly_confirm.pack(side="left", padx=5)
+
+        self.btn_poly_reset = ctk.CTkButton(
+            self.polygon_control_frame,
+            text="Reset Polygon",
+            command=self.reset_polygon,
+            state="disabled"
+        )
+        self.btn_poly_reset.pack(side="left", padx=5)
+
+        self.btn_poly_cancel = ctk.CTkButton(
+            self.polygon_control_frame,
+            text="Cancel",
+            command=self.cancel_polygon_mode,
+            state="disabled"
+        )
+        self.btn_poly_cancel.pack(side="left", padx=5)
+
+        self.polygon_control_frame.pack_forget()
+
+    def set_polygon_mode(self):
+        self.reset_selection()
+        self.polygon_mode = True
+        self.canvas.config(cursor="cross")
+        self.polygon_control_frame.pack(fill="x", pady=5)
+        self.btn_poly_confirm.configure(state="disabled")
+        self.btn_poly_reset.configure(state="normal")
+        self.btn_poly_cancel.configure(state="normal")
+
+        self.btn_open.configure(state="disabled")
+        self.btn_rect_crop.configure(state="disabled")
+        self.btn_poly_crop.configure(state="disabled")
+        self.btn_reset.configure(state="disabled")
+        self.btn_save.configure(state="disabled")
+
+    def cancel_polygon_mode(self):
+        self.polygon_mode = False
+        self.reset_polygon()
+        self.polygon_control_frame.pack_forget()
+
+        self.btn_open.configure(state="normal")
+        self.btn_rect_crop.configure(state="normal")
+        self.btn_poly_crop.configure(state="normal")
+        self.btn_reset.configure(state="normal")
+        self.btn_save.configure(state="normal")
+
+    def reset_polygon(self):
+        self.polygon_points = []
+        for line in self.polygon_lines:
+            self.canvas.delete(line)
+        self.polygon_lines = []
+        self.btn_poly_confirm.configure(state="disabled")
+
+    def on_button_press(self, event):
+        if not self.image:
             return
 
-        # Сохраняем текущее состояние окна
-        self.withdraw()
-        self.polygon_crop(self.original_file_path)
-        self.deiconify()
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
 
-    def polygon_crop(self, image_path):
-        global drawing, points, img, img_copy
-        drawing = False
-        points = []
-        img = cv2.imread(image_path)
-        img_copy = img.copy()
+        if self.polygon_mode:
+            self.polygon_points.append((x, y))
 
-        instruction_panel = np.zeros((60, img.shape[1], 3), dtype=np.uint8)
-        instructions = [
-            "Instructions:",
-            "LKM - Draw, 'C' - crop",
-            "'R' - reset, 'Q' - exit"
-        ]
+            # Draw point
+            point_size = 3
+            self.canvas.create_oval(
+                x - point_size, y - point_size,
+                x + point_size, y + point_size,
+                fill="green", outline="green"
+            )
 
-        # Добавляем инструкции на панель
-        y = 15
-        for i, line in enumerate(instructions):
-            cv2.putText(instruction_panel, line, (10, y + i * 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            if len(self.polygon_points) > 1:
+                line = self.canvas.create_line(
+                    self.polygon_points[-2][0], self.polygon_points[-2][1],
+                    self.polygon_points[-1][0], self.polygon_points[-1][1],
+                    fill="green", width=2
+                )
+                self.polygon_lines.append(line)
 
-        def mouse_callback(event, x, y, flags, param):
-            global drawing, points, img_copy
+            if len(self.polygon_points) >= 3:
+                self.btn_poly_confirm.configure(state="normal")
+        else:
+            self.rect_coords = [x, y, x, y]
+            self.rect_id = self.canvas.create_rectangle(
+                x, y, x, y, outline="red", width=2, dash=(5, 5))
 
-            if event == cv2.EVENT_LBUTTONDOWN:
-                drawing = True
-                points = [(x, y)]
-                img_copy = img.copy()
-                img_copy = np.vstack([img_copy, instruction_panel])  # Добавляем инструкции
-                cv2.circle(img_copy, (x, y), 3, (0, 255, 0), -1)
-                cv2.imshow("Polygon Cropper", img_copy)
+    def on_move_press(self, event):
+        if not self.image or not self.rect_id:
+            return
 
-            elif event == cv2.EVENT_MOUSEMOVE:
-                if drawing:
-                    points.append((x, y))
-                    if len(points) > 1:
-                        img_copy = img.copy()
-                        cv2.polylines(img_copy, [np.array(points)], False, (0, 255, 0), 2)
-                        img_copy = np.vstack([img_copy, instruction_panel])  # Добавляем инструкции
-                        cv2.imshow("Polygon Cropper", img_copy)
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
 
-            elif event == cv2.EVENT_LBUTTONUP:
-                drawing = False
-                if len(points) > 2:
-                    img_copy = img.copy()
-                    cv2.polylines(img_copy, [np.array(points)], True, (0, 255, 0), 2)
-                    img_copy = np.vstack([img_copy, instruction_panel])  # Добавляем инструкции
-                    cv2.imshow("Polygon Cropper", img_copy)
+        self.rect_coords[2] = x
+        self.rect_coords[3] = y
+        self.canvas.coords(self.rect_id, *self.rect_coords)
 
-        cv2.namedWindow("Polygon Cropper")
-        cv2.setMouseCallback("Polygon Cropper", mouse_callback)
+    def on_button_release(self, event):
+        if not self.image or not self.rect_id:
+            return
 
-        # Первоначальное отображение изображения с инструкциями
-        img_copy = np.vstack([img_copy, instruction_panel])
-        cv2.imshow("Polygon Cropper", img_copy)
+        if abs(self.rect_coords[2] - self.rect_coords[0]) > 10 and abs(self.rect_coords[3] - self.rect_coords[1]) > 10:
+            self.apply_rectangle_crop()
 
-        while True:
-            key = cv2.waitKey(1) & 0xFF
+    def apply_polygon_crop(self):
+        if len(self.polygon_points) < 3:
+            return
 
-            if key == ord("c"):  # Обрезать изображение
-                if len(points) > 2:
-                    # Создаем маску
-                    mask = np.zeros(img.shape[:2], dtype=np.uint8)
-                    pts = np.array([points], dtype=np.int32)
-                    cv2.fillPoly(mask, pts, 255)
+        try:
+            mask = Image.new('L', (self.image.width, self.image.height), 0)
+            draw = ImageDraw.Draw(mask)
+            draw.polygon(self.polygon_points, fill=255)
 
-                    # создаем черный фон
-                    black_bg = np.zeros_like(img)
+            result = Image.new('RGBA', (self.image.width, self.image.height), (0, 0, 0, 0))
+            result.paste(self.image, (0, 0), mask)
 
-                    # копируем только выбранную область
-                    result = black_bg.copy()
-                    result[mask == 255] = img[mask == 255]
+            min_x = min(p[0] for p in self.polygon_points)
+            max_x = max(p[0] for p in self.polygon_points)
+            min_y = min(p[1] for p in self.polygon_points)
+            max_y = max(p[1] for p in self.polygon_points)
 
-                    self.image = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
-                    self.update_canvas()
-                    self.btn_save.configure(state="normal")
+            result = result.crop((min_x, min_y, max_x, max_y))
 
-                    cv2.destroyAllWindows()
-                    break
+            self.image = result
+            self.update_canvas()
+            self.cancel_polygon_mode()
+            self.btn_save.configure(state="normal")
+        except Exception as e:
+            print(f"Error cropping image: {e}")
 
-            elif key == ord("r"):  # Сбросить контур
-                points.clear()
-                img_copy = img.copy()
-                img_copy = np.vstack([img_copy, instruction_panel])
-                cv2.imshow("Polygon Cropper", img_copy)
-                print("Контур сброшен")
-
-            elif key == ord("q"):  # Выход
-                cv2.destroyAllWindows()
-                break
+    @staticmethod
+    def convert_to_png(image_file_path):
+        png_file_path = os.path.splitext(image_file_path)[0] + '.png'
+        try:
+            img = Image.open(image_file_path)
+            img_converted = img.convert("RGB")
+            img_converted.save(png_file_path, "PNG")
+            print(f"Image saved as {png_file_path}")
+            return png_file_path
+        except Exception as e:
+            print(f"Error: {e}")
+            return None
 
     def open_image(self):
         file_types = [("Image files", "*.png *.jpg *.jpeg *.bmp")]
@@ -180,6 +226,7 @@ class ImageCropperApp(ctk.CTkToplevel):
             return
 
         try:
+            file_path = self.convert_to_png(file_path)
             self.original_image = Image.open(file_path)
             self.image = self.original_image.copy()
             self.original_file_path = file_path
@@ -205,52 +252,9 @@ class ImageCropperApp(ctk.CTkToplevel):
             self.canvas.yview_moveto(0.5)
 
     def set_rectangle_mode(self):
+        self.cancel_polygon_mode()
         self.reset_selection()
         self.canvas.config(cursor="cross")
-
-    def on_button_press(self, event):
-        if not self.image:
-            return
-
-        x = self.canvas.canvasx(event.x)
-        y = self.canvas.canvasy(event.y)
-
-        self.rect_coords = [x, y, x, y]
-        self.rect_id = self.canvas.create_rectangle(
-            x, y, x, y, outline="red", width=2, dash=(5, 5))
-
-    def on_move_press(self, event):
-        if not self.image or not self.rect_id:
-            return
-
-        x = self.canvas.canvasx(event.x)
-        y = self.canvas.canvasy(event.y)
-
-        self.rect_coords[2] = x
-        self.rect_coords[3] = y
-        self.canvas.coords(self.rect_id, *self.rect_coords)
-
-    def on_button_release(self, event):
-        if not self.image or not self.rect_id:
-            return
-
-        # проверяем, что область выделения достаточно большая
-        if abs(self.rect_coords[2] - self.rect_coords[0]) > 10 and abs(self.rect_coords[3] - self.rect_coords[1]) > 10:
-            # применяем обрезку сразу после выделения
-            self.apply_rectangle_crop()
-
-    def apply_rectangle_crop(self):
-        try:
-            x1, y1, x2, y2 = self.rect_coords
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(self.image.width, x2), min(self.image.height, y2)
-
-            self.image = self.image.crop((x1, y1, x2, y2))
-            self.update_canvas()
-            self.reset_selection()
-            self.btn_save.configure(state="normal")
-        except Exception as e:
-            print(f"Error cropping image: {e}")
 
     def on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -268,6 +272,19 @@ class ImageCropperApp(ctk.CTkToplevel):
             self.rect_id = None
             self.rect_coords = None
 
+    def apply_rectangle_crop(self):
+        try:
+            x1, y1, x2, y2 = self.rect_coords
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(self.image.width, x2), min(self.image.height, y2)
+
+            self.image = self.image.crop((x1, y1, x2, y2))
+            self.update_canvas()
+            self.reset_selection()
+            self.btn_save.configure(state="normal")
+        except Exception as e:
+            print(f"Error cropping image: {e}")
+
     def save_and_exit(self):
         if not self.image:
             return
@@ -277,8 +294,6 @@ class ImageCropperApp(ctk.CTkToplevel):
         if file_path:
             try:
                 self.image.save(file_path)
-                with open("image_paths.txt", "w") as f:
-                    f.write(file_path)
                 self.destroy()
                 return file_path
             except Exception as e:
@@ -288,7 +303,7 @@ class ImageCropperApp(ctk.CTkToplevel):
     def get_cropped_filename(self):
         if hasattr(self, 'original_file_path'):
             path, ext = os.path.splitext(self.original_file_path)
-            return f"{path}_cropped_image{ext}"
+            return f"{path}_cropped{ext}"
 
 
 def run_cropper(master=None):
