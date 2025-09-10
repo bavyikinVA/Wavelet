@@ -1,7 +1,7 @@
 import datetime
-import math
 import os
 import time
+import math
 import tkinter as tk
 from multiprocessing import Pool, freeze_support
 from tkinter import filedialog
@@ -10,7 +10,7 @@ import customtkinter as ctk
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-from numba import jit
+from numba import jit, prange
 
 import points
 import interpol
@@ -19,27 +19,62 @@ from image_cropper_app import run_cropper
 from pipette import run_pipette
 
 
-# Morlet wavelet transform functions
 @jit(nopython=True)
-def morlet_wavelet_single_scale(data, data_size, scale, j):
-    w0 = 0
-    for k in range(data_size):
+def morlet_wavelet_single_scale(data, scale, j):
+    w0 = 0.0
+    for k in range(len(data)):
         t = (k - j) / scale
         w0 += data[k] * 0.75 * math.exp(-(t * t) / 2) * math.cos(2 * math.pi * t)
     return w0 / math.sqrt(scale)
 
 
-def morlet_wavelet(data, data_size, scales, weight_size):
-    coef = np.zeros((weight_size, data_size))
-    for i in range(weight_size):
-        for j in range(data_size):
-            coef[i][j] = morlet_wavelet_single_scale(data, data_size, scales[i], j)
+@jit(nopython=True, parallel=True)
+def morlet_wavelet(data, scales):
+    coef = np.zeros((len(scales), len(data)))
+    for i in prange(len(scales)):
+        for j in range(len(data)):
+            coef[i,j] = morlet_wavelet_single_scale(data, scales[i], j)
     return coef
+
+
+@jit(nopython=True)
+def apply_gaussian_edge_filter(channel_data, scales, wavelet_lengths):
+    """
+    Применяет гауссов фильтр только к краевым зонам, сохраняя внутреннюю часть неизменной
+
+    Параметры:
+    channel_data - массив вейвлет-коэффициентов (scales, rows, cols)
+    scales - список масштабов
+    wavelet_lengths - список длин вейвлетов для каждого масштаба
+    """
+    num_scales = len(scales)
+    rows, cols = channel_data.shape[1], channel_data.shape[2]
+
+    for scale_idx in range(num_scales):
+        edge_size = wavelet_lengths[scale_idx]
+
+        # Создаем гауссов фильтр (только возрастающую часть)
+        x = np.linspace(-3, 0, edge_size)
+        gaussian = np.exp(-(x ** 2) / 2)
+        gaussian = (gaussian - gaussian[0]) / (gaussian[-1] - gaussian[0])  # Нормализуем от 0 до 1
+
+        # Применяем фильтр к началу каждой строки
+        for row in range(rows):
+            for col in range(edge_size):
+                channel_data[scale_idx, row, col] *= gaussian[col]
+
+        # Применяем фильтр к концу каждой строки (зеркально)
+        for row in range(rows):
+            for col in range(cols - edge_size, cols):
+                idx = cols - col - 1
+                channel_data[scale_idx, row, col] *= gaussian[idx]
+
+    return channel_data
 
 
 def process_row(args):
     row_data, scales, scales_size = args
-    return morlet_wavelet(row_data, len(row_data), scales, scales_size)
+    return morlet_wavelet(row_data, scales)
 
 
 def process_channel(data, scales):
@@ -82,7 +117,7 @@ class ImageProcessor:
             self.original_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             b, g, r = cv2.split(image)
             self.data = [r, g, b]
-            self.data_copy = self.data
+            self.data_copy = [channel.copy() for channel in self.data]
             return True
         else:
             print('Image conversion failed')
@@ -154,6 +189,10 @@ class ImageProcessor:
                     row -= mean
 
             data_channel_after = process_channel(data_channel, self.scales)
+
+            wavelet_lengths = [int(7 * scale) for scale in self.scales]
+            data_channel_after = apply_gaussian_edge_filter(data_channel_after, self.scales, wavelet_lengths)
+
             print(data_channel_after.shape)
             data_channel_after_transposed = np.transpose(data_channel_after, (1, 0, 2))
             data_3_channel[channel] = data_channel_after_transposed  # [channels, scales, rows, cols]
@@ -234,7 +273,7 @@ class ImageProcessor:
 
     def find_extremes(self, coefs, scale, row_var, col_var, max_var, min_var, type_wavelet):
         # удаляем коэффициенты с краевыми эффектами
-        coefs = self.delete_edge_points(np.array(coefs, dtype=np.float32), scale, type_wavelet)
+        # coefs = self.delete_edge_points(np.array(coefs, dtype=np.float32), scale, type_wavelet)
 
         points_max_by_row = []
         points_min_by_row = []
@@ -302,20 +341,24 @@ class ImageProcessor:
 
                     if max_var:
                         if row_var:
-                            extremes_to_process.append(pmaxr)
+                            # extremes_to_process.append(pmaxr)
+                            extremes_to_process.append(upper_max_row_points)
                             titles.append(
                                 f"{type_matrix_str}_Точки_максимума_по_строкам_масштаб_{self.scales[scale]}_{colors[channel]}")
                         if col_var:
-                            extremes_to_process.append(pmaxc)
+                            # extremes_to_process.append(pmaxc)
+                            extremes_to_process.append(upper_max_col_points)
                             titles.append(
                                 f"{type_matrix_str}_Точки_максимума_по_cтолбцам_масштаб_{self.scales[scale]}_{colors[channel]}")
                     if min_var:
                         if row_var:
-                            extremes_to_process.append(pminr)
+                            # extremes_to_process.append(pminr)
+                            extremes_to_process.append(lower_min_row_points)
                             titles.append(
                                 f"{type_matrix_str}_Точки_минимума_по_строкам_масштаб_{self.scales[scale]}_{colors[channel]}")
                         if col_var:
-                            extremes_to_process.append(pminc)
+                            # extremes_to_process.append(pminc)
+                            extremes_to_process.append(lower_min_col_points)
                             titles.append(
                                 f"{type_matrix_str}_Точки_минимума_по_cтолбцам_масштаб_{self.scales[scale]}_{colors[channel]}")
 

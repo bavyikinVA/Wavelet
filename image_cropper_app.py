@@ -287,23 +287,32 @@ class ImageCropperApp(ctk.CTkToplevel):
 
     def save_and_exit(self):
         if not self.image:
-            return
+            return None
 
         file_path = self.get_cropped_filename()
 
-        if file_path:
-            try:
-                self.image.save(file_path)
-                self.destroy()
-                return file_path
-            except Exception as e:
-                print(f"Error saving image: {e}")
-                return None
+        if not file_path:
+            return None
+
+        try:
+            self.image.save(file_path)
+            self.destroy()
+            return file_path
+        except Exception as e:
+            print(f"Error saving image: {e}")
+            return None
 
     def get_cropped_filename(self):
-        if hasattr(self, 'original_file_path'):
-            path, ext = os.path.splitext(self.original_file_path)
-            return f"{path}_cropped{ext}"
+        if not hasattr(self, 'original_file_path'):
+            return None
+
+        base_path, ext = os.path.splitext(self.original_file_path)
+        filename = os.path.basename(base_path).lower()
+
+        if "cropped" in filename or "cropped_image" in filename:
+            return self.original_file_path
+        else:
+            return f"{base_path}_cropped{ext}"
 
 
 def run_cropper(master=None):
