@@ -4,9 +4,13 @@ from PIL import Image, ImageTk
 import numpy as np
 import os
 
+
 class PipetteApp(ctk.CTkToplevel):
     def __init__(self, master=None, image_path=None):
         super().__init__(master)
+        self.master_app = master
+        if hasattr(master, 'register_child_window'):
+            master.register_child_window(self)
         self.color1 = None
         self.color2 = None
         self.original_img = None
@@ -122,25 +126,40 @@ class PipetteApp(ctk.CTkToplevel):
         self.btn_reset.configure(state="disabled")
         self.btn_start_choice.configure(state="normal")
 
+    def safe_destroy(self):
+        """Безопасное уничтожение окна"""
+        try:
+            if hasattr(self, 'master_app') and hasattr(self.master_app, 'unregister_child_window'):
+                self.master_app.unregister_child_window(self)
+            self.grab_release()
+            self.destroy()
+        except tk.TclError:
+            pass
+
     def save_and_exit(self):
         if len(self.colors) == 2:
             self.color1 = np.array(self.colors[0], dtype=np.int16)
             self.color2 = np.array(self.colors[1], dtype=np.int16)
-            self.destroy()
+            self.safe_destroy()  # Используем безопасное закрытие
         else:
             self.color1, self.color2 = None, None
-            self.destroy()
+            self.safe_destroy()
 
     def get_colors(self):
         return self.color1, self.color2
 
-def run_pipette(master=None, image_path=None):
-    if master is None:
-        root = tk.Tk()
-        root.withdraw()
-        pipette_window = PipetteApp(root, image_path)
-    else:
-        pipette_window = PipetteApp(master, image_path)
 
-    pipette_window.wait_window()
-    return pipette_window.get_colors()
+def run_pipette(master=None, image_path=None):
+    try:
+        if master is None:
+            root = tk.Tk()
+            root.withdraw()
+            pipette_window = PipetteApp(root, image_path)
+        else:
+            pipette_window = PipetteApp(master, image_path)
+
+        pipette_window.wait_window()
+        return pipette_window.get_colors()
+    except Exception as e:
+        print(f"Error in pipette tool: {e}")
+        return None, None

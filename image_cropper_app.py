@@ -7,6 +7,10 @@ import os
 class ImageCropperApp(ctk.CTkToplevel):
     def __init__(self, master=None):
         super().__init__(master)
+        self.master_app = master  # Сохраняем ссылку на главное приложение
+        if hasattr(master, 'register_child_window'):
+            master.register_child_window(self)
+
         self.title("Advanced Image Cropper")
         self.geometry("1000x700")
         self.grab_set()
@@ -285,6 +289,16 @@ class ImageCropperApp(ctk.CTkToplevel):
         except Exception as e:
             print(f"Error cropping image: {e}")
 
+    def safe_destroy(self):
+        """Безопасное уничтожение окна"""
+        try:
+            if hasattr(self, 'master_app') and hasattr(self.master_app, 'unregister_child_window'):
+                self.master_app.unregister_child_window(self)
+            self.grab_release()
+            self.destroy()
+        except tk.TclError:
+            pass
+
     def save_and_exit(self):
         if not self.image:
             return None
@@ -296,7 +310,7 @@ class ImageCropperApp(ctk.CTkToplevel):
 
         try:
             self.image.save(file_path)
-            self.destroy()
+            self.safe_destroy()
             return file_path
         except Exception as e:
             print(f"Error saving image: {e}")
@@ -325,7 +339,8 @@ def run_cropper(master=None):
             cropper_window = ImageCropperApp(master)
 
         cropper_window.wait_window()
-        return cropper_window.save_and_exit()
+        result = cropper_window.save_and_exit()
+        return result
     except Exception as e:
-        print(f"Error saving image: {e}")
+        print(f"Error in image cropper: {e}")
         return None
