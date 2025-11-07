@@ -1,45 +1,4 @@
 import os
-import warnings
-
-# НАСТРОЙКА CUDA
-def setup_cuda_environment():
-    """Настройка окружения CUDA перед импортом любых библиотек"""
-    # Подавление предупреждений CuPy
-    warnings.filterwarnings("ignore", message="CUDA path could not be detected")
-
-    # Автоматический поиск пути CUDA
-    cuda_paths = [
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.5",  # CUDA 12.0
-        os.environ.get('CUDA_PATH'),
-        os.environ.get('CUDA_HOME'),
-    ]
-
-    for path in cuda_paths:
-        if path and os.path.exists(path):
-            os.environ['CUDA_PATH'] = path
-            # Добавляем в PATH для доступа к библиотекам
-            cuda_bin = os.path.join(path, 'bin')
-            cuda_lib = os.path.join(path, 'lib', 'x64')
-            if os.path.exists(cuda_bin) and cuda_bin not in os.environ['PATH']:
-                os.environ['PATH'] = cuda_bin + os.pathsep + os.environ['PATH']
-            if os.path.exists(cuda_lib) and cuda_lib not in os.environ['PATH']:
-                os.environ['PATH'] = cuda_lib + os.pathsep + os.environ['PATH']
-            print(f"🔧 Настроен путь CUDA: {path}")
-            return path
-
-    print("⚠️ CUDA путь не найден автоматически")
-    return None
-
-
-# Выполняем настройку ДО всех импортов
-cuda_path = setup_cuda_environment()
-
-# Дополнительные настройки для подавления предупреждений
-os.environ['CUPY_CUDA_DISABLE_CUBIN_CACHE'] = '1'
-os.environ['CUPY_CACHE_DIR'] = os.path.join(os.path.expanduser('~'), '.cupy', 'cache')
-
-
-import os
 import threading
 import time
 import tkinter as tk
@@ -54,25 +13,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import interpol
+import points
 from Gram_Shmidt import change_channels
+from compute.cpu_wavelet import morlet_wavelet_with_padding
 from compute.processing_task import ProcessingTask
 from image_cropper_app import run_cropper
 from pipette import run_pipette
 from utils.gui import TkinterApp, ScrollableFrame, CollapsibleFrame
 from utils.progress_manager import ProgressManager
-import points as knn
 
 
 def process_row_static(args_):
-    """Статическая функция для обработки строк на CPU"""
     row_data, scales_ = args_
-    from compute.cpu_wavelet import morlet_wavelet_with_padding
     return morlet_wavelet_with_padding(row_data, scales_)
 
+
 def process_column_static(args_):
-    """Статическая функция для обработки столбцов на CPU"""
     col_idx, column_data, scales_ = args_
-    from compute.cpu_wavelet import morlet_wavelet_with_padding
     return col_idx, morlet_wavelet_with_padding(column_data, scales_)
 
 
@@ -82,25 +39,6 @@ class ImageProcessor:
         self.tasks = []
         self.current_task_index = -1
         self.root_folder_path = ""  # Корневая папка для всех задач
-
-        # Инициализация бэкенда вычислений с автоматическим определением
-        from compute.backend import ComputeBackend
-        from compute.gpu_processor import GPUWaveletProcessor
-        self.backend = ComputeBackend()  # Автоматически определит доступность GPU
-        self.gpu_processor = GPUWaveletProcessor()
-
-        # Логирование информации о бэкенде
-        backend_info = self.backend.get_backend_info()
-        self.progress.log_info(f"Вычислительный бэкенд: {backend_info['device_name']}")
-        if backend_info['use_gpu']:
-            self.progress.log_info(f"GPU память: {backend_info['gpu_memory']}")
-
-    def clear_gpu_memory(self):
-        """Очистка GPU памяти"""
-        if hasattr(self, 'backend'):
-            self.backend.clear_gpu_cache()
-        if hasattr(self, 'gpu_processor'):
-            self.gpu_processor.clear_cache()
 
     def add_task(self, task):
         task.task_id = len(self.tasks) + 1
@@ -237,29 +175,17 @@ class ImageProcessor:
         task.num_scale = len(task.scales)
         self.progress.log_info(f"Загружено {task.num_scale} масштабов")
 
-    def toggle_gpu_backend(self):
-        """Переключение между CPU и GPU"""
-        success = self.backend.toggle_backend()
-        backend_info = self.backend.get_backend_info()
-        if success:
-            self.progress.log_info(f"Переключено на: {backend_info['device_name']}")
-        return success, backend_info
-
-    def get_backend_info(self):
-        """Получение информации о бэкенде"""
-        return self.backend.get_backend_info()
-
-    def process_channel(self, data, scales):
+    @staticmethod
+    def process_channel(data, scales):
         """
-        Обработка канала с встроенным симметричным отражением на CPU
+        Обработка канала с встроенным симметричным отражением
         """
         rows = data.shape[0]
         cols = data.shape[1]
         scales_size = len(scales)
         result = np.zeros((rows, scales_size, cols))
 
-        self.progress.log_info(f"🔹 CPU обработка {rows} строк...")
-
+        print("start_morlet with symmetric padding")
         with Pool() as pool:
             args = [(data[i], scales) for i in range(rows)]
             results = pool.map(process_row_static, args)
@@ -269,17 +195,16 @@ class ImageProcessor:
 
         return result
 
-    def process_channel_columns(self, data, scales):
+    @staticmethod
+    def process_channel_columns(data, scales):
         """
-        Параллельная обработка столбцов с использованием multiprocessing на CPU
+        Параллельная обработка столбцов с использованием multiprocessing
         """
         cols = data.shape[1]
         scales_size = len(scales)
         rows = data.shape[0]
 
         result_3d = np.zeros((scales_size, cols, rows))
-
-        self.progress.log_info(f"🔹 CPU обработка {cols} столбцов...")
 
         # Подготавливаем аргументы для каждого столбца
         args = [(col_idx, data[:, col_idx], scales) for col_idx in range(cols)]
@@ -294,27 +219,13 @@ class ImageProcessor:
 
         return np.transpose(result_3d, (0, 2, 1))
 
-    def process_channel_batch_gpu(self, data_channel, scales):
-        """Батчевая обработка ВСЕГО канала на GPU (используется для обоих backend)"""
-        if not self.backend.use_gpu:
-            return self.process_channel(data_channel, scales)  # CPU fallback
-
-        try:
-            rows, cols = data_channel.shape
-            self.progress.log_info(f"Подготовка батча для GPU: {rows} строк × {cols} колонок")
-
-            result = self.gpu_processor.morlet_wavelet_batch(data_channel, scales)  # [rows, scales, cols]
-            return result
-
-        except Exception as e:
-            self.progress.log_error(f"❌ GPU батчевая обработка не удалась: {e}. Возврат к CPU.")
-            return self.process_channel(data_channel, scales)
-
     def wavelets(self, task, type_data, data_3_channel):
-        """Версия для GPU с прогресс-баром"""
+        """
+        type_data - флажок для направления обработки
+        (0 - построчно, 1 - по столбцам)
+        """
         t_compute_wavelet_start = time.time()
-
-        backend_info = "GPU" if self.backend.use_gpu else "CPU"
+        backend_info = "CPU"
         direction = "построчно" if type_data == 0 else "по столбцам"
 
         self.progress.log_info(f"Начало вейвлет-преобразования ({backend_info}, {direction})")
@@ -323,29 +234,23 @@ class ImageProcessor:
         num_rows = task.data[0].shape[0]
         num_cols = task.data[0].shape[1]
 
-        self.progress.log_info(f"Масштабы: {len(task.scales)}, Строки: {num_rows}, Столбцы: {num_cols}")
-        self.progress.log_info(
-            f"Общий объем: {num_channels} канала × {num_rows if type_data == 0 else num_cols} направлений")
+        self.progress.log_info(f"Масштабы: {len(task.scales)}, "
+                               f"Строки: {num_rows}, Столбцы: {num_cols}")
 
-        total_operations = num_channels
+        total_operations = num_channels * (num_rows if type_data == 0 else num_cols)
         current_operation = 0
 
         for channel in range(num_channels):
             channel_name = ['Красный', 'Зеленый', 'Синий'][channel]
-
-            # Обновляем прогресс для каждого канала
-            progress = current_operation / total_operations
             self.progress.update_progress(
-                progress,
-                f"Подготовка канала {channel_name}..."
+                current_operation / total_operations,
+                f"Обработка канала {channel_name}..."
             )
 
             data_channel = task.data[channel].astype(np.float64)
-
             # Вычитание среднего
             insert_filename = "rows" if type_data == 0 else "cols"
             file_mean_path = os.path.join(task.task_folder_path, f'mean_to_{insert_filename}_by_channel_{channel}.txt')
-
             with open(file_mean_path, 'w') as file:
                 for i in range(data_channel.shape[0] if type_data == 0 else data_channel.shape[1]):
                     if type_data == 0:
@@ -354,45 +259,30 @@ class ImageProcessor:
                         file.write(str(mean) + "\n")
                         data_channel[i] -= mean
                     else:
+                        # Для обработки по столбцам - вычитаем среднее по столбцам
                         col = data_channel[:, i]
                         mean = np.mean(col)
                         file.write(str(mean) + "\n")
                         data_channel[:, i] -= mean
 
-            # GPU обработка
-            if self.backend.use_gpu:
-                self.progress.update_progress(
-                    progress + 0.1 / total_operations,
-                    f"GPU обработка канала {channel_name}..."
-                )
+            # Выбор метода обработки
+            if type_data == 0:
+                # Построчная обработка
+                print("morlet построчно")
+                data_channel_after = self.process_channel(data_channel, task.scales)
+                data_channel_after_transposed = np.transpose(data_channel_after, (1, 0, 2))
+                # (scales, rows, cols)
+            else:
+                # обработка по столбцам
+                print("morlet по столбцам")
+                data_channel_after = self.process_channel_columns(data_channel, task.scales)
+                # data_channel_after имеет форму (scales, rows, cols)
+                data_channel_after_transposed = data_channel_after
 
-                try:
-                    if type_data == 0:
-                        self.progress.log_info(f"🔹 GPU обработка {num_rows} строк канала {channel_name}...")
-                        data_channel_after = self.gpu_processor.morlet_wavelet_batch(data_channel, task.scales)
-                        data_channel_after_transposed = np.transpose(data_channel_after, (1, 0, 2))
-                    else:
-                        self.progress.log_info(f"🔹 GPU обработка {num_cols} столбцов канала {channel_name}...")
-                        data_channel_transposed = data_channel.T
-                        data_channel_after = self.gpu_processor.morlet_wavelet_batch(data_channel_transposed,
-                                                                                     task.scales)
-                        data_channel_after_transposed = np.transpose(data_channel_after, (1, 2, 0))
+            print(f"Результат канала {channel_name}: {data_channel_after_transposed.shape}")
+            data_3_channel[channel] = data_channel_after_transposed
 
-                    data_3_channel[channel] = data_channel_after_transposed
-
-                except Exception as e:
-                    self.progress.log_error(f"❌ Ошибка GPU: {e}. Переход на CPU...")
-                    # Fallback to CPU
-                    if type_data == 0:
-                        data_channel_after = self.process_channel(data_channel, task.scales)
-                        data_channel_after_transposed = np.transpose(data_channel_after, (1, 0, 2))
-                    else:
-                        data_channel_after = self.process_channel_columns(data_channel, task.scales)
-                        data_channel_after_transposed = data_channel_after
-
-                    data_3_channel[channel] = data_channel_after_transposed
-
-            current_operation += 1
+            current_operation += (num_rows if type_data == 0 else num_cols)
             self.progress.update_progress(
                 current_operation / total_operations,
                 f"Завершен канал {channel_name}"
@@ -463,6 +353,7 @@ class ImageProcessor:
                     plt.close()
                     self.progress.log_debug(f"Сохранен график для масштаба {task.scales[scale]}")
 
+
     @staticmethod
     def find_extremes(coefs, row_var, col_var, max_var, min_var):
         points_max_by_row = []
@@ -486,7 +377,7 @@ class ImageProcessor:
                 min_coords = np.where(min_mask)
                 points_min_by_row = [[x + 1, y] for y, x in zip(min_coords[0], min_coords[1])]
 
-        # Экстремумы по столбцам
+        # экстремумы по столбцам
         if col_var and (max_var or min_var):
             up = coefs[:-2, :]
             center = coefs[1:-1, :]
@@ -506,58 +397,28 @@ class ImageProcessor:
 
     def compute_points(self, task, row_var, col_var, max_var, min_var,
                        knn_var, knn_bool_text_var, knn_bool_image_var, print_text_var, print_graphic, pipette_state):
-        """Поиск точек экстремумов и KNN"""
-
-        self.progress.update_progress(0.1, "Начало поиска экстремумов...")
         self.progress.log_info("Запущена функция подсчета экстремумов")
-
         extremes = []
-
-        # общее количество операций для прогресс-бара
-        total_operations = 2 * (1 if pipette_state == 'normal' else 3) * task.num_scale
-        current_operation = 0
-
         for type_data in range(2):
-            direction = "построчно" if type_data == 0 else "по столбцам"
             channels_to_process = [0] if pipette_state == 'normal' else range(3)
-
             for channel in channels_to_process:
-                channel_name = ['Красный', 'Зелёный', 'Синий'][channel]
-
                 for scale in range(task.num_scale):
-                    current_operation += 1
-
-                    # обновление прогресс-бара
-                    progress = 0.1 + (current_operation / total_operations) * 0.8
-                    self.progress.update_progress(
-                        progress,
-                        f"Поиск экстремумов: {channel_name}, масштаб {task.scales[scale]}, {direction}"
-                    )
-
-                    # Получение коэффициентов вейвлета
                     coefs_2d = task.result[type_data][channel][scale]
                     coefs_2d = np.round(coefs_2d, decimals=3)
-
-                    # Поиск экстремумов
                     coefs_2d, pmaxr, pmaxc, pminr, pminc = self.find_extremes(
-                        coefs=coefs_2d, row_var=row_var, col_var=col_var,
+                        coefs=coefs_2d,
+                        row_var=row_var, col_var=col_var,
                         max_var=max_var, min_var=min_var)
 
-                    # логирование статистики найденных точек
                     self.progress.log_info(
-                        f"Масштаб {task.scales[scale]}, {channel_name}, {direction}: "
-                        f"макс_строк={len(pmaxr)}, мин_строк={len(pminr)}, "
-                        f"макс_столб={len(pmaxc)}, мин_столб={len(pminc)}"
-                    )
+                        f"Extremes - pmaxr: {len(pmaxr)}, pminr: {len(pminr)}, pmaxc: {len(pmaxc)}, pminc: {len(pminc)}")
 
                     colors = ['Красный', 'Зелёный', 'Синий']
                     type_matrix_str = "Str" if type_data == 0 else "Tr"
 
-                    # Получение огибающих
                     upper_max_row_points, lower_min_row_points = interpol.get_row_envelopes(coefs_2d, pmaxr, pminr)
                     upper_max_col_points, lower_min_col_points = interpol.get_column_envelopes(coefs_2d, pmaxc, pminc)
 
-                    # Валидация точек
                     if not isinstance(upper_max_row_points, (list, np.ndarray)) or len(upper_max_row_points) == 0:
                         upper_max_row_points = []
                     if not isinstance(lower_min_row_points, (list, np.ndarray)) or len(lower_min_row_points) == 0:
@@ -567,8 +428,9 @@ class ImageProcessor:
                     if not isinstance(lower_min_col_points, (list, np.ndarray)) or len(lower_min_col_points) == 0:
                         lower_min_col_points = []
 
-                    # Подготовка данных для сохранения
+                    # массив для выгрузки массивов точек экстремумов
                     extremes_to_process = []
+                    # массив названий заголовков файлов
                     titles = []
 
                     if max_var:
@@ -590,18 +452,15 @@ class ImageProcessor:
                             titles.append(
                                 f"{type_matrix_str}_Точки_минимума_по_cтолбцам_масштаб_{task.scales[scale]}_{colors[channel]}")
 
-                    # Сохранение результатов
                     scale_folder = self.find_scale_folder(task, task.scales[scale])
                     for i, p in enumerate(extremes_to_process):
                         if len(p) > 0:
                             if print_text_var:
                                 self.save_extremes_to_file(scale_folder, titles[i], p)
-                                self.progress.log_debug(f"Сохранен текстовый файл: {titles[i]}.txt")
                             if print_graphic:
-                                self.save_extremes_graphic(scale_folder, titles[i], p, coefs_2d.shape)
-                                self.progress.log_debug(f"Сохранен график: {titles[i]}.png")
+                                self.graphic(scale_folder, titles[i], p, coefs_2d.shape)
 
-                    # Подготовка данных для KNN
+                    # словарь с отфильтрованными экстремумами
                     knn_extremes = {
                         'type_data': type_data,
                         'channel': channel,
@@ -613,40 +472,14 @@ class ImageProcessor:
                     }
                     extremes.append(knn_extremes)
 
-                    # Обработка KNN
                     if knn_bool_text_var or knn_bool_image_var:
-                        self.progress.update_progress(0.85, "Обработка KNN...")
-                        self.progress.log_info(f"Применение KNN для {channel_name}, масштаб {task.scales[scale]}")
-
-                        # Вызов с передачей callback'ов для логирования
-                        knn.process_extremes_with_knn(
-                            knn_extremes,
-                            scale_folder,
-                            knn_var,
-                            task.original_image,
-                            knn_bool_text_var,
-                            knn_bool_image_var,
-                            progress_callback=self.progress.update_progress,
-                            log_callback=self.progress.log_info
-                        )
-
-        # ⚠️ ИСПРАВЛЕНИЕ: выносим завершение за пределы цикла for type_data
-        # Завершение процесса
-        self.progress.update_progress(0.95, "Завершение поиска экстремумов...")
-
-        # Подсчет общей статистики
-        total_points = sum(len(extreme['max_by_row']) + len(extreme['max_by_column']) +
-                           len(extreme['min_by_row']) + len(extreme['min_by_column'])
-                           for extreme in extremes)
-
-        self.progress.log_info(f"Всего найдено точек экстремумов: {total_points}")
-        self.progress.update_progress(1.0, "Поиск экстремумов завершен")
+                        points.process_extremes_with_knn(knn_extremes, scale_folder, knn_var,
+                                                         task.original_image, knn_bool_text_var, knn_bool_image_var)
 
         return extremes
 
     @staticmethod
     def save_extremes_to_file(path, title, local_points):
-        """Сохранение точек экстремумов в файл"""
         if not local_points:
             print(f"Нет точек для сохранения в {title}")
             return
@@ -661,43 +494,38 @@ class ImageProcessor:
             print(f"Ошибка при сохранении файла {file_path}: {str(e)}")
 
     @staticmethod
-    def save_extremes_graphic(path, title, points_local, original_img_shape):
-        """Сохранение графиков точек экстремумов"""
+    def graphic(path, title, points_local, original_img_shape):
         if not points_local:
             print(f"Нет точек для отображения: {title}")
             return
 
-        try:
-            plt.figure(figsize=(10, 10))
+        plt.figure(figsize=(10, 10))
 
-            data = np.array(points_local)
-            x = data[:, 0]
-            y = data[:, 1]
+        data = np.array(points_local)
+        x = data[:, 0]
+        y = data[:, 1]
 
-            # оси с сохранением пропорций
-            ax = plt.gca()
+        # оси с сохранением пропорций
+        ax = plt.gca()
 
-            if original_img_shape is not None:
-                height, width = original_img_shape[:2]
-                ax.set_xlim(0, width)
-                ax.set_ylim(height, 0)  # инвертируем ось Y
-                ax.set_aspect('equal')  # фиксируем соотношение сторон 1:1
+        if original_img_shape is not None:
+            height, width = original_img_shape[:2]
+            ax.set_xlim(0, width)
+            ax.set_ylim(height, 0)  # инвертируем ось Y
+            ax.set_aspect('equal')  # фиксируем соотношение сторон 1:1
 
-            # рисуем точки
-            plt.scatter(x, y, s=1, alpha=0.6)
-            plt.title(title)
+        # рисуем точки
+        plt.scatter(x, y, s=1, alpha=0.6)
+        plt.title(title)
 
-            plt.grid(True)
-            plt.xlabel('X (пиксели)')
-            plt.ylabel('Y (пиксели)')
+        plt.grid(True)
+        plt.xlabel('X (пиксели)')
+        plt.ylabel('Y (пиксели)')
 
-            filename = os.path.join(path, f"{title}.png")
-            plt.savefig(filename, bbox_inches='tight', dpi=96)
-            plt.close()
-            print(f"График сохранён: {filename}")
-
-        except Exception as e:
-            print(f"Ошибка при сохранении графика {title}: {str(e)}")
+        filename = os.path.join(path, f"{title}.png")
+        plt.savefig(filename, bbox_inches='tight', dpi=96)
+        plt.close()
+        print(f"График сохранён: {filename}")
 
     def find_scale_folder(self, task, scale):
         """Находит папку масштаба для текущей задачи"""
@@ -713,33 +541,29 @@ class ImageProcessor:
             print(f"Directory {scale_folder_path} is not found")
             return None
 
+
     def compute_for_task(self, task, wp_var1, wp_var2, print_channels_txt_var, row_var, col_var, max_var, min_var,
                          p_ex_var1, p_ex_var2, knn_bool_text_var, knn_bool_image_var, pipette_state):
         """Выполнение вычислений для конкретной задачи"""
         try:
             task_folder = self.create_task_folder(task)
             self.progress.log_info(f"Создана папка для {task.task_name}: {task_folder}")
-
-            # Сохранение исходных каналов - 5%
-            self.progress.update_progress(0.05, "Сохранение исходных каналов...")
             self.save_orig_channels_txt(task, print_channels_txt_var)
 
             task.result = []
+
             info_out = self._get_output_type(wp_var1.get(), wp_var2.get())
 
-            # Вейвлет-преобразование - 60%
-            self.progress.update_progress(0.1, "Начало вейвлет-преобразования...")
             self.compute_wavelets(task, info_out)
 
-            # Поиск экстремумов - 30%
-            self.progress.update_progress(0.7, "Начало поиска экстремумов...")
+            self.progress.log_info("Поиск точек экстремумов...")
             if p_ex_var1.get() or p_ex_var2.get():
+                self.progress.log_info(f"Calling compute_points with row_var={row_var.get()}, col_var={col_var.get()}, "
+                                       f"max_var={max_var.get()}, min_var={min_var.get()}")
                 self.compute_points(task, row_var.get(), col_var.get(), max_var.get(), min_var.get(),
                                     task.k_neighbors, knn_bool_text_var.get(), knn_bool_image_var.get(),
                                     p_ex_var1.get(), p_ex_var2.get(), pipette_state)
 
-            # Завершение - 5%
-            self.progress.update_progress(1.0, f"Вычисления для {task.task_name} завершены успешно")
             self.progress.log_info(f"Вычисления для {task.task_name} завершены успешно")
 
         except Exception as e:
@@ -750,7 +574,6 @@ class ImageProcessor:
         finally:
             # Очищаем временные данные в задаче после вычислений
             task.result = []
-            # self.clear_gpu_cache()
 
     @staticmethod
     def _get_output_type(wp_var1, wp_var2):
@@ -771,7 +594,8 @@ class App(TkinterApp):
         self._compute_thread = None
         self.title("Wavelets - Professional Edition")
         self.resizable(True, True)
-        self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight() - 40}+0+0")
+        # self.state('normal')
+        self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()-40}+0+0")
 
         # настройка темы
         ctk.set_appearance_mode("dark")
@@ -807,24 +631,8 @@ class App(TkinterApp):
         self.current_task = None
         self.knn_text_var.trace('w', self.update_knn_for_current_task)
 
-        # Переменная для GPU/CPU переключения
-        self.use_gpu_var = tk.BooleanVar(value=True)
-
-        # Обновляем UI после инициализации image_processor
-        self.after(100, self._update_gpu_section)
-
         # ждем создания всех виджетов и затем максимизируем
         self.after(100, self._maximize_properly)
-
-    def _update_gpu_section(self):
-        """Обновление секции GPU после инициализации image_processor"""
-        if hasattr(self, 'compute_settings_section') and self.compute_settings_section:
-            # Очищаем секцию
-            for widget in self.compute_settings_section.content.winfo_children():
-                widget.destroy()
-
-            # Пересоздаем содержимое
-            self._setup_compute_settings_section()
 
     def _maximize_properly(self):
         """Правильная максимизация после создания всех виджетов"""
@@ -851,57 +659,6 @@ class App(TkinterApp):
                 child.update_scrollbar()
 
         self.update()
-
-    def _create_main_container(self):
-        """Создание главного контейнера с четким разделением на верхнюю и нижнюю части"""
-        # Главный контейнер - используем вертикальное расположение pack
-        self.main_container = ctk.CTkFrame(self)
-        self.main_container.pack(fill="both", expand=True, padx=5, pady=5)
-
-        # Верхняя часть - 3 панели (будет занимать 85% пространства)
-        self.panels_frame = ctk.CTkFrame(self.main_container)
-        self.panels_frame.pack(fill="both", expand=True, pady=(0, 5))
-
-        # Нижняя часть - прогресс (фиксированная высота, 15% пространства)
-        # ProgressManager автоматически создаст свой frame и упакует его
-
-    def _create_ui(self):
-        """Создание всех UI элементов с четким разделением"""
-        # ==================== ВЕРХНЯЯ ЧАСТЬ - 3 ПАНЕЛИ ====================
-        self._create_top_panels()
-
-        # ==================== НИЖНЯЯ ЧАСТЬ - ПРОГРЕСС ====================
-        self._setup_bottom_progress()
-
-    def _create_top_panels(self):
-        """Создание 3 панелей в верхней части"""
-        # Настройка сетки для 3 панелей - равномерное распределение
-        self.panels_frame.grid_columnconfigure(0, weight=1)  # Левая панель - задачи
-        self.panels_frame.grid_columnconfigure(1, weight=1)  # Центральная панель - ввод
-        self.panels_frame.grid_columnconfigure(2, weight=1)  # Правая панель - вывод
-        self.panels_frame.grid_rowconfigure(0, weight=1)  # Одна строка
-
-        # 1. Левая панель - управление задачами
-        self.tasks_panel = self._create_tasks_panel()
-        self.tasks_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
-
-        # 2. Центральная панель - настройки ввода
-        self.left_panel = self._create_left_panel()
-        self.left_panel.grid(row=0, column=1, sticky="nsew", padx=2)
-
-        # 3. Правая панель - настройки вывода
-        self.right_panel = self._create_right_panel()
-        self.right_panel.grid(row=0, column=2, sticky="nsew", padx=(2, 0))
-
-    def _setup_bottom_progress(self):
-        """Настройка нижней панели прогресса"""
-        # Переупаковываем фрейм прогресса в нижнюю часть главного контейнера.
-        # Устанавливаем фиксированную высоту и запрещаем изменение размера
-        self.progress_manager.frame.configure(height=180)  # Фиксированная высота
-        self.progress_manager.frame.pack_propagate(False)  # Запрещаем авто-изменение размера
-
-        # Упаковываем вниз главного контейнера
-        self.progress_manager.frame.pack(side="bottom", fill="x", padx=0, pady=0)
 
     def _initialize_ui_variables(self):
         """Инициализация всех переменных UI"""
@@ -934,8 +691,45 @@ class App(TkinterApp):
         self.entry_near_point = None
         self.app_start_button = None
         self.task_widgets = []
-        self.compute_settings_section = None
-        self.gpu_checkbox = None
+
+    def _create_left_panel(self):
+        """Создание левой панели с настройками ввода"""
+        panel = ctk.CTkFrame(self.main_container)
+
+        # Используем ScrollableFrame для прокрутки
+        scrollable_panel = ScrollableFrame(panel)
+        scrollable_panel.pack(fill="both", expand=True)
+
+        # Заголовок панели
+        header = ctk.CTkLabel(
+            scrollable_panel.scrollable_frame,
+            text="Настройки ввода и обработки",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            anchor="w"
+        )
+        header.pack(fill="x", padx=10, pady=(10, 15))
+
+        # Секция загрузки изображения
+        self.load_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="📁 Загрузка изображения")
+        self.load_section.pack(fill="x", padx=5, pady=2)
+        self._setup_load_section()
+
+        # Секция работы с каналами
+        self.channel_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="🎨 Работа с каналами")
+        self.channel_section.pack(fill="x", padx=5, pady=2)
+        self._setup_channel_section()
+
+        # Секция масштабов
+        self.scales_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="📏 Настройка масштабов")
+        self.scales_section.pack(fill="x", padx=5, pady=2)
+        self._setup_scales_section()
+
+        # Секция точек экстремумов
+        self.extremes_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="📊 Точки экстремумов")
+        self.extremes_section.pack(fill="x", padx=5, pady=2)
+        self._setup_extremes_section()
+
+        return panel
 
     def _create_tasks_panel(self):
         """Создание панели управления задачами"""
@@ -991,45 +785,6 @@ class App(TkinterApp):
 
         return panel
 
-    def _create_left_panel(self):
-        """Создание левой панели с настройками ввода"""
-        panel = ctk.CTkFrame(self.main_container)
-
-        # Используем ScrollableFrame для прокрутки
-        scrollable_panel = ScrollableFrame(panel)
-        scrollable_panel.pack(fill="both", expand=True)
-
-        # Заголовок панели
-        header = ctk.CTkLabel(
-            scrollable_panel.scrollable_frame,
-            text="Настройки ввода и обработки",
-            font=ctk.CTkFont(size=16, weight="bold"),
-            anchor="w"
-        )
-        header.pack(fill="x", padx=10, pady=(10, 15))
-
-        # Секция загрузки изображения
-        self.load_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="📁 Загрузка изображения")
-        self.load_section.pack(fill="x", padx=5, pady=2)
-        self._setup_load_section()
-
-        # Секция работы с каналами
-        self.channel_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="🎨 Работа с каналами")
-        self.channel_section.pack(fill="x", padx=5, pady=2)
-        self._setup_channel_section()
-
-        # Секция масштабов
-        self.scales_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="📏 Настройка масштабов")
-        self.scales_section.pack(fill="x", padx=5, pady=2)
-        self._setup_scales_section()
-
-        # Секция точек экстремумов
-        self.extremes_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="📊 Точки экстремумов")
-        self.extremes_section.pack(fill="x", padx=5, pady=2)
-        self._setup_extremes_section()
-
-        return panel
-
     def _create_right_panel(self):
         """Создание правой панели с настройками вывода"""
         panel = ctk.CTkFrame(self.main_container)
@@ -1046,19 +801,6 @@ class App(TkinterApp):
             anchor="w"
         )
         header.pack(fill="x", padx=10, pady=(10, 15))
-
-        # НОВАЯ СЕКЦИЯ: Настройки вычислений
-        self.compute_settings_section = CollapsibleFrame(scrollable_panel.scrollable_frame,
-                                                         title="⚙️ Настройки вычислений")
-        self.compute_settings_section.pack(fill="x", padx=5, pady=2)
-        # Создаем временный контент, который обновим позже
-        temp_label = ctk.CTkLabel(
-            self.compute_settings_section.content,
-            text="Загрузка настроек...",
-            font=ctk.CTkFont(size=11),
-            text_color="gray"
-        )
-        temp_label.pack(pady=10)
 
         # Секция вейвлет-преобразования
         self.wavelet_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="🌀 Вейвлет-преобразование")
@@ -1088,132 +830,6 @@ class App(TkinterApp):
         self._setup_compute_section()
 
         return panel
-
-    def _setup_compute_settings_section(self):
-        """Настройка секции параметров вычислений"""
-        # Очищаем секцию
-        for widget in self.compute_settings_section.content.winfo_children():
-            widget.destroy()
-
-        # Проверяем, что image_processor инициализирован
-        if not hasattr(self, 'image_processor') or self.image_processor is None:
-            error_label = ctk.CTkLabel(
-                self.compute_settings_section.content,
-                text="Ошибка инициализации процессора",
-                font=ctk.CTkFont(size=11),
-                text_color="red"
-            )
-            error_label.pack(pady=10)
-            return
-
-        # Информация о бэкенде
-        backend_info = self.image_processor.get_backend_info()
-        info_text = f"Устройство: {backend_info['device_name']}"
-        if backend_info['use_gpu'] and backend_info['gpu_memory'] != "N/A":
-            info_text += f" | Память: {backend_info['gpu_memory']}"
-
-        info_label = ctk.CTkLabel(
-            self.compute_settings_section.content,
-            text=info_text,
-            font=ctk.CTkFont(size=11),
-            text_color="lightblue",
-            anchor="w"
-        )
-        info_label.pack(fill="x", pady=(0, 10))
-
-        # Переключатель CPU/GPU
-        gpu_available = self.image_processor.backend.is_gpu_available()
-
-        self.gpu_checkbox = ctk.CTkCheckBox(
-            self.compute_settings_section.content,
-            text="Использовать GPU (ускорение)",
-            variable=self.use_gpu_var,
-            command=self.toggle_gpu_backend,
-            state="normal" if gpu_available else "disabled"
-        )
-        # Устанавливаем начальное значение
-        self.use_gpu_var.set(self.image_processor.backend.use_gpu)
-        self.gpu_checkbox.pack(fill="x", pady=5)
-
-        if not gpu_available:
-            warning_label = ctk.CTkLabel(
-                self.compute_settings_section.content,
-                text="GPU не обнаружен. Установите CuPy для CUDA поддержки.",
-                font=ctk.CTkFont(size=10),
-                text_color="orange",
-                anchor="w"
-            )
-            warning_label.pack(fill="x", pady=(5, 0))
-        else:
-            status_label = ctk.CTkLabel(
-                self.compute_settings_section.content,
-                text="✅ GPU доступен для вычислений",
-                font=ctk.CTkFont(size=10),
-                text_color="green",
-                anchor="w"
-            )
-            status_label.pack(fill="x", pady=(5, 0))
-
-            # Выбор режима точности GPU
-            accuracy_frame = ctk.CTkFrame(self.compute_settings_section.content, fg_color="transparent")
-            accuracy_frame.pack(fill="x", pady=5)
-
-            accuracy_label = ctk.CTkLabel(
-                accuracy_frame,
-                text="Режим точности GPU:",
-                font=ctk.CTkFont(size=11, weight="bold"),
-                anchor="w"
-            )
-            accuracy_label.pack(fill="x")
-
-            self.accuracy_var = tk.StringVar(value="balanced")
-
-            accuracy_options = [
-                ("Высокая точность", "high"),
-                ("Сбалансированный", "balanced"),
-                ("Высокая скорость", "fast")
-            ]
-
-            for text, mode in accuracy_options:
-                rb = ctk.CTkRadioButton(
-                    accuracy_frame,
-                    text=text,
-                    variable=self.accuracy_var,
-                    value=mode,
-                    command=self.on_accuracy_mode_changed
-                )
-                rb.pack(anchor="w", pady=2)
-
-    def on_accuracy_mode_changed(self):
-        """Обработчик изменения режима точности"""
-        if hasattr(self, 'image_processor') and self.image_processor.gpu_processor:
-            self.image_processor.gpu_processor.set_accuracy_mode(self.accuracy_var.get())
-            self.progress_manager.log_info(f"Режим точности GPU изменен на: {self.accuracy_var.get()}")
-
-
-
-    def toggle_gpu_backend(self):
-        """Переключение между CPU и GPU"""
-        success, backend_info = self.image_processor.toggle_gpu_backend()
-
-        # Обновляем UI
-        if success:
-            new_state = "GPU" if backend_info['use_gpu'] else "CPU"
-            self.progress_manager.log_info(f"Переключено на вычисления на {new_state}")
-
-            # Обновляем информацию в UI
-            self._update_compute_settings_display()
-
-
-    def _update_compute_settings_display(self):
-        """Обновление отображения настроек вычислений"""
-        if not hasattr(self, 'image_processor') or self.image_processor is None:
-            return
-
-        backend_info = self.image_processor.get_backend_info()
-
-        # Обновляем состояние чекбокса
-        self.use_gpu_var.set(backend_info['use_gpu'])
 
     def _setup_load_section(self):
         """Настройка секции загрузки изображения"""
@@ -1422,6 +1038,7 @@ class App(TkinterApp):
         self.entry_near_point.pack(fill="x", pady=(5, 0))
         self.entry_near_point.bind("<Button-1>", self.on_entry_click)
 
+
     def add_new_task(self):
         try:
             # Создаем новую задачу
@@ -1431,8 +1048,8 @@ class App(TkinterApp):
             self.current_task = new_task
             self.image_processor.set_current_task(task_id)
             # обновляем интерфейс окна
-            self._update_ui_for_current_task()
             self._update_tasks_display()
+            self._update_ui_for_current_task()
 
             self.progress_manager.log_info(f"Добавлена новая задача #{task_id}")
 
@@ -1447,27 +1064,16 @@ class App(TkinterApp):
             try:
                 widget.destroy()
             except Exception as e:
-                print(f"Ошибка при удалении виджета задачи: {e}")
+                print(str(e))
+                pass
         self.task_widgets.clear()
 
         # Обновляем статус
         task_count = len(self.image_processor.tasks)
         if task_count == 0:
-            self.tasks_status_label.configure(
-                text="Задачи не добавлены",
-                text_color="gray"
-            )
+            self.tasks_status_label.configure(text="Задачи не добавлены", text_color="gray")
         else:
-            status_text = f"Всего задач: {task_count}"
-            active_tasks = sum(1 for task in self.image_processor.tasks
-                               if task.image_path and len(task.scales) > 0)
-            if active_tasks > 0:
-                status_text += f" | Готовы к вычислениям: {active_tasks}"
-
-            self.tasks_status_label.configure(
-                text=status_text,
-                text_color="white"
-            )
+            self.tasks_status_label.configure(text=f"Всего задач: {task_count}", text_color="white")
 
         # Создаем виджеты для каждой задачи
         for task in self.image_processor.tasks:
@@ -1475,100 +1081,52 @@ class App(TkinterApp):
 
     def _create_task_widget(self, task):
         """Создание виджета для отображения задачи"""
-        # Основной фрейм задачи
-        task_frame = ctk.CTkFrame(
-            self.tasks_container,
-            border_width=1,
-            border_color="#3a3a3a",
-            corner_radius=8
-        )
-        task_frame.pack(fill="x", padx=5, pady=3)
+        task_frame = ctk.CTkFrame(self.tasks_container, fg_color="#2c2c2c", corner_radius=6)
+        task_frame.pack(fill="x", padx=5, pady=2)
         self.task_widgets.append(task_frame)
-
-        # Верхняя часть - заголовок и статус
-        header_frame = ctk.CTkFrame(task_frame, fg_color="transparent")
-        header_frame.pack(fill="x", padx=12, pady=(10, 5))
-
-        # Заголовок задачи с номером и статусом
-        title_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
-        title_frame.pack(fill="x")
-
-        # Номер задачи и название
-        task_title = ctk.CTkLabel(
-            title_frame,
-            text=f"{task.task_name}",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            anchor="w"
-        )
-        task_title.pack(side="left", fill="x", expand=True)
-
-        # Статус задачи
-        status_text = self._get_task_status(task)
-        status_color = self._get_status_color(status_text)
-        task_status = ctk.CTkLabel(
-            title_frame,
-            text=status_text,
-            font=ctk.CTkFont(size=10, weight="bold"),
-            text_color=status_color
-        )
-        task_status.pack(side="right", padx=(5, 0))
 
         # Основная информация о задаче
         info_frame = ctk.CTkFrame(task_frame, fg_color="transparent")
-        info_frame.pack(fill="x", padx=12, pady=(0, 8))
+        info_frame.pack(fill="x", padx=10, pady=5)
 
-        # Первая строка информации
-        row1_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
-        row1_frame.pack(fill="x", pady=2)
-
-        # Информация об изображении
-        if task.image_path:
-            image_info = f"📁 {os.path.basename(task.image_path)}"
-            if hasattr(task, 'original_image') and task.original_image is not None:
-                height, width = task.original_image.shape[:2]
-                image_info += f" ({width}×{height}px)"
-        else:
-            image_info = "📁 Изображение не загружено"
-
-        image_label = ctk.CTkLabel(
-            row1_frame,
-            text=image_info,
-            font=ctk.CTkFont(size=11),
+        # Заголовок задачи
+        task_title = ctk.CTkLabel(
+            info_frame,
+            text=f"#{task.task_id}: {task.task_name}",
+            font=ctk.CTkFont(size=12, weight="bold"),
             anchor="w"
         )
-        image_label.pack(side="left", fill="x", expand=True)
+        task_title.pack(fill="x")
 
-        # Вторая строка информации
-        row2_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
-        row2_frame.pack(fill="x", pady=2)
-
-        # Информация о масштабах
-        scales_info = self._get_scales_info(task)
-        scales_label = ctk.CTkLabel(
-            row2_frame,
-            text=f"📏 {scales_info}",
-            font=ctk.CTkFont(size=11),
+        # Информация о задаче
+        task_info = ctk.CTkLabel(
+            info_frame,
+            text=f"Изображение: {os.path.basename(task.image_path) if task.image_path else 'Не загружено'}",
+            font=ctk.CTkFont(size=10),
             anchor="w"
         )
-        scales_label.pack(side="left", fill="x", expand=True)
+        task_info.pack(fill="x")
 
-        # Третья строка информации
-        row3_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
-        row3_frame.pack(fill="x", pady=2)
-
-        # Информация о настройках обработки
-        processing_info = self._get_processing_info(task)
-        processing_label = ctk.CTkLabel(
-            row3_frame,
-            text=f"⚙️ {processing_info}",
-            font=ctk.CTkFont(size=11),
+        # Детали задачи
+        scales_text = f"Масштабы: {task.num_scale}"
+        if task.num_scale > 0:
+            if task.num_scale <= 5:
+                scales_text = f"Масштабы: {', '.join(map(str, task.scales))}"
+            else:
+                min_scale = min(task.scales)
+                max_scale = max(task.scales)
+                scales_text = f"Масштабы: от {min_scale} до {max_scale}"
+        task_details = ctk.CTkLabel(
+            info_frame,
+            text=f"{scales_text}. \nKNN: {task.k_neighbors}",
+            font=ctk.CTkFont(size=10),
             anchor="w"
         )
-        processing_label.pack(side="left", fill="x", expand=True)
+        task_details.pack(fill="x")
 
         # Кнопки управления задачей
         button_frame = ctk.CTkFrame(task_frame, fg_color="transparent")
-        button_frame.pack(fill="x", padx=12, pady=(5, 10))
+        button_frame.pack(fill="x", padx=10, pady=(0, 5))
 
         def make_task_active():
             self.current_task = task
@@ -1583,89 +1141,27 @@ class App(TkinterApp):
             self._update_tasks_display()
             self._update_ui_for_current_task()
 
-        # Кнопка активации
         activate_btn = ctk.CTkButton(
             button_frame,
             text="Активировать",
             command=make_task_active,
-            width=90,
-            height=28,
-            font=ctk.CTkFont(size=11),
-            fg_color="#2b5b84",
-            hover_color="#1e4160"
+            width=80,
+            height=25,
+            font=ctk.CTkFont(size=10)
         )
-        activate_btn.pack(side="left", padx=(0, 8))
+        activate_btn.pack(side="left", padx=(0, 5))
 
-        # Кнопка удаления
         remove_btn = ctk.CTkButton(
             button_frame,
             text="Удалить",
             command=remove_task,
-            width=70,
-            height=28,
-            font=ctk.CTkFont(size=11),
+            width=60,
+            height=25,
+            font=ctk.CTkFont(size=10),
             fg_color="#dc3545",
             hover_color="#c82333"
         )
         remove_btn.pack(side="left")
-
-        # Подсветка текущей активной задачи
-        if self.current_task and self.current_task.task_id == task.task_id:
-            task_frame.configure(border_color="#007bff", border_width=2)
-
-    @staticmethod
-    def _get_task_status(task):
-        """Получить текстовый статус задачи"""
-        if not task.image_path:
-            return "Ожидает изображение"
-        elif len(task.scales) == 0:
-            return "Ожидает масштабы"
-        elif task.color1 is not None and task.color2 is not None:
-            return "Готова к вычислениям"
-        else:
-            return "Готова к настройке"
-
-    @staticmethod
-    def _get_status_color(status):
-        """Получить цвет статуса"""
-        status_colors = {
-            "Ожидает изображение": "#ffc107",  # желтый
-            "Ожидает масштабы": "#ffc107",  # желтый
-            "Готова к настройке": "#17a2b8",  # голубой
-            "Готова к вычислениям": "#28a745"  # зеленый
-        }
-        return status_colors.get(status, "#6c757d")  # серый по умолчанию
-
-    @staticmethod
-    def _get_scales_info(task):
-        """Получить информацию о масштабах в читаемом формате"""
-        if len(task.scales) == 0:
-            return "Масштабы не заданы"
-
-        if len(task.scales) <= 5:
-            # Для небольшого количества показываем все масштабы
-            scales_str = ", ".join(map(str, task.scales))
-            return f"Масштабы: {scales_str}. Кол-во: {len(task.scales)}"
-        else:
-            # Для большого количества показываем диапазон
-            min_scale = min(task.scales)
-            max_scale = max(task.scales)
-            return f"Масштабы: от {min_scale} до {max_scale}. Кол-во: {len(task.scales)}"
-
-    def _get_processing_info(self, task):
-        """Получить информацию о настройках обработки"""
-        info_parts = [f"KNN: {task.k_neighbors}"]
-
-        # Информация о цветовых каналах
-        if task.color1 is not None and task.color2 is not None:
-            info_parts.append("Пипетка настроена")
-
-            # Проверяем, применено ли преобразование Грамма-Шмидта
-            # если кнопка Грамма-Шмидта отключена, значит преобразование применено
-            if hasattr(self, 'gram_shmidt_button') and self.gram_shmidt_button.cget('state') == 'disabled':
-                info_parts.append("Грамм-Шмидт применен")
-
-        return " • ".join(info_parts) if info_parts else "Базовые настройки"
 
     def _update_ui_for_current_task(self):
         """Обновление UI в соответствии с текущей задачей"""
@@ -1687,7 +1183,8 @@ class App(TkinterApp):
                 )
                 self.print_load_image.configure(text="Изображение не загружено", text_color="gray")
 
-            # Проверяем наличие цветов для пипетки
+            # ИСПРАВЛЕННАЯ ПРОВЕРКА МАССИВОВ для пипетки
+            # Проверяем, что массивы не пустые и содержат данные
             has_colors = (self.current_task.color1 is not None and
                           self.current_task.color2 is not None and
                           isinstance(self.current_task.color1, np.ndarray) and
@@ -1704,7 +1201,6 @@ class App(TkinterApp):
                 )
                 # Активируем кнопку Грамма-Шмидта если есть цвета
                 self.gram_shmidt_button.configure(
-                    text="🔄 Применить Грамма-Шмидта",  # Всегда сбрасываем текст
                     state='normal',
                     fg_color="#2b5b84",
                     hover_color="#1e4160"
@@ -1718,7 +1214,6 @@ class App(TkinterApp):
                 )
                 # Деактивируем кнопку Грамма-Шмидта если нет цветов
                 self.gram_shmidt_button.configure(
-                    text="🔄 Применить Грамма-Шмидта",  # Всегда сбрасываем текст
                     state='disabled',
                     fg_color="#6c757d",
                     hover_color="#5a6268"
@@ -1726,34 +1221,6 @@ class App(TkinterApp):
 
             # Обновляем KNN
             self.knn_text_var.set(str(self.current_task.k_neighbors))
-
-            # Сбрасываем состояние кнопок масштабов для новой задачи
-            if len(self.current_task.scales) == 0:
-                self.button_save_scales.configure(
-                    text="💾 Сохранить значения",
-                    fg_color="#2b5b84",
-                    hover_color="#1e4160",
-                    state='normal'
-                )
-                self.button_load_scales_file.configure(
-                    text="📂 Загрузить из файла",
-                    fg_color="#2b5b84",
-                    hover_color="#1e4160",
-                    state='normal'
-                )
-                self.label_custom_scale.configure(text="", text_color="gray")
-
-                # Включаем поля ввода
-                self.entry_start.configure(state='normal')
-                self.entry_end.configure(state='normal')
-                self.entry_step.configure(state='normal')
-            else:
-                # Если масштабы уже загружены, показываем это
-                if len(self.current_task.scales) <= 5:
-                    scales_text = f"Масштабы: {', '.join(map(str, self.current_task.scales))}"
-                else:
-                    scales_text = f"Загружено {len(self.current_task.scales)} масштабов"
-                self.label_custom_scale.configure(text=scales_text, text_color="white")
 
         else:
             # Сбрасываем UI если нет активной задачи
@@ -1775,22 +1242,6 @@ class App(TkinterApp):
                 fg_color="#6c757d",
                 hover_color="#5a6268"
             )
-            self.button_save_scales.configure(
-                text="💾 Сохранить значения",
-                fg_color="#2b5b84",
-                hover_color="#1e4160",
-                state='disabled'
-            )
-            self.button_load_scales_file.configure(
-                text="📂 Загрузить из файла",
-                fg_color="#2b5b84",
-                hover_color="#1e4160",
-                state='disabled'
-            )
-            self.label_custom_scale.configure(text="", text_color="gray")
-
-        # Всегда обновляем отображение задач для подсветки активной
-        self._update_tasks_display()
 
     # Обновляем методы загрузки изображения и работы с каналами для работы с текущей задачей
     def load_image_callback(self):
@@ -1851,14 +1302,12 @@ class App(TkinterApp):
             hover_color="#5a6268"
         )
 
-        # Обновляем отображение задач, чтобы показать новый статус
-        self._update_tasks_display()
-
     def load_scales(self):
         """Загрузка масштабов для текущей задачи"""
         if not self.current_task:
             mb.showwarning("Внимание", "Сначала создайте задачу")
             return
+
         try:
             start = int(self.entry_start.get() or "1")
             end = int(self.entry_end.get() or "10")
@@ -1885,7 +1334,6 @@ class App(TkinterApp):
             mb.showwarning("Внимание", "Сначала создайте задачу")
             return
 
-        # Временно блокируем поля ввода
         self.entry_start.configure(state='disabled')
         self.entry_step.configure(state='disabled')
         self.entry_end.configure(state='disabled')
@@ -1918,16 +1366,10 @@ class App(TkinterApp):
             self.button_save_scales.configure(
                 text="💾 Сохранить значения",
                 fg_color="#6c757d",
-                hover_color="#5a6268",
-                state='disabled'
+                hover_color="#5a6268"
             )
 
             self._update_tasks_display()
-        else:
-            # Если файл не выбран, разблокируем поля ввода
-            self.entry_start.configure(state='normal')
-            self.entry_step.configure(state='normal')
-            self.entry_end.configure(state='normal')
 
     def on_entry_click(self, event=None):
         """Обработчик клика по полю ввода KNN"""
@@ -1982,12 +1424,14 @@ class App(TkinterApp):
             variable=self.p_ex_var2
         )
         self.output_extremes_section.add_widget(self.p_ex2_checkbox, fill="x")
+
         self.p_ex1_checkbox = ctk.CTkCheckBox(
             self.output_extremes_section.content,
             text="📄 Вывести текстовым файлом",
             variable=self.p_ex_var1
         )
         self.output_extremes_section.add_widget(self.p_ex1_checkbox, fill="x")
+
 
     def _setup_knn_section(self):
         """Настройка секции K-ближайших соседей"""
@@ -1999,7 +1443,12 @@ class App(TkinterApp):
             wraplength=0
         )
         self.knn_section.add_widget(info_label, pady=(0, 10))
-
+        self.knn_image_checkbox = ctk.CTkCheckBox(
+            self.knn_section.content,
+            text="📊 Вывести изображением",
+            variable=self.knn_bool_image_var
+        )
+        self.knn_section.add_widget(self.knn_image_checkbox, fill="x")
         self.knn_text_checkbox = ctk.CTkCheckBox(
             self.knn_section.content,
             text="📄 Вывести текстовым файлом",
@@ -2007,12 +1456,6 @@ class App(TkinterApp):
         )
         self.knn_section.add_widget(self.knn_text_checkbox, fill="x")
 
-        self.knn_image_checkbox = ctk.CTkCheckBox(
-            self.knn_section.content,
-            text="📊 Вывести изображением",
-            variable=self.knn_bool_image_var
-        )
-        self.knn_section.add_widget(self.knn_image_checkbox, fill="x")
 
     def _setup_intermediate_section(self):
         """Настройка секции промежуточных вычислений"""
@@ -2086,7 +1529,8 @@ class App(TkinterApp):
         widgets_to_disable = [
             self.load_button, self.pipette_button, self.gram_shmidt_button,
             self.button_save_scales, self.button_load_scales_file,
-            self.app_start_button, self.add_task_btn]
+            self.app_start_button
+        ]
 
         for widget in widgets_to_disable:
             try:
@@ -2161,43 +1605,46 @@ class App(TkinterApp):
 
         # Центрируем окно
         msg_box.update_idletasks()
-        width = 450
-        height = 280  # Уменьшили высоту
+        width = 650
+        height = 350
         x = (self.winfo_screenwidth() // 2) - (width // 2)
         y = (self.winfo_screenheight() // 2) - (height // 2)
         msg_box.geometry(f"{width}x{height}+{x}+{y}")
 
-        # Содержимое - используем pack без дополнительных фреймов
+        # Содержимое
+        main_frame = ctk.CTkFrame(msg_box)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
         success_label = ctk.CTkLabel(
-            msg_box,
-            text="Вычисления выполнены успешно!",
+            main_frame,
+            text=f"✓ Вычисления выполнены успешно!",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        success_label.pack(pady=(20, 10))
+        success_label.pack(pady=(10, 5))
 
         tasks_label = ctk.CTkLabel(
-            msg_box,
+            main_frame,
             text=f"Обработано задач: {total_tasks}",
             font=ctk.CTkFont(size=14, weight="bold")
         )
-        tasks_label.pack(pady=(0, 5))
+        tasks_label.pack(pady=(0, 10))
 
         time_label = ctk.CTkLabel(
-            msg_box,
+            main_frame,
             text=f"Затраченное время: {format_time(elapsed_time)}",
-            font=ctk.CTkFont(size=12, weight="bold")
+            font=ctk.CTkFont(size=12, weight="bold"),
+            justify="left"
         )
-        time_label.pack(pady=(0, 25))
+        time_label.pack(anchor="w", pady=(0, 10))
 
-        # Кнопки размещаем прямо в окне, по центру в одну линию
-        buttons_frame = ctk.CTkFrame(msg_box, fg_color="transparent")
-        buttons_frame.pack(pady=(10, 20))
+        # Кнопки
+        button_frame = ctk.CTkFrame(main_frame)
+        button_frame.pack(fill="x", pady=(10, 0))
 
         def open_folder_action():
             """Открыть папку с результатами"""
             try:
-                if hasattr(self.image_processor, 'root_folder_path') and os.path.exists(
-                        self.image_processor.root_folder_path):
+                if hasattr(self.image_processor, 'root_folder_path') and os.path.exists(self.image_processor.root_folder_path):
                     os.startfile(self.image_processor.root_folder_path)
             except Exception as e:
                 self.progress_manager.log_error(f"Не удалось открыть папку: {e}")
@@ -2208,17 +1655,17 @@ class App(TkinterApp):
             self.safe_destroy()
 
         open_folder_btn = ctk.CTkButton(
-            buttons_frame,
+            button_frame,
             text="Открыть папку с результатами",
             command=open_folder_action,
             width=180,
             height=35,
             font=ctk.CTkFont(size=12)
         )
-        open_folder_btn.pack(side="left", padx=(0, 15))
+        open_folder_btn.pack(side="left", padx=(0, 10))
 
         close_btn = ctk.CTkButton(
-            buttons_frame,
+            button_frame,
             text="Закрыть",
             command=close_action,
             width=100,
@@ -2226,6 +1673,7 @@ class App(TkinterApp):
             font=ctk.CTkFont(size=12)
         )
         close_btn.pack(side="left")
+
 
 def format_time(seconds):
     """Форматирование времени в читаемый вид"""

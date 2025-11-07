@@ -1,6 +1,9 @@
 import numpy as np
 from numba import jit, prange
 
+
+# оригинальный код расчета НВП Морле для CPU
+"""
 @jit(nopython=True)
 def morlet_wavelet_single_scale(data, scale, j):
     w0 = 0.0
@@ -16,38 +19,48 @@ def morlet_wavelet(data, scales):
         for j in range(len(data)):
             coef[i, j] = morlet_wavelet_single_scale(data, scales[i], j)
     return coef
+"""
 
-
+# расчет НВП с симметричным отражением для строк и столбцов
 @jit(nopython=True)
-def apply_gaussian_edge_filter(channel_data, scales, wavelet_lengths):
+def morlet_wavelet_single_scale_with_padding(data, scale, j, pad_width):
     """
-    Применяет гауссов фильтр только к краевым зонам, сохраняя внутреннюю часть неизменной
-
-    Параметры:
-    channel_data - массив вейвлет-коэффициентов (scales, rows, cols)
-    scales - список масштабов
-    wavelet_lengths - список длин вейвлетов для каждого масштаба
+    Вычисление одного коэффициента вейвлет-преобразования с симметричным отражением
     """
-    num_scales = len(scales)
-    rows, cols = channel_data.shape[1], channel_data.shape[2]
+    w0 = 0.0
+    data_len = len(data)
 
-    for scale_idx in range(num_scales):
-        edge_size = wavelet_lengths[scale_idx]
+    for k in range(-pad_width, data_len + pad_width):
+        # определяем индекс с учетом симметричного отражения
+        if k < 0:
+            # отражение слева
+            actual_k = -k - 1
+        elif k >= data_len:
+            # отражение справа
+            actual_k = 2 * data_len - k - 1
+        else:
+            # внутренняя часть
+            actual_k = k
 
-        # Создаем гауссов фильтр (только возрастающую часть)
-        x = np.linspace(-3, 0, edge_size)
-        gaussian = np.exp(-(x ** 2) / 2)
-        gaussian = (gaussian - gaussian[0]) / (gaussian[-1] - gaussian[0])  # Нормализуем от 0 до 1
+        t = (k - j) / scale
+        w0 += data[actual_k] * 0.75 * np.exp(-(t * t) / 2) * np.cos(2 * np.pi * t)
 
-        # Применяем фильтр к началу каждой строки
-        for row in range(rows):
-            for col in range(edge_size):
-                channel_data[scale_idx, row, col] *= gaussian[col]
+    return w0 / np.sqrt(scale)
 
-        # Применяем фильтр к концу каждой строки (зеркально)
-        for row in range(rows):
-            for col in range(cols - edge_size, cols):
-                idx = cols - col - 1
-                channel_data[scale_idx, row, col] *= gaussian[idx]
 
-    return channel_data
+@jit(nopython=True, parallel=True)
+def morlet_wavelet_with_padding(data, scales):
+    """
+    Вейвлет-преобразование Морле со встроенным симметричным отражением
+    """
+    max_scale = max(scales)
+    pad_width = int(7 * max_scale) // 2 + 1
+
+    coef = np.zeros((len(scales), len(data)))
+
+    for i in prange(len(scales)):
+        for j in range(len(data)):
+            coef[i, j] = morlet_wavelet_single_scale_with_padding(
+                data, scales[i], j, pad_width
+            )
+    return coef

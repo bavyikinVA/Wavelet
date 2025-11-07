@@ -21,7 +21,7 @@ class LoggingHandler(logging.Handler):
             self.log_queue.put(str(e))
 
 
-class SafeProgressManager:
+class ProgressManager:
     def __init__(self, parent: TkinterApp):
         self._update_logs_callback_id = None
         self.logger = None
@@ -30,7 +30,7 @@ class SafeProgressManager:
         self.log_text = None
         self.progress_bar = None
         self.progress_label = None
-        self.progress_frame = None
+        self.frame = None
         self.parent = parent
         self.log_queue = queue.Queue()
         self._is_active = True
@@ -48,19 +48,19 @@ class SafeProgressManager:
     def setup_ui(self):
         """Настройка UI элементов прогресса"""
         # Основной фрейм
-        self.progress_frame = ctk.CTkFrame(self.parent)
-        self.progress_frame.pack(fill="x", padx=20, pady=10)
+        self.frame = ctk.CTkFrame(self.parent)
+        self.frame.pack(fill="x", padx=20, pady=10)
 
         # Метка статуса
         self.progress_label = ctk.CTkLabel(
-            self.progress_frame,
+            self.frame,
             text="Готов к работе",
             font=ctk.CTkFont(size=12, weight="bold")
         )
         self.progress_label.pack(anchor="w", padx=10, pady=(10, 5))
 
         # Фрейм для прогресс-бара и процентов
-        progress_bar_frame = ctk.CTkFrame(self.progress_frame, fg_color="transparent")
+        progress_bar_frame = ctk.CTkFrame(self.frame, fg_color="transparent")
         progress_bar_frame.pack(fill="x", padx=10, pady=5)
 
         # Прогресс-бар
@@ -79,7 +79,7 @@ class SafeProgressManager:
 
         # Текстовое поле для логов
         self.log_text = ctk.CTkTextbox(
-            self.progress_frame,
+            self.frame,
             height=120,
             wrap="word",
             font=ctk.CTkFont(family="Consolas", size=10)
@@ -89,7 +89,7 @@ class SafeProgressManager:
 
         # Кнопка очистки логов
         self.clear_logs_btn = ctk.CTkButton(
-            self.progress_frame,
+            self.frame,
             text="Очистить логи",
             command=self.clear_logs,
             width=100,
@@ -102,7 +102,6 @@ class SafeProgressManager:
         self.logger = logging.getLogger('WaveletApp')
         self.logger.setLevel(logging.INFO)
 
-        # Форматтер
         formatter = logging.Formatter(
             '%(asctime)s - %(levelname)s - %(message)s',
             datefmt='%H:%M:%S'
@@ -190,9 +189,3 @@ class SafeProgressManager:
         # Отменяем все pending callbacks
         if hasattr(self, '_update_logs_callback_id') and self._update_logs_callback_id:
             self.parent.after_cancel_safe(self._update_logs_callback_id)
-
-
-# Обновим ProgressManager для совместимости
-class ProgressManager(SafeProgressManager):
-    """Алиас для совместимости"""
-    pass
