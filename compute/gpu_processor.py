@@ -1,7 +1,3 @@
-"""
-GPU processor using OPTIMIZED CuPy implementation
-"""
-
 import numpy as np
 from typing import Dict, Any
 import logging
@@ -9,11 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class GPUWaveletProcessor:
-    """
-    GPU processor using OPTIMIZED CuPy implementation
-    """
-
-    def __init__(self, accuracy_mode: str = "fast"):  # По умолчанию FAST для производительности
+    def __init__(self, accuracy_mode: str = "balanced"):
         self.gpu_processor = None
         self._gpu_available = False
         self._gpu_info = {}
@@ -32,6 +24,7 @@ class GPUWaveletProcessor:
         }
 
         try:
+            # Используем простую версию для надежности
             from .cupy_wavelet import CupyWaveletGPU
             self.gpu_processor = CupyWaveletGPU()
 
@@ -39,7 +32,7 @@ class GPUWaveletProcessor:
                 self._gpu_available = True
                 gpu_info = self.gpu_processor.get_gpu_info()
                 self._gpu_info.update(gpu_info)
-                logger.info(f"✅ OPTIMIZED CuPy GPU processor initialized (mode: {self.accuracy_mode})")
+                logger.info(f"✅ SIMPLE CuPy GPU processor initialized (mode: {self.accuracy_mode})")
             else:
                 logger.warning("❌ CuPy GPU not available")
 
@@ -50,6 +43,7 @@ class GPUWaveletProcessor:
     def morlet_wavelet_batch(self, data: np.ndarray, scales: np.ndarray) -> np.ndarray:
         """
         Compute wavelet transform for batch of signals on GPU
+        Используем простую и надежную реализацию
         """
         if not self.is_available():
             raise RuntimeError("GPU processor not available")
@@ -57,17 +51,11 @@ class GPUWaveletProcessor:
         if data.ndim != 2:
             raise ValueError("Expected 2D array for data")
 
-        logger.info(f"🚀 GPU processing: {data.shape[0]} signals × {data.shape[1]} points × {len(scales)} scales")
+        logger.info(f"🚀 SIMPLE GPU processing: {data.shape[0]} signals × {data.shape[1]} points × {len(scales)} scales")
 
         try:
-            # Для больших изображений используем FAST метод независимо от режима
-            if data.shape[0] * data.shape[1] > 100000:  # Большое изображение
-                logger.info("🔧 Используется FAST метод для большого изображения")
-                return self.gpu_processor.compute_batch_signals_fast(data, scales)
-            elif self.accuracy_mode == "fast":
-                return self.gpu_processor.compute_batch_signals_fast(data, scales)
-            else:
-                return self.gpu_processor.compute_batch_signals_optimized(data, scales)
+            # Всегда используем простую версию для надежности
+            return self.gpu_processor.compute_batch_signals(data, scales)
 
         except Exception as e:
             logger.error(f"❌ GPU computation failed: {e}")
@@ -77,6 +65,7 @@ class GPUWaveletProcessor:
             logger.warning("🔄 Возврат нулевых результатов из-за ошибки GPU")
             return np.zeros((num_signals, num_scales, signal_length), dtype=np.float64)
 
+    # Остальные методы остаются без изменений...
     def set_accuracy_mode(self, mode: str):
         """Set accuracy mode"""
         valid_modes = ["high", "balanced", "fast"]
@@ -84,7 +73,7 @@ class GPUWaveletProcessor:
             self.accuracy_mode = mode
             logger.info(f"🔧 GPU accuracy mode set to: {mode}")
         else:
-            logger.warning(f"Invalid accuracy mode: {mode}. Using 'fast'.")
+            logger.warning(f"Invalid accuracy mode: {mode}. Using 'balanced'.")
 
     def is_available(self) -> bool:
         """Check if GPU processing is available"""

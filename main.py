@@ -4,12 +4,11 @@ import warnings
 # НАСТРОЙКА CUDA
 def setup_cuda_environment():
     """Настройка окружения CUDA перед импортом любых библиотек"""
-    # Подавление предупреждений CuPy
     warnings.filterwarnings("ignore", message="CUDA path could not be detected")
 
     # Автоматический поиск пути CUDA
     cuda_paths = [
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.5",  # CUDA 12.0
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.5",
         os.environ.get('CUDA_PATH'),
         os.environ.get('CUDA_HOME'),
     ]
@@ -27,14 +26,12 @@ def setup_cuda_environment():
             print(f"🔧 Настроен путь CUDA: {path}")
             return path
 
-    print("⚠️ CUDA путь не найден автоматически")
+    print("CUDA путь не найден")
     return None
 
-
-# Выполняем настройку ДО всех импортов
 cuda_path = setup_cuda_environment()
 
-# Дополнительные настройки для подавления предупреждений
+# настройки для подавления предупреждений
 os.environ['CUPY_CUDA_DISABLE_CUBIN_CACHE'] = '1'
 os.environ['CUPY_CACHE_DIR'] = os.path.join(os.path.expanduser('~'), '.cupy', 'cache')
 
@@ -61,12 +58,12 @@ from pipette import run_pipette
 from utils.gui import TkinterApp, ScrollableFrame, CollapsibleFrame
 from utils.progress_manager import ProgressManager
 import points as knn
+from compute.cpu_wavelet import morlet_wavelet_with_padding
 
 
 def process_row_static(args_):
     """Статическая функция для обработки строк на CPU"""
     row_data, scales_ = args_
-    from compute.cpu_wavelet import morlet_wavelet_with_padding
     return morlet_wavelet_with_padding(row_data, scales_)
 
 def process_column_static(args_):
@@ -258,7 +255,7 @@ class ImageProcessor:
         scales_size = len(scales)
         result = np.zeros((rows, scales_size, cols))
 
-        self.progress.log_info(f"🔹 CPU обработка {rows} строк...")
+        self.progress.log_info(f"CPU обработка {rows} строк...")
 
         with Pool() as pool:
             args = [(data[i], scales) for i in range(rows)]
@@ -391,7 +388,15 @@ class ImageProcessor:
                         data_channel_after_transposed = data_channel_after
 
                     data_3_channel[channel] = data_channel_after_transposed
+            else:
+                if type_data == 0:
+                    data_channel_after = self.process_channel(data_channel, task.scales)
+                    data_channel_after_transposed = np.transpose(data_channel_after, (1, 0, 2))
+                else:
+                    data_channel_after = self.process_channel_columns(data_channel, task.scales)
+                    data_channel_after_transposed = data_channel_after
 
+                data_3_channel[channel] = data_channel_after_transposed
             current_operation += 1
             self.progress.update_progress(
                 current_operation / total_operations,
@@ -402,6 +407,7 @@ class ImageProcessor:
         self.progress.log_info(f"Вейвлет-преобразование завершено за {elapsed_time:.2f} секунд")
 
         return data_3_channel
+
 
     def compute_wavelets(self, task, info_out):
         self.progress.update_progress(0.1, "Подготовка данных для вейвлет-преобразования...")
@@ -2094,8 +2100,7 @@ class App(TkinterApp):
             except Exception as e:
                 self.progress_manager.log_error(str(e))
 
-    def compute(self):
-        """Основная функция вычислений для всех задач"""
+    def compute(self): # Основная функция вычислений для всех задач
         if not self.image_processor.tasks:
             mb.showwarning("Внимание", "Нет задач для обработки")
             return
@@ -2119,7 +2124,7 @@ class App(TkinterApp):
                 self.progress_manager.log_info(f"Обработка задачи {current_task_num}/{total_tasks}: {task.task_name}")
 
                 # Выполняем вычисления для задачи
-                self.image_processor.compute_for_task( # передаем сюда все tk.BooleanVar
+                self.image_processor.compute_for_task(
                     task,
                     self.wp_var1, self.wp_var2, self.print_channels_txt_var,
                     self.row_var, self.col_var,
@@ -2166,8 +2171,6 @@ class App(TkinterApp):
         x = (self.winfo_screenwidth() // 2) - (width // 2)
         y = (self.winfo_screenheight() // 2) - (height // 2)
         msg_box.geometry(f"{width}x{height}+{x}+{y}")
-
-        # Содержимое - используем pack без дополнительных фреймов
         success_label = ctk.CTkLabel(
             msg_box,
             text="Вычисления выполнены успешно!",
@@ -2193,8 +2196,7 @@ class App(TkinterApp):
         buttons_frame = ctk.CTkFrame(msg_box, fg_color="transparent")
         buttons_frame.pack(pady=(10, 20))
 
-        def open_folder_action():
-            """Открыть папку с результатами"""
+        def open_folder_action(): # открыть папку с результатами
             try:
                 if hasattr(self.image_processor, 'root_folder_path') and os.path.exists(
                         self.image_processor.root_folder_path):
@@ -2203,7 +2205,6 @@ class App(TkinterApp):
                 self.progress_manager.log_error(f"Не удалось открыть папку: {e}")
 
         def close_action():
-            """Закрытие приложения"""
             on_closing()
             self.safe_destroy()
 
@@ -2228,7 +2229,6 @@ class App(TkinterApp):
         close_btn.pack(side="left")
 
 def format_time(seconds):
-    """Форматирование времени в читаемый вид"""
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     seconds = int(seconds % 60)
@@ -2237,7 +2237,6 @@ def format_time(seconds):
 
 if __name__ == '__main__':
     freeze_support()  # for multiprocess
-
 
     def main():
         try:

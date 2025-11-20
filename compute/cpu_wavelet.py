@@ -24,9 +24,6 @@ def morlet_wavelet(data, scales):
 # расчет НВП с симметричным отражением для строк и столбцов
 @jit(nopython=True)
 def morlet_wavelet_single_scale_with_padding(data, scale, j, pad_width):
-    """
-    Вычисление одного коэффициента вейвлет-преобразования с симметричным отражением
-    """
     w0 = 0.0
     data_len = len(data)
 
@@ -50,9 +47,6 @@ def morlet_wavelet_single_scale_with_padding(data, scale, j, pad_width):
 
 @jit(nopython=True, parallel=True)
 def morlet_wavelet_with_padding(data, scales):
-    """
-    Вейвлет-преобразование Морле со встроенным симметричным отражением
-    """
     max_scale = max(scales)
     pad_width = int(7 * max_scale) // 2 + 1
 

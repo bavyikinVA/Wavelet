@@ -1,7 +1,3 @@
-"""
-Unified compute backend with CuPy-based GPU support
-"""
-
 import numpy as np
 from typing import Dict, Any
 import logging
@@ -9,7 +5,6 @@ from multiprocessing import Pool
 
 logger = logging.getLogger(__name__)
 
-# Глобальная функция для multiprocessing (решает проблему pickle)
 def _process_row_wrapper(args):
     """Wrapper function for multiprocessing to avoid pickle issues"""
     from .cpu_wavelet import morlet_wavelet_with_padding
