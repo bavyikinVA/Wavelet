@@ -24,7 +24,6 @@ class GPUWaveletProcessor:
         }
 
         try:
-            # Используем простую версию для надежности
             from .cupy_wavelet import CupyWaveletGPU
             self.gpu_processor = CupyWaveletGPU()
 
@@ -32,46 +31,38 @@ class GPUWaveletProcessor:
                 self._gpu_available = True
                 gpu_info = self.gpu_processor.get_gpu_info()
                 self._gpu_info.update(gpu_info)
-                logger.info(f"✅ SIMPLE CuPy GPU processor initialized (mode: {self.accuracy_mode})")
+                logger.info(f"CuPy GPU processor initialized (mode: {self.accuracy_mode})")
             else:
-                logger.warning("❌ CuPy GPU not available")
+                logger.warning("CuPy GPU not available")
 
         except Exception as e:
-            logger.warning(f"❌ GPU initialization failed: {e}")
+            logger.warning(f"GPU initialization failed: {e}")
             self._gpu_info["error"] = str(e)
 
     def morlet_wavelet_batch(self, data: np.ndarray, scales: np.ndarray) -> np.ndarray:
-        """
-        Compute wavelet transform for batch of signals on GPU
-        Используем простую и надежную реализацию
-        """
         if not self.is_available():
             raise RuntimeError("GPU processor not available")
 
         if data.ndim != 2:
             raise ValueError("Expected 2D array for data")
 
-        logger.info(f"🚀 SIMPLE GPU processing: {data.shape[0]} signals × {data.shape[1]} points × {len(scales)} scales")
+        logger.info(f"GPU processing: {data.shape[0]} signals × {data.shape[1]} points × {len(scales)} scales")
 
         try:
-            # Всегда используем простую версию для надежности
             return self.gpu_processor.compute_batch_signals(data, scales)
 
         except Exception as e:
-            logger.error(f"❌ GPU computation failed: {e}")
-            # Return zeros as fallback
+            logger.error(f"GPU computation failed: {e}")
             num_signals, signal_length = data.shape
             num_scales = len(scales)
-            logger.warning("🔄 Возврат нулевых результатов из-за ошибки GPU")
+            logger.warning("Возврат нулевых результатов из-за ошибки GPU")
             return np.zeros((num_signals, num_scales, signal_length), dtype=np.float64)
 
-    # Остальные методы остаются без изменений...
     def set_accuracy_mode(self, mode: str):
-        """Set accuracy mode"""
         valid_modes = ["high", "balanced", "fast"]
         if mode in valid_modes:
             self.accuracy_mode = mode
-            logger.info(f"🔧 GPU accuracy mode set to: {mode}")
+            logger.info(f"GPU accuracy mode set to: {mode}")
         else:
             logger.warning(f"Invalid accuracy mode: {mode}. Using 'balanced'.")
 

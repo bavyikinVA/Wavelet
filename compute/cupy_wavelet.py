@@ -8,8 +8,6 @@ logger = logging.getLogger(__name__)
 
 
 class CupyWaveletGPU:
-    """Оптимизированная GPU реализация с векторными операциями"""
-
     def __init__(self):
         self.cp = cp
         self._available = True
@@ -17,7 +15,6 @@ class CupyWaveletGPU:
 
     def _compile_kernels(self):
         """Compile optimized CUDA kernels"""
-        # Оптимизированное ядро для одного сигнала и одного масштаба
         self.single_scale_kernel = cp.RawKernel(r'''
         extern "C" __global__
         void morlet_single_scale(const float* data, float* result, int data_len, 
@@ -49,16 +46,13 @@ class CupyWaveletGPU:
         ''', 'morlet_single_scale')
 
     def compute_batch_signals(self, data_batch: np.ndarray, scales: np.ndarray) -> np.ndarray:
-        """
-        Оптимизированная GPU реализация с батчевой обработкой
-        """
         data_batch = data_batch.astype(np.float32)
         scales = scales.astype(np.float32)
 
         num_signals, signal_length = data_batch.shape
         num_scales = len(scales)
 
-        logger.info(f"🚀 OPTIMIZED GPU processing: {num_signals} signals × {signal_length} points × {num_scales} scales")
+        logger.info(f"GPU processing: {num_signals} signals × {signal_length} points × {num_scales} scales")
 
         # Если данные слишком большие, обрабатываем частями
         if num_signals * signal_length * num_scales > 1000000:
@@ -103,7 +97,7 @@ class CupyWaveletGPU:
             chunk_end = min(chunk_start + chunk_size, num_signals)
             chunk_data = data_batch[chunk_start:chunk_end]
 
-            logger.info(f"🔧 Processing chunk {chunk_start}-{chunk_end} of {num_signals}")
+            logger.info(f"Processing chunk {chunk_start}-{chunk_end} of {num_signals}")
 
             chunk_results = []
             for signal_idx in range(len(chunk_data)):

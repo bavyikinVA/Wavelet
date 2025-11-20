@@ -6,16 +6,11 @@ from multiprocessing import Pool
 logger = logging.getLogger(__name__)
 
 def _process_row_wrapper(args):
-    """Wrapper function for multiprocessing to avoid pickle issues"""
     from .cpu_wavelet import morlet_wavelet_with_padding
     row_data, scales = args
     return morlet_wavelet_with_padding(row_data, scales)
 
 class ComputeBackend:
-    """
-    Unified compute backend with CuPy GPU support
-    """
-
     def __init__(self, use_gpu: bool = True):
         self.use_gpu = use_gpu
         self.gpu_processor = None
@@ -23,7 +18,6 @@ class ComputeBackend:
         self._initialize_backend()
 
     def _initialize_backend(self):
-        """Initialize compute backend"""
         self.backend_info = {
             "use_gpu": False,
             "device_name": "CPU",
@@ -32,21 +26,18 @@ class ComputeBackend:
             "available": True
         }
 
-        # Initialize CPU backend
         try:
             from .cpu_wavelet import morlet_wavelet_with_padding
             self._cpu_processor = morlet_wavelet_with_padding
-            logger.info("✅ CPU backend initialized")
+            logger.info("CPU backend initialized")
         except Exception as e:
-            logger.error(f"❌ CPU backend initialization failed: {e}")
+            logger.error(f"CPU backend initialization failed: {e}")
             self.backend_info["available"] = False
             return
 
-        # Try GPU if requested
         if self.use_gpu:
             try:
                 from .gpu_processor import GPUWaveletProcessor
-                # Используем balanced режим для оптимальной точности и скорости
                 self.gpu_processor = GPUWaveletProcessor(accuracy_mode="balanced")
 
                 if self.gpu_processor.is_available():
@@ -57,57 +48,51 @@ class ComputeBackend:
                         "gpu_memory": f"{gpu_info.get('memory_free_mb', 0)}/{gpu_info.get('memory_total_mb', 0)} MB",
                         "backend": "CuPy"
                     })
-                    logger.info(f"✅ GPU backend: {self.backend_info['device_name']}")
+                    logger.info(f"GPU backend: {self.backend_info['device_name']}")
                 else:
                     logger.info("🔧 GPU not available, using CPU")
                     self.use_gpu = False
 
             except Exception as e:
-                logger.warning(f"❌ GPU initialization failed: {e}")
+                logger.warning(f"GPU initialization failed: {e}")
                 self.use_gpu = False
 
     def morlet_wavelet_batch(self, data: np.ndarray, scales: np.ndarray) -> np.ndarray:
-        """
-        Compute wavelet transform with automatic GPU/CPU selection
-        """
         if not self.backend_info["available"]:
             raise RuntimeError("No compute backend available")
 
-        # Try GPU first if available
         if self.use_gpu and self.gpu_processor and self.gpu_processor.is_available():
             try:
-                logger.debug(f"🔹 GPU processing: {data.shape} signals")
+                logger.debug(f"GPU processing: {data.shape} signals")
                 result = self.gpu_processor.morlet_wavelet_batch(data, scales)
                 return result
             except Exception as e:
-                logger.warning(f"❌ GPU computation failed: {e}. Using CPU.")
+                logger.warning(f"GPU computation failed: {e}. Using CPU.")
                 return self._compute_cpu_fallback(data, scales)
         else:
             return self._compute_cpu_fallback(data, scales)
 
     def _compute_cpu_fallback(self, data: np.ndarray, scales: np.ndarray) -> np.ndarray:
         """CPU fallback implementation without pickle issues"""
-        logger.info(f"🔹 CPU processing: {data.shape} signals with {len(scales)} scales")
+        logger.info(f"CPU processing: {data.shape} signals with {len(scales)} scales")
 
         try:
-            # Use global function to avoid pickle issues
-            logger.debug("🔄 Starting multiprocessing pool...")
+            logger.debug("Starting multiprocessing pool...")
             with Pool() as pool:
                 args = [(data[i], scales) for i in range(data.shape[0])]
-                logger.debug(f"🔄 Processing {len(args)} items...")
+                logger.debug(f"Processing {len(args)} items...")
                 results = pool.map(_process_row_wrapper, args)
 
-            logger.info("✅ CPU multiprocessing completed successfully")
+            logger.info("CPU multiprocessing completed successfully")
             return np.array(results)
 
         except Exception as e:
-            logger.error(f"❌ CPU multiprocessing failed: {e}")
-            # Emergency fallback - sequential processing
+            logger.error(f"CPU multiprocessing failed: {e}")
             return self._compute_cpu_sequential(data, scales)
 
     def _compute_cpu_sequential(self, data: np.ndarray, scales: np.ndarray) -> np.ndarray:
         """Sequential CPU computation as last resort"""
-        logger.warning("🔄 Using sequential CPU computation")
+        logger.warning("Using sequential CPU computation")
         results = []
         for i in range(data.shape[0]):
             result = self._cpu_processor(data[i], scales)
@@ -133,7 +118,7 @@ class ComputeBackend:
                 "device_name": "CPU",
                 "gpu_memory": "N/A"
             })
-            logger.info("🔄 Switched to CPU backend")
+            logger.info("Switched to CPU backend")
         else:
             # Try to switch to GPU
             if self.is_gpu_available():
@@ -144,9 +129,9 @@ class ComputeBackend:
                     "device_name": gpu_info.get("device_name", "CuPy GPU"),
                     "gpu_memory": f"{gpu_info.get('memory_free_mb', 0)}/{gpu_info.get('memory_total_mb', 0)} MB"
                 })
-                logger.info(f"🔄 Switched to GPU backend: {self.backend_info['device_name']}")
+                logger.info(f"Switched to GPU backend: {self.backend_info['device_name']}")
             else:
-                logger.warning("❌ GPU not available, staying on CPU")
+                logger.warning("GPU not available, staying on CPU")
 
         return self.use_gpu
 
@@ -155,5 +140,5 @@ class ComputeBackend:
         if self.gpu_processor:
             try:
                 self.gpu_processor.clear_cache()
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"GPU cache clear failed: {e}")
