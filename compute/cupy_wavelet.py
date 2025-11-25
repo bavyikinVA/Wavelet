@@ -1,5 +1,3 @@
-# compute/cupy_wavelet.py - ОПТИМИЗИРОВАННАЯ ВЕРСИЯ
-
 import numpy as np
 import logging
 import cupy as cp

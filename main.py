@@ -1,7 +1,7 @@
 import os
 import warnings
 
-# НАСТРОЙКА CUDA
+
 def setup_cuda_environment():
     """Настройка окружения CUDA перед импортом любых библиотек"""
     warnings.filterwarnings("ignore", message="CUDA path could not be detected")
@@ -23,7 +23,7 @@ def setup_cuda_environment():
                 os.environ['PATH'] = cuda_bin + os.pathsep + os.environ['PATH']
             if os.path.exists(cuda_lib) and cuda_lib not in os.environ['PATH']:
                 os.environ['PATH'] = cuda_lib + os.pathsep + os.environ['PATH']
-            print(f"🔧 Настроен путь CUDA: {path}")
+            print(f"Настроен путь CUDA: {path}")
             return path
 
     print("CUDA путь не найден")
@@ -36,7 +36,6 @@ os.environ['CUPY_CUDA_DISABLE_CUBIN_CACHE'] = '1'
 os.environ['CUPY_CACHE_DIR'] = os.path.join(os.path.expanduser('~'), '.cupy', 'cache')
 
 
-import os
 import threading
 import time
 import tkinter as tk
@@ -57,17 +56,14 @@ from image_cropper_app import run_cropper
 from pipette import run_pipette
 from utils.gui import TkinterApp, ScrollableFrame, CollapsibleFrame
 from utils.progress_manager import ProgressManager
-import points as knn
 from compute.cpu_wavelet import morlet_wavelet_with_padding
 
 
 def process_row_static(args_):
-    """Статическая функция для обработки строк на CPU"""
     row_data, scales_ = args_
     return morlet_wavelet_with_padding(row_data, scales_)
 
 def process_column_static(args_):
-    """Статическая функция для обработки столбцов на CPU"""
     col_idx, column_data, scales_ = args_
     from compute.cpu_wavelet import morlet_wavelet_with_padding
     return col_idx, morlet_wavelet_with_padding(column_data, scales_)
@@ -78,19 +74,22 @@ class ImageProcessor:
         self.progress = progress_manager
         self.tasks = []
         self.current_task_index = -1
-        self.root_folder_path = ""  # Корневая папка для всех задач
+        self.root_folder_path = ""
 
-        # Инициализация бэкенда вычислений с автоматическим определением
+        # Инициализация бэкендов
         from compute.backend import ComputeBackend
         from compute.gpu_processor import GPUWaveletProcessor
-        self.backend = ComputeBackend()  # Автоматически определит доступность GPU
+        self.backend = ComputeBackend()
         self.gpu_processor = GPUWaveletProcessor()
 
-        # Логирование информации о бэкенде
+        # Инициализация KNN процессора
+        from compute.knn_cpu import get_knn_processor
+        self.knn_processor = get_knn_processor(self.backend.use_gpu)
+
+        # Логирование
         backend_info = self.backend.get_backend_info()
         self.progress.log_info(f"Вычислительный бэкенд: {backend_info['device_name']}")
-        if backend_info['use_gpu']:
-            self.progress.log_info(f"GPU память: {backend_info['gpu_memory']}")
+        self.progress.log_info(f"KNN бэкенд: {'GPU' if self.knn_processor.is_gpu_available() else 'CPU'}")
 
     def clear_gpu_memory(self):
         """Очистка GPU памяти"""
@@ -511,11 +510,19 @@ class ImageProcessor:
         return coefs, points_max_by_row, points_max_by_column, points_min_by_row, points_min_by_column
 
     def compute_points(self, task, row_var, col_var, max_var, min_var,
-                       knn_var, knn_bool_text_var, knn_bool_image_var, print_text_var, print_graphic, pipette_state):
-        """Поиск точек экстремумов и KNN"""
+                       knn_var, knn_bool_text_var, knn_bool_image_var,
+                       print_text_var, print_graphic, pipette_state):
 
         self.progress.update_progress(0.1, "Начало поиска экстремумов...")
         self.progress.log_info("Запущена функция подсчета экстремумов")
+
+        use_gpu_knn = self.backend.use_gpu and self.knn_processor.is_gpu_available()
+
+        if use_gpu_knn and knn_var:
+            self.progress.log_info("Использование GPU для KNN вычислений")
+        if use_gpu_knn and knn_var:
+            self.progress.log_info("Использование CPU для KNN вычислений")
+
 
         extremes = []
 
@@ -622,22 +629,20 @@ class ImageProcessor:
                     # Обработка KNN
                     if knn_bool_text_var or knn_bool_image_var:
                         self.progress.update_progress(0.85, "Обработка KNN...")
-                        self.progress.log_info(f"Применение KNN для {channel_name}, масштаб {task.scales[scale]}")
 
-                        # Вызов с передачей callback'ов для логирования
-                        knn.process_extremes_with_knn(
+                        from compute.knn_cpu import process_extremes_with_knn
+                        process_extremes_with_knn(
                             knn_extremes,
                             scale_folder,
                             knn_var,
                             task.original_image,
                             knn_bool_text_var,
                             knn_bool_image_var,
+                            use_gpu=use_gpu_knn,
                             progress_callback=self.progress.update_progress,
                             log_callback=self.progress.log_info
                         )
 
-        # ⚠️ ИСПРАВЛЕНИЕ: выносим завершение за пределы цикла for type_data
-        # Завершение процесса
         self.progress.update_progress(0.95, "Завершение поиска экстремумов...")
 
         # Подсчет общей статистики
@@ -1197,7 +1202,6 @@ class App(TkinterApp):
             self.progress_manager.log_info(f"Режим точности GPU изменен на: {self.accuracy_var.get()}")
 
 
-
     def toggle_gpu_backend(self):
         """Переключение между CPU и GPU"""
         success, backend_info = self.image_processor.toggle_gpu_backend()
@@ -1216,10 +1220,15 @@ class App(TkinterApp):
         if not hasattr(self, 'image_processor') or self.image_processor is None:
             return
 
-        backend_info = self.image_processor.get_backend_info()
+        knn_gpu_available = self.image_processor.knn_processor.is_gpu_available()
 
-        # Обновляем состояние чекбокса
-        self.use_gpu_var.set(backend_info['use_gpu'])
+        # Обновляем информацию о KNN
+        knn_info = f"KNN: {'GPU' if knn_gpu_available else 'CPU'}"
+        if hasattr(self, 'knn_status_label'):
+            self.knn_status_label.configure(
+                text=knn_info,
+                text_color="lightgreen" if knn_gpu_available else "orange"
+            )
 
     def _setup_load_section(self):
         """Настройка секции загрузки изображения"""

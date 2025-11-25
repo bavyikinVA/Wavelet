@@ -13,7 +13,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import interpol
-import points
 from Gram_Shmidt import change_channels
 from compute.cpu_wavelet import morlet_wavelet_with_padding
 from compute.processing_task import ProcessingTask
