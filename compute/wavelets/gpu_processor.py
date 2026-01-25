@@ -24,7 +24,7 @@ class GPUWaveletProcessor:
         }
 
         try:
-            from .cupy_wavelet import CupyWaveletGPU
+            from compute.wavelets.cupy_wavelet import CupyWaveletGPU
             self.gpu_processor = CupyWaveletGPU()
 
             if self.gpu_processor.is_available():

@@ -12,9 +12,9 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 
-import interpol
+from compute.extremes import interpol
 from Gram_Shmidt import change_channels
-from compute.cpu_wavelet import morlet_wavelet_with_padding
+from compute.wavelets.cpu_wavelet import morlet_wavelet_with_padding
 from compute.processing_task import ProcessingTask
 from image_cropper_app import run_cropper
 from pipette import run_pipette

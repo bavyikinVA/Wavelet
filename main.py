@@ -49,14 +49,14 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 
-import interpol
+from compute.extremes import interpol
 from Gram_Shmidt import change_channels
 from compute.processing_task import ProcessingTask
 from image_cropper_app import run_cropper
 from pipette import run_pipette
 from utils.gui import TkinterApp, ScrollableFrame, CollapsibleFrame
 from utils.progress_manager import ProgressManager
-from compute.cpu_wavelet import morlet_wavelet_with_padding
+from compute.wavelets.cpu_wavelet import morlet_wavelet_with_padding
 
 
 def process_row_static(args_):
@@ -65,7 +65,7 @@ def process_row_static(args_):
 
 def process_column_static(args_):
     col_idx, column_data, scales_ = args_
-    from compute.cpu_wavelet import morlet_wavelet_with_padding
+    from compute.wavelets.cpu_wavelet import morlet_wavelet_with_padding
     return col_idx, morlet_wavelet_with_padding(column_data, scales_)
 
 
@@ -78,12 +78,12 @@ class ImageProcessor:
 
         # Инициализация бэкендов
         from compute.backend import ComputeBackend
-        from compute.gpu_processor import GPUWaveletProcessor
+        from compute.wavelets.gpu_processor import GPUWaveletProcessor
         self.backend = ComputeBackend()
         self.gpu_processor = GPUWaveletProcessor()
 
         # Инициализация KNN процессора
-        from compute.knn_cpu import get_knn_processor
+        from compute.knn.knn_cpu import get_knn_processor
         self.knn_processor = get_knn_processor(self.backend.use_gpu)
 
         # Логирование
@@ -364,11 +364,11 @@ class ImageProcessor:
 
                 try:
                     if type_data == 0:
-                        self.progress.log_info(f"🔹 GPU обработка {num_rows} строк канала {channel_name}...")
+                        self.progress.log_info(f"GPU обработка {num_rows} строк канала {channel_name}...")
                         data_channel_after = self.gpu_processor.morlet_wavelet_batch(data_channel, task.scales)
                         data_channel_after_transposed = np.transpose(data_channel_after, (1, 0, 2))
                     else:
-                        self.progress.log_info(f"🔹 GPU обработка {num_cols} столбцов канала {channel_name}...")
+                        self.progress.log_info(f"GPU обработка {num_cols} столбцов канала {channel_name}...")
                         data_channel_transposed = data_channel.T
                         data_channel_after = self.gpu_processor.morlet_wavelet_batch(data_channel_transposed,
                                                                                      task.scales)
@@ -377,7 +377,7 @@ class ImageProcessor:
                     data_3_channel[channel] = data_channel_after_transposed
 
                 except Exception as e:
-                    self.progress.log_error(f"❌ Ошибка GPU: {e}. Переход на CPU...")
+                    self.progress.log_error(f"Ошибка GPU: {e}. Переход на CPU...")
                     # Fallback to CPU
                     if type_data == 0:
                         data_channel_after = self.process_channel(data_channel, task.scales)
@@ -630,7 +630,7 @@ class ImageProcessor:
                     if knn_bool_text_var or knn_bool_image_var:
                         self.progress.update_progress(0.85, "Обработка KNN...")
 
-                        from compute.knn_cpu import process_extremes_with_knn
+                        from compute.knn.knn_cpu import process_extremes_with_knn
                         process_extremes_with_knn(
                             knn_extremes,
                             scale_folder,

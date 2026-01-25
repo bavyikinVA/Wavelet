@@ -6,7 +6,7 @@ from multiprocessing import Pool
 logger = logging.getLogger(__name__)
 
 def _process_row_wrapper(args):
-    from .cpu_wavelet import morlet_wavelet_with_padding
+    from compute.wavelets.cpu_wavelet import morlet_wavelet_with_padding
     row_data, scales = args
     return morlet_wavelet_with_padding(row_data, scales)
 
@@ -27,7 +27,7 @@ class ComputeBackend:
         }
 
         try:
-            from .cpu_wavelet import morlet_wavelet_with_padding
+            from compute.wavelets.cpu_wavelet import morlet_wavelet_with_padding
             self._cpu_processor = morlet_wavelet_with_padding
             logger.info("CPU backend initialized")
         except Exception as e:
@@ -37,7 +37,7 @@ class ComputeBackend:
 
         if self.use_gpu:
             try:
-                from .gpu_processor import GPUWaveletProcessor
+                from compute.wavelets.gpu_processor import GPUWaveletProcessor
                 self.gpu_processor = GPUWaveletProcessor(accuracy_mode="balanced")
 
                 if self.gpu_processor.is_available():
