@@ -133,12 +133,17 @@ class CupyWaveletGPU:
     def get_gpu_info(self):
         """Get GPU information"""
         try:
-            mem_info = self.cp.cuda.Device().mem_info
+            device = self.cp.cuda.Device()
+            mem_info = device.mem_info
+            properties = self.cp.cuda.runtime.getDeviceProperties(device.id)
+            device_name = properties.get("name", "CuPy GPU")
+            if isinstance(device_name, bytes):
+                device_name = device_name.decode("utf-8", errors="replace")
             return {
                 "available": True,
                 "memory_free_mb": mem_info[0] // (1024 ** 2),
                 "memory_total_mb": mem_info[1] // (1024 ** 2),
-                "device_name": "CuPy GPU",
+                "device_name": device_name,
                 "backend": "CuPy"
             }
         except Exception as e:

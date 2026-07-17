@@ -4,6 +4,7 @@ import queue
 import customtkinter as ctk
 
 from utils.gui import TkinterApp
+from utils.theme import AppTheme
 
 
 class LoggingHandler(logging.Handler):
@@ -31,6 +32,9 @@ class ProgressManager:
         self.progress_bar = None
         self.progress_label = None
         self.frame = None
+        self.logs_expanded = False
+        self.logs_container = None
+        self.toggle_logs_btn = None
         self.parent = parent
         self.log_queue = queue.Queue()
         self._is_active = True
@@ -51,13 +55,28 @@ class ProgressManager:
         self.frame = ctk.CTkFrame(self.parent)
         self.frame.pack(fill="x", padx=20, pady=10)
 
-        # Метка статуса
+        # Верхняя строка: текущий статус и управление журналом.
+        status_frame = ctk.CTkFrame(self.frame, fg_color="transparent")
+        status_frame.pack(fill="x", padx=10, pady=(8, 2))
+
         self.progress_label = ctk.CTkLabel(
-            self.frame,
+            status_frame,
             text="Готов к работе",
-            font=ctk.CTkFont(size=12, weight="bold")
+            font=AppTheme.body_font()
         )
-        self.progress_label.pack(anchor="w", padx=10, pady=(10, 5))
+        self.progress_label.pack(side="left", fill="x", expand=True, anchor="w")
+
+        self.toggle_logs_btn = ctk.CTkButton(
+            status_frame,
+            text="Показать журнал",
+            command=self.toggle_logs,
+            width=125,
+            height=AppTheme.COMPACT_CONTROL_HEIGHT,
+            fg_color="transparent",
+            hover_color=AppTheme.BORDER,
+            font=AppTheme.caption_font()
+        )
+        self.toggle_logs_btn.pack(side="right")
 
         # Фрейм для прогресс-бара и процентов
         progress_bar_frame = ctk.CTkFrame(self.frame, fg_color="transparent")
@@ -72,30 +91,41 @@ class ProgressManager:
         self.percent_label = ctk.CTkLabel(
             progress_bar_frame,
             text="0%",
-            font=ctk.CTkFont(size=10),
+            font=AppTheme.caption_font(),
             width=40
         )
         self.percent_label.pack(side="right", padx=(10, 0))
 
-        # Текстовое поле для логов
+        # Журнал создаётся сразу, но по умолчанию остаётся свёрнутым.
+        self.logs_container = ctk.CTkFrame(self.frame, fg_color="transparent")
         self.log_text = ctk.CTkTextbox(
-            self.frame,
-            height=120,
+            self.logs_container,
+            height=AppTheme.LOG_EXPANDED_HEIGHT,
             wrap="word",
-            font=ctk.CTkFont(family="Consolas", size=10)
+            font=AppTheme.monospace_font()
         )
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=10)
+        self.log_text.pack(fill="both", expand=True, pady=(6, 6))
         self.log_text.configure(state="disabled")
 
         # Кнопка очистки логов
         self.clear_logs_btn = ctk.CTkButton(
-            self.frame,
+            self.logs_container,
             text="Очистить логи",
             command=self.clear_logs,
             width=100,
-            height=25
+            height=AppTheme.COMPACT_CONTROL_HEIGHT
         )
-        self.clear_logs_btn.pack(anchor="e", padx=10, pady=(0, 10))
+        self.clear_logs_btn.pack(anchor="e", pady=(0, 6))
+
+    def toggle_logs(self):
+        """Развернуть или свернуть подробный журнал вычислений."""
+        self.logs_expanded = not self.logs_expanded
+        if self.logs_expanded:
+            self.logs_container.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+            self.toggle_logs_btn.configure(text="Скрыть журнал")
+        else:
+            self.logs_container.pack_forget()
+            self.toggle_logs_btn.configure(text="Показать журнал")
 
     def setup_logging(self):
         """Настройка системы логирования"""

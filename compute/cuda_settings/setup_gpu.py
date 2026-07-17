@@ -27,7 +27,7 @@ def setup_cuda_environment():
         if path and os.path.exists(path):
             if os.path.exists(os.path.join(path, 'bin', 'nvcc.exe')):
                 found_path = path
-                print(f"✅ Found CUDA at: {path}")
+                print(f"Found CUDA at: {path}")
                 break
 
     if found_path:
@@ -43,10 +43,10 @@ def setup_cuda_environment():
         if cuda_lib not in current_path:
             os.environ['PATH'] = cuda_lib + os.pathsep + current_path
 
-        print(f"🔧 Configured CUDA_PATH: {found_path}")
+        print(f"Configured CUDA_PATH: {found_path}")
         return True
     else:
-        print("❌ CUDA path not found")
+        print("CUDA path not found")
         return False
 
 

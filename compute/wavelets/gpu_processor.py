@@ -5,11 +5,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 class GPUWaveletProcessor:
-    def __init__(self, accuracy_mode: str = "balanced"):
+    def __init__(self):
         self.gpu_processor = None
         self._gpu_available = False
         self._gpu_info = {}
-        self.accuracy_mode = accuracy_mode
         self._initialize_gpu()
 
     def _initialize_gpu(self):
@@ -31,7 +30,7 @@ class GPUWaveletProcessor:
                 self._gpu_available = True
                 gpu_info = self.gpu_processor.get_gpu_info()
                 self._gpu_info.update(gpu_info)
-                logger.info(f"CuPy GPU processor initialized (mode: {self.accuracy_mode})")
+                logger.info("CuPy GPU processor initialized")
             else:
                 logger.warning("CuPy GPU not available")
 
@@ -53,18 +52,10 @@ class GPUWaveletProcessor:
 
         except Exception as e:
             logger.error(f"GPU computation failed: {e}")
-            num_signals, signal_length = data.shape
-            num_scales = len(scales)
-            logger.warning("Возврат нулевых результатов из-за ошибки GPU")
-            return np.zeros((num_signals, num_scales, signal_length), dtype=np.float64)
-
-    def set_accuracy_mode(self, mode: str):
-        valid_modes = ["high", "balanced", "fast"]
-        if mode in valid_modes:
-            self.accuracy_mode = mode
-            logger.info(f"GPU accuracy mode set to: {mode}")
-        else:
-            logger.warning(f"Invalid accuracy mode: {mode}. Using 'balanced'.")
+            # Ошибка должна дойти до вызывающего кода, который выполнит
+            # корректный fallback на CPU. Нулевой массив выглядел как
+            # успешный научный результат и мог остаться незамеченным.
+            raise RuntimeError("GPU wavelet computation failed") from e
 
     def is_available(self) -> bool:
         """Check if GPU processing is available"""

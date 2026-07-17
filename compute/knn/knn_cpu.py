@@ -53,7 +53,7 @@ class KNNProcessor:
             return {}
 
         # Пытаемся использовать GPU если доступен
-        if self.gpu_processor and self.gpu_processor.is_available():
+        if self.use_gpu and self.gpu_processor and self.gpu_processor.is_available():
             if log_callback:
                 log_callback("Использование GPU для KNN...")
 

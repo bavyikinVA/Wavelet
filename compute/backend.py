@@ -21,6 +21,8 @@ class ComputeBackend:
         self.backend_info = {
             "use_gpu": False,
             "device_name": "CPU",
+            "gpu_available": False,
+            "gpu_device_name": "GPU",
             "gpu_memory": "N/A",
             "status": "active",
             "available": True
@@ -38,19 +40,21 @@ class ComputeBackend:
         if self.use_gpu:
             try:
                 from compute.wavelets.gpu_processor import GPUWaveletProcessor
-                self.gpu_processor = GPUWaveletProcessor(accuracy_mode="balanced")
+                self.gpu_processor = GPUWaveletProcessor()
 
                 if self.gpu_processor.is_available():
                     gpu_info = self.gpu_processor.get_gpu_info()
                     self.backend_info.update({
                         "use_gpu": True,
                         "device_name": gpu_info.get("device_name", "CuPy GPU"),
+                        "gpu_available": True,
+                        "gpu_device_name": gpu_info.get("device_name", "CuPy GPU"),
                         "gpu_memory": f"{gpu_info.get('memory_free_mb', 0)}/{gpu_info.get('memory_total_mb', 0)} MB",
                         "backend": "CuPy"
                     })
                     logger.info(f"GPU backend: {self.backend_info['device_name']}")
                 else:
-                    logger.info("🔧 GPU not available, using CPU")
+                    logger.info("GPU not available, using CPU")
                     self.use_gpu = False
 
             except Exception as e:
@@ -101,6 +105,16 @@ class ComputeBackend:
 
     def get_backend_info(self) -> Dict[str, Any]:
         """Get information about current backend"""
+        if self.is_gpu_available():
+            gpu_info = self.gpu_processor.get_gpu_info()
+            self.backend_info.update({
+                "gpu_available": True,
+                "gpu_device_name": gpu_info.get("device_name", "CuPy GPU"),
+                "gpu_memory": (
+                    f"{gpu_info.get('memory_free_mb', 0)}/"
+                    f"{gpu_info.get('memory_total_mb', 0)} MB"
+                )
+            })
         return self.backend_info.copy()
 
     def is_gpu_available(self) -> bool:
@@ -108,32 +122,41 @@ class ComputeBackend:
         return (self.gpu_processor is not None and
                 self.gpu_processor.is_available())
 
-    def toggle_backend(self) -> bool:
-        """Toggle between CPU and GPU backend"""
-        if self.use_gpu:
-            # Switch to CPU
+    def set_use_gpu(self, enabled: bool) -> bool:
+        """Set the requested backend explicitly and return the applied state."""
+        if not enabled:
             self.use_gpu = False
             self.backend_info.update({
                 "use_gpu": False,
-                "device_name": "CPU",
-                "gpu_memory": "N/A"
+                "device_name": "CPU"
             })
             logger.info("Switched to CPU backend")
         else:
-            # Try to switch to GPU
             if self.is_gpu_available():
                 self.use_gpu = True
                 gpu_info = self.gpu_processor.get_gpu_info()
                 self.backend_info.update({
                     "use_gpu": True,
                     "device_name": gpu_info.get("device_name", "CuPy GPU"),
+                    "gpu_available": True,
+                    "gpu_device_name": gpu_info.get("device_name", "CuPy GPU"),
                     "gpu_memory": f"{gpu_info.get('memory_free_mb', 0)}/{gpu_info.get('memory_total_mb', 0)} MB"
                 })
                 logger.info(f"Switched to GPU backend: {self.backend_info['device_name']}")
             else:
+                self.use_gpu = False
+                self.backend_info.update({
+                    "use_gpu": False,
+                    "device_name": "CPU",
+                    "gpu_available": False
+                })
                 logger.warning("GPU not available, staying on CPU")
 
         return self.use_gpu
+
+    def toggle_backend(self) -> bool:
+        """Backward-compatible toggle between CPU and GPU."""
+        return self.set_use_gpu(not self.use_gpu)
 
     def clear_gpu_cache(self):
         """Clear GPU memory cache"""

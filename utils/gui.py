@@ -1,6 +1,7 @@
 import tkinter as tk
 import customtkinter as ctk
 from typing import Optional, Callable
+from utils.theme import AppTheme
 
 
 class TkinterApp(ctk.CTk):
@@ -184,7 +185,7 @@ class ResizablePanedWindow(ctk.CTkFrame):
 
     def _create_sash(self):
         """Создание разделителя"""
-        self.sash = ctk.CTkFrame(self, width=4, height=4, fg_color="#cccccc")
+        self.sash = ctk.CTkFrame(self, width=4, height=4, fg_color=AppTheme.TEXT_SECONDARY)
         self.sash.bind("<Button-1>", self._on_sash_press)
         self.sash.bind("<B1-Motion>", self._on_sash_drag)
         self.sash.bind("<Enter>", self._on_sash_enter)
@@ -252,10 +253,10 @@ class CollapsibleFrame(ctk.CTkFrame):
             self.header,
             text=f"▼ {self.title}",
             command=self.toggle,
-            height=30,
-            font=ctk.CTkFont(size=12, weight="bold"),
+            height=AppTheme.BUTTON_HEIGHT,
+            font=AppTheme.section_title_font(),
             fg_color="transparent",
-            hover_color="#3a3a3a",
+            hover_color=AppTheme.BORDER,
             anchor="w"
         )
         self.toggle_btn.pack(fill="x")

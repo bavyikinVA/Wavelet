@@ -1,5 +1,16 @@
 import os
 import warnings
+import json
+
+# Подавляем известное предупреждение экспериментального интерфейса CuPy до
+# импорта модулей, которые могут косвенно загрузить cupyx.jit.
+warnings.filterwarnings(
+    "ignore",
+    message=r"cupyx\.jit\.rawkernel is experimental.*",
+    category=FutureWarning,
+    module=r"cupyx\.jit\._interface"
+)
+
 from compute.knn.knn_cpu import process_extremes_with_knn
 from compute.extremes.extremes_finder import ExtremesFinder
 from compute.extremes.interpolator import Interpolator
@@ -8,6 +19,15 @@ from compute.extremes.interpolator import Interpolator
 def setup_cuda_environment():
     """Настройка окружения CUDA"""
     warnings.filterwarnings("ignore", message="CUDA path could not be detected")
+    # cupyx.jit.rawkernel используется зависимостями CuPy и пока помечен как
+    # experimental. Предупреждение не влияет на расчёты и засоряет консоль
+    # ещё до появления главного окна.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"cupyx\.jit\.rawkernel is experimental.*",
+        category=FutureWarning,
+        module=r"cupyx\.jit\._interface"
+    )
 
     # Автоматический поиск пути CUDA
     cuda_paths = [
@@ -44,6 +64,7 @@ import time
 import tkinter as tk
 import traceback
 from multiprocessing import Pool, freeze_support
+from tkinter import filedialog
 from tkinter import messagebox as mb
 
 import customtkinter as ctk
@@ -53,6 +74,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import numpy as np
+from PIL import Image
 
 from Gram_Shmidt import change_channels
 from compute.processing_task import ProcessingTask
@@ -60,6 +82,7 @@ from image_cropper_app import run_cropper
 from pipette import run_pipette
 from utils.gui import TkinterApp, ScrollableFrame, CollapsibleFrame
 from utils.progress_manager import ProgressManager
+from utils.theme import AppTheme
 from compute.wavelets.cpu_wavelet import morlet_wavelet_with_padding
 
 
@@ -82,9 +105,9 @@ class ImageProcessor:
 
         # Инициализация бэкендов
         from compute.backend import ComputeBackend
-        from compute.wavelets.gpu_processor import GPUWaveletProcessor
         self.backend = ComputeBackend()
-        self.gpu_processor = GPUWaveletProcessor()
+        # Используем один экземпляр GPU-процессора во всём приложении.
+        self.gpu_processor = self.backend.gpu_processor
 
         # Инициализация KNN процессора
         from compute.knn.knn_cpu import get_knn_processor
@@ -99,7 +122,7 @@ class ImageProcessor:
         """Очистка GPU памяти"""
         if hasattr(self, 'backend'):
             self.backend.clear_gpu_cache()
-        if hasattr(self, 'gpu_processor'):
+        if getattr(self, 'gpu_processor', None) is not None:
             self.gpu_processor.clear_cache()
 
     def add_task(self, task):
@@ -237,12 +260,12 @@ class ImageProcessor:
         task.num_scale = len(task.scales)
         self.progress.log_info(f"Загружено {task.num_scale} масштабов")
 
-    def toggle_gpu_backend(self):
-        """Переключение между CPU и GPU"""
-        success = self.backend.toggle_backend()
+    def set_gpu_enabled(self, enabled):
+        """Включить или отключить GPU для всех поддерживаемых вычислений."""
+        success = self.backend.set_use_gpu(enabled)
+        self.knn_processor.toggle_gpu(self.backend.use_gpu)
         backend_info = self.backend.get_backend_info()
-        if success:
-            self.progress.log_info(f"Переключено на: {backend_info['device_name']}")
+        self.progress.log_info(f"Вычислительное устройство: {backend_info['device_name']}")
         return success, backend_info
 
     def get_backend_info(self):
@@ -279,7 +302,7 @@ class ImageProcessor:
 
         result_3d = np.zeros((scales_size, cols, rows))
 
-        self.progress.log_info(f"🔹 CPU обработка {cols} столбцов...")
+        self.progress.log_info(f"CPU обработка {cols} столбцов...")
 
         # Подготавливаем аргументы для каждого столбца
         args = [(col_idx, data[:, col_idx], scales) for col_idx in range(cols)]
@@ -307,7 +330,7 @@ class ImageProcessor:
             return result
 
         except Exception as e:
-            self.progress.log_error(f"❌ GPU батчевая обработка не удалась: {e}. Возврат к CPU.")
+            self.progress.log_error(f"GPU батчевая обработка не удалась: {e}. Возврат к CPU.")
             return self.process_channel(data_channel, scales)
 
     def wavelets(self, task, type_data, data_3_channel):
@@ -414,21 +437,131 @@ class ImageProcessor:
 
     def compute_wavelets(self, task, info_out):
         self.progress.update_progress(0.1, "Подготовка данных для вейвлет-преобразования...")
-        # (3, scales, rows, cols)
-        data_3_channels = np.zeros((3, task.num_scale, task.data[0].shape[0], task.data[0].shape[1]))
-        data_3_channels = self.wavelets(task, 0, data_3_channels)
-        task.result.append(data_3_channels)
-        self.save_print_wavelets(task, 0, info_out)
+        if task.process_rows:
+            data_3_channels = np.zeros(
+                (3, task.num_scale, task.data[0].shape[0], task.data[0].shape[1])
+            )
+            task.result[0] = self.wavelets(task, 0, data_3_channels)
+            self.save_print_wavelets(task, 0, info_out)
 
-        self.progress.update_progress(0.6, "Обработка транспонированных данных...")
-        # (3, scales, cols, rows)
-        data_3_channels_tr = np.zeros((3, task.num_scale, task.data[0].shape[0], task.data[0].shape[1]))
-        data_3_channels_tr = self.wavelets(task, 1, data_3_channels_tr)
-        data_3_channels_tr = np.transpose(data_3_channels_tr, (0, 1, 2, 3))
-        task.result.append(data_3_channels_tr)
-        self.save_print_wavelets(task, 1, info_out)
+        if task.process_columns:
+            self.progress.update_progress(0.6, "Обработка столбцов...")
+            data_3_channels_tr = np.zeros(
+                (3, task.num_scale, task.data[0].shape[0], task.data[0].shape[1])
+            )
+            task.result[1] = self.wavelets(task, 1, data_3_channels_tr)
+            self.save_print_wavelets(task, 1, info_out)
 
         self.progress.update_progress(1.0, "Вейвлет-преобразование завершено")
+
+    def compute_wavelets_2d(self, task):
+        """Выполнить отдельное ориентационное 2D-преобразование Морле."""
+        from compute.wavelets.morlet_2d import (
+            cwt2d_morlet_cpu,
+            cwt2d_morlet_gpu,
+        )
+
+        task_folder = self.create_task_folder(task)
+        total = 3 * len(task.scales) * len(task.orientations)
+        completed = 0
+        use_gpu = self.backend.use_gpu and self.backend.is_gpu_available()
+        channel_names = ["Красный", "Зелёный", "Синий"]
+
+        metadata = {
+            "transform": "2D Morlet CWT",
+            "scales": [float(value) for value in task.scales],
+            "orientations_deg": [float(value) for value in task.orientations],
+            "omega0": float(task.morlet_omega0),
+            "anisotropy": float(task.morlet_anisotropy),
+            "normalization": "L2",
+            "coefficient_type": "complex64",
+        }
+        with open(
+                os.path.join(task_folder, "2D_Morlet_parameters.json"),
+                "w", encoding="utf-8") as metadata_file:
+            json.dump(metadata, metadata_file, ensure_ascii=False, indent=2)
+
+        for channel_index, channel_name in enumerate(channel_names):
+            channel = task.data[channel_index].astype(np.float32)
+            for scale in task.scales:
+                scale_folder = self.create_scale_folder(scale, task_folder)
+                output_folder = os.path.join(scale_folder, "2D_Morlet")
+                os.makedirs(output_folder, exist_ok=True)
+
+                for angle in task.orientations:
+                    completed += 1
+                    self.progress.update_progress(
+                        completed / max(total, 1),
+                        (f"2D Morlet: {channel_name}, масштаб {scale}, "
+                         f"ориентация {angle:g}°")
+                    )
+
+                    if use_gpu:
+                        try:
+                            coefficients = cwt2d_morlet_gpu(
+                                channel, [scale], [angle],
+                                task.morlet_omega0,
+                                task.morlet_anisotropy
+                            )[0, 0]
+                        except Exception as error:
+                            self.progress.log_error(
+                                f"Ошибка 2D Morlet на GPU: {error}. Переход на CPU."
+                            )
+                            use_gpu = False
+                            coefficients = cwt2d_morlet_cpu(
+                                channel, [scale], [angle],
+                                task.morlet_omega0,
+                                task.morlet_anisotropy
+                            )[0, 0]
+                    else:
+                        coefficients = cwt2d_morlet_cpu(
+                            channel, [scale], [angle],
+                            task.morlet_omega0,
+                            task.morlet_anisotropy
+                        )[0, 0]
+
+                    file_stem = (
+                        f"2D_Morlet_{channel_name}_scale_{scale}_"
+                        f"angle_{angle:g}"
+                    )
+                    magnitude = np.abs(coefficients)
+                    phase = np.angle(coefficients)
+
+                    if task.output_wavelet_text:
+                        np.savetxt(
+                            os.path.join(output_folder, file_stem + "_magnitude.csv"),
+                            magnitude, fmt="%.6g", delimiter=","
+                        )
+                        np.savetxt(
+                            os.path.join(output_folder, file_stem + "_phase.csv"),
+                            phase, fmt="%.6g", delimiter=","
+                        )
+
+                    if task.output_wavelet_image:
+                        fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+                        magnitude_plot = axes[0].imshow(magnitude, cmap="viridis")
+                        axes[0].set_title("Модуль коэффициентов")
+                        axes[0].axis("off")
+                        fig.colorbar(magnitude_plot, ax=axes[0], fraction=0.046)
+
+                        phase_plot = axes[1].imshow(
+                            phase, cmap="twilight", vmin=-np.pi, vmax=np.pi
+                        )
+                        axes[1].set_title("Фаза")
+                        axes[1].axis("off")
+                        fig.colorbar(phase_plot, ax=axes[1], fraction=0.046)
+                        fig.suptitle(
+                            f"{channel_name}: масштаб {scale}, ориентация {angle:g}°"
+                        )
+                        fig.tight_layout()
+                        fig.savefig(
+                            os.path.join(output_folder, file_stem + ".png"),
+                            dpi=220,
+                            bbox_inches="tight"
+                        )
+                        plt.close(fig)
+
+        self.progress.update_progress(1.0, "2D-преобразование Морле завершено")
 
     def save_print_wavelets(self, task, type_data, info_out):
         colors = ['Красный', 'Зелёный', 'Синий']
@@ -1625,30 +1758,46 @@ class ImageProcessor:
             print(f"Directory {scale_folder_path} is not found")
             return None
 
-    def compute_for_task(self, task, wp_var1, wp_var2, print_channels_txt_var, row_var, col_var, max_var, min_var,
-                         p_ex_var1, p_ex_var2, knn_bool_text_var, knn_bool_image_var, pipette_state):
+    def compute_for_task(self, task):
         """Выполнение вычислений для конкретной задачи"""
         try:
+            pipette_state = 'disabled' if task.has_colors_selected() else 'normal'
             task_folder = self.create_task_folder(task)
             self.progress.log_info(f"Создана папка для {task.task_name}: {task_folder}")
 
             # Сохранение исходных каналов - 5%
             self.progress.update_progress(0.05, "Сохранение исходных каналов...")
-            self.save_orig_channels_txt(task, print_channels_txt_var)
+            self.save_orig_channels_txt(task, task.save_source_channels)
 
-            task.result = []
-            info_out = self._get_output_type(wp_var1.get(), wp_var2.get())
+            task.result = {}
+            info_out = self._get_output_type(
+                task.output_wavelet_image,
+                task.output_wavelet_text
+            )
 
-            # Вейвлет-преобразование - 60%
             self.progress.update_progress(0.1, "Начало вейвлет-преобразования...")
-            self.compute_wavelets(task, info_out)
+            if task.analysis_mode == "2d":
+                self.compute_wavelets_2d(task)
+            else:
+                self.compute_wavelets(task, info_out)
 
-            # Поиск экстремумов - 30%
-            self.progress.update_progress(0.7, "Начало поиска экстремумов...")
-            if p_ex_var1.get() or p_ex_var2.get():
-                self.compute_points(task, row_var.get(), col_var.get(), max_var.get(), min_var.get(),
-                                    task.k_neighbors, knn_bool_text_var.get(), knn_bool_image_var.get(),
-                                    p_ex_var1.get(), p_ex_var2.get(), pipette_state)
+                # Текущий конвейер огибающих относится к построчному 1D-анализу.
+                self.progress.update_progress(0.7, "Начало поиска экстремумов...")
+                if ((task.output_extremes_text or task.output_extremes_image) and
+                        task.process_rows):
+                    self.compute_points(
+                        task,
+                        task.process_rows,
+                        task.process_columns,
+                        task.find_maxima,
+                        task.find_minima,
+                        task.k_neighbors,
+                        task.output_knn_text,
+                        task.output_knn_image,
+                        task.output_extremes_text,
+                        task.output_extremes_image,
+                        pipette_state
+                    )
 
             # Завершение - 5%
             self.progress.update_progress(1.0, f"Вычисления для {task.task_name} завершены успешно")
@@ -1661,7 +1810,7 @@ class ImageProcessor:
             raise
         finally:
             # Очищаем временные данные в задаче после вычислений
-            task.result = []
+            task.result = {}
             # self.clear_gpu_cache()
 
     @staticmethod
@@ -1678,10 +1827,20 @@ class ImageProcessor:
 
 
 class App(TkinterApp):
+    ANALYSIS_MODE_LABELS = {
+        "1D-анализ": "1d",
+        "2D-анализ": "2d",
+    }
+    ANALYSIS_MODE_NAMES = {
+        "1d": "1D-анализ",
+        "2d": "2D-анализ",
+    }
+
     def __init__(self):
         super().__init__()
         self._compute_thread = None
-        self.title("Wavelets - Professional Edition")
+        self._loading_task_settings = False
+        self.title("Wavelet Analysis")
         self.resizable(True, True)
         self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight() - 40}+0+0")
 
@@ -1692,23 +1851,63 @@ class App(TkinterApp):
         # инициализация всех атрибутов UI
         self._initialize_ui_variables()
 
+        self.app_header = ctk.CTkFrame(self, fg_color="transparent")
+        self.app_header.pack(
+            fill="x",
+            padx=AppTheme.WINDOW_PADDING,
+            pady=(AppTheme.WINDOW_PADDING, 2)
+        )
+        ctk.CTkLabel(
+            self.app_header,
+            text="Wavelet Analysis",
+            font=AppTheme.page_title_font(),
+            anchor="w"
+        ).pack(side="left")
+        ctk.CTkLabel(
+            self.app_header,
+            text="Анализ изображений и одномерных сигналов",
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w"
+        ).pack(side="left", padx=(12, 0), pady=(4, 0))
+        ctk.CTkButton(
+            self.app_header,
+            text="ML — следующий этап",
+            state="disabled",
+            width=150,
+            height=AppTheme.SMALL_BUTTON_HEIGHT
+        ).pack(side="right")
+
         # создаем главный контейнер с тремя панелями
         self.main_container = ctk.CTkFrame(self)
-        self.main_container.pack(fill="both", expand=True, padx=5, pady=5)
-        self.main_container.grid_columnconfigure(0, weight=1)  # Левая панель
-        self.main_container.grid_columnconfigure(1, weight=1)  # Центральная панель
-        self.main_container.grid_columnconfigure(2, weight=1)  # Правая панель
+        self.main_container.pack(
+            fill="both", expand=True,
+            padx=AppTheme.WINDOW_PADDING,
+            pady=(2, AppTheme.SECTION_GAP)
+        )
+        self.main_container.grid_columnconfigure(0, weight=3)  # Задачи
+        self.main_container.grid_columnconfigure(1, weight=5)  # Рабочая область
+        self.main_container.grid_columnconfigure(2, weight=4)  # Вывод и запуск
         self.main_container.grid_rowconfigure(0, weight=1)
 
         # панель управления задачами
         self.tasks_panel = self._create_tasks_panel()
-        self.tasks_panel.grid(row=0, column=0, sticky="nsew", padx=2)
+        self.tasks_panel.grid(
+            row=0, column=0, sticky="nsew",
+            padx=(0, AppTheme.PANEL_GAP // 2)
+        )
         # настройки ввода
         self.left_panel = self._create_left_panel()
-        self.left_panel.grid(row=0, column=1, sticky="nsew", padx=(0, 2))
+        self.left_panel.grid(
+            row=0, column=1, sticky="nsew",
+            padx=AppTheme.PANEL_GAP // 2
+        )
         # настройки вывода
         self.right_panel = self._create_right_panel()
-        self.right_panel.grid(row=0, column=2, sticky="nsew", padx=(2, 0))
+        self.right_panel.grid(
+            row=0, column=2, sticky="nsew",
+            padx=(AppTheme.PANEL_GAP // 2, 0)
+        )
 
         self.progress_manager = ProgressManager(self)
 
@@ -1718,6 +1917,13 @@ class App(TkinterApp):
         # текущая задача
         self.current_task = None
         self.knn_text_var.trace('w', self.update_knn_for_current_task)
+        for variable in (
+                self.row_var, self.col_var, self.max_var, self.min_var,
+                self.wp_var1, self.wp_var2, self.p_ex_var1, self.p_ex_var2,
+                self.knn_bool_text_var, self.knn_bool_image_var,
+                self.print_channels_txt_var, self.orientations_var,
+                self.morlet_omega0_var, self.morlet_anisotropy_var):
+            variable.trace_add('write', self._store_settings_for_current_task)
 
         # Переменная для GPU/CPU переключения
         self.use_gpu_var = tk.BooleanVar(value=True)
@@ -1817,6 +2023,7 @@ class App(TkinterApp):
 
     def _initialize_ui_variables(self):
         """Инициализация всех переменных UI"""
+        self.analysis_mode_var = tk.StringVar(value="1D-анализ")
         self.row_var = tk.BooleanVar(value=True)
         self.col_var = tk.BooleanVar(value=True)
         self.max_var = tk.BooleanVar(value=True)
@@ -1831,10 +2038,15 @@ class App(TkinterApp):
 
         self.data = tk.StringVar()
         self.knn_text_var = tk.StringVar(value="0")
+        self.orientations_var = tk.StringVar(value="0, 45, 90, 135")
+        self.morlet_omega0_var = tk.StringVar(value="6.0")
+        self.morlet_anisotropy_var = tk.StringVar(value="1.0")
 
         # Widget references
         self.load_button = None
         self.print_load_image = None
+        self.image_preview_label = None
+        self.preview_ctk_image = None
         self.pipette_button = None
         self.gram_shmidt_button = None
         self.entry_start = None
@@ -1845,9 +2057,14 @@ class App(TkinterApp):
         self.button_load_scales_file = None
         self.entry_near_point = None
         self.app_start_button = None
+        self.required_step_label = None
         self.task_widgets = []
         self.compute_settings_section = None
-        self.gpu_checkbox = None
+        self.gpu_switch = None
+        self.analysis_mode_selector = None
+        self.analysis_mode_description = None
+        self.two_d_section = None
+        self.extremes_hint_label = None
 
     def _create_tasks_panel(self):
         """Создание панели управления задачами"""
@@ -1856,8 +2073,8 @@ class App(TkinterApp):
         # Заголовок панели
         header = ctk.CTkLabel(
             panel,
-            text="📋 Управление задачами",
-            font=ctk.CTkFont(size=16, weight="bold"),
+            text="Задачи",
+            font=AppTheme.panel_title_font(),
             anchor="w"  # Выравнивание текста слева
         )
         header.pack(fill="x", padx=10, pady=(10, 15))
@@ -1865,12 +2082,12 @@ class App(TkinterApp):
         # Кнопка добавления задачи
         self.add_task_btn = ctk.CTkButton(
             panel,
-            text="➕ Добавить задачу",
+            text="Добавить задачу",
             command=self.add_new_task,
-            height=40,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color="#28a745",
-            hover_color="#218838"
+            height=AppTheme.BUTTON_HEIGHT,
+            font=AppTheme.section_title_font(),
+            fg_color=AppTheme.PRIMARY,
+            hover_color=AppTheme.PRIMARY_HOVER
         )
         self.add_task_btn.pack(fill="x", padx=10, pady=(0, 10))
 
@@ -1882,7 +2099,7 @@ class App(TkinterApp):
         tasks_label = ctk.CTkLabel(
             tasks_scrollable.scrollable_frame,
             text="Список задач:",
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=AppTheme.section_title_font(),
             anchor="w"
         )
         tasks_label.pack(fill="x", padx=10, pady=(10, 5))
@@ -1895,8 +2112,8 @@ class App(TkinterApp):
         self.tasks_status_label = ctk.CTkLabel(
             tasks_scrollable.scrollable_frame,
             text="Задачи не добавлены",
-            font=ctk.CTkFont(size=11),
-            text_color="gray",
+            font=AppTheme.body_font(),
+            text_color=AppTheme.MUTED,
             anchor="w"
         )
         self.tasks_status_label.pack(fill="x", padx=10, pady=(5, 10))
@@ -1915,32 +2132,213 @@ class App(TkinterApp):
         header = ctk.CTkLabel(
             scrollable_panel.scrollable_frame,
             text="Настройки ввода и обработки",
-            font=ctk.CTkFont(size=16, weight="bold"),
+            font=AppTheme.panel_title_font(),
             anchor="w"
         )
         header.pack(fill="x", padx=10, pady=(10, 15))
 
+        # Режим анализа определяет доступные параметры и способ вычисления.
+        self._setup_analysis_mode_section(scrollable_panel.scrollable_frame)
+
         # Секция загрузки изображения
-        self.load_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="📁 Загрузка изображения")
+        self.load_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="Загрузка изображения")
         self.load_section.pack(fill="x", padx=5, pady=2)
         self._setup_load_section()
 
         # Секция работы с каналами
-        self.channel_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="🎨 Работа с каналами")
+        self.channel_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="Работа с каналами")
         self.channel_section.pack(fill="x", padx=5, pady=2)
         self._setup_channel_section()
 
         # Секция масштабов
-        self.scales_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="📏 Настройка масштабов")
+        self.scales_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="Настройка масштабов")
         self.scales_section.pack(fill="x", padx=5, pady=2)
         self._setup_scales_section()
 
+        # Параметры настоящего двумерного Morlet показываются только в 2D.
+        self.two_d_section = CollapsibleFrame(
+            scrollable_panel.scrollable_frame,
+            title="Параметры 2D Morlet"
+        )
+        self._setup_2d_section()
+
         # Секция точек экстремумов
-        self.extremes_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="📊 Точки экстремумов")
+        self.extremes_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="Точки экстремумов")
         self.extremes_section.pack(fill="x", padx=5, pady=2)
         self._setup_extremes_section()
 
         return panel
+
+    def _setup_2d_section(self):
+        """Настройки ориентационного двумерного вейвлета Морле."""
+        ctk.CTkLabel(
+            self.two_d_section.content,
+            text="Ориентации, градусы (через запятую)",
+            font=AppTheme.body_font(),
+            anchor="w"
+        ).pack(fill="x", pady=(0, 4))
+        ctk.CTkEntry(
+            self.two_d_section.content,
+            textvariable=self.orientations_var,
+            placeholder_text="0, 45, 90, 135"
+        ).pack(fill="x", pady=(0, 8))
+
+        ctk.CTkLabel(
+            self.two_d_section.content,
+            text="Центральная частота ω₀",
+            font=AppTheme.body_font(),
+            anchor="w"
+        ).pack(fill="x", pady=(0, 4))
+        ctk.CTkEntry(
+            self.two_d_section.content,
+            textvariable=self.morlet_omega0_var,
+            placeholder_text="6.0"
+        ).pack(fill="x", pady=(0, 8))
+
+        ctk.CTkLabel(
+            self.two_d_section.content,
+            text="Анизотропность",
+            font=AppTheme.body_font(),
+            anchor="w"
+        ).pack(fill="x", pady=(0, 4))
+        ctk.CTkEntry(
+            self.two_d_section.content,
+            textvariable=self.morlet_anisotropy_var,
+            placeholder_text="1.0"
+        ).pack(fill="x")
+
+        ctk.CTkLabel(
+            self.two_d_section.content,
+            text=("Ориентация задаёт направление чувствительности фильтра; "
+                  "ω₀ управляет частотой несущей, а анизотропность — "
+                  "вытянутостью вейвлета."),
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w",
+            justify="left",
+            wraplength=420
+        ).pack(fill="x", pady=(8, 0))
+
+    def _setup_analysis_mode_section(self, parent):
+        """Создать верхнеуровневый переключатель режима активной задачи."""
+        mode_frame = ctk.CTkFrame(parent, corner_radius=8)
+        mode_frame.pack(fill="x", padx=5, pady=(0, 8))
+
+        ctk.CTkLabel(
+            mode_frame,
+            text="Режим вейвлет-анализа",
+            font=AppTheme.section_title_font(),
+            anchor="w"
+        ).pack(fill="x", padx=12, pady=(10, 6))
+
+        self.analysis_mode_selector = ctk.CTkSegmentedButton(
+            mode_frame,
+            values=list(self.ANALYSIS_MODE_LABELS.keys()),
+            variable=self.analysis_mode_var,
+            command=self.on_analysis_mode_changed,
+            height=AppTheme.BUTTON_HEIGHT,
+            state="disabled"
+        )
+        self.analysis_mode_selector.pack(fill="x", padx=12, pady=(0, 8))
+        self.analysis_mode_selector.set("1D-анализ")
+
+        self.analysis_mode_description = ctk.CTkLabel(
+            mode_frame,
+            text="Создайте или активируйте задачу, чтобы выбрать режим.",
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.MUTED,
+            anchor="w",
+            justify="left",
+            wraplength=430
+        )
+        self.analysis_mode_description.pack(fill="x", padx=12, pady=(0, 10))
+
+    def on_analysis_mode_changed(self, selected_label):
+        """Сохранить выбранный режим в активной задаче и обновить интерфейс."""
+        if not self.current_task:
+            self.analysis_mode_selector.set("1D-анализ")
+            return
+
+        selected_mode = self.ANALYSIS_MODE_LABELS[selected_label]
+        if self.current_task.analysis_mode == selected_mode:
+            return
+
+        self.current_task.set_analysis_mode(selected_mode)
+        self.progress_manager.log_info(
+            f"{self.current_task.task_name}: выбран режим {selected_label}"
+        )
+        self._apply_analysis_mode_ui()
+        self._update_action_availability()
+        self._update_tasks_display()
+
+    def _apply_analysis_mode_ui(self):
+        """Показать только настройки, корректные для режима активной задачи."""
+        if not self.current_task:
+            self.analysis_mode_var.set("1D-анализ")
+            self.analysis_mode_selector.set("1D-анализ")
+            self.analysis_mode_selector.configure(state="disabled")
+            self.analysis_mode_description.configure(
+                text="Создайте или активируйте задачу, чтобы выбрать режим.",
+                text_color=AppTheme.MUTED
+            )
+            self.extremes_section.pack(fill="x", padx=5, pady=2)
+            self.two_d_section.pack_forget()
+            self.knn_section.pack(fill="x", padx=5, pady=2, before=self.intermediate_section)
+            self.output_extremes_section.pack(
+                fill="x", padx=5, pady=2, before=self.knn_section
+            )
+            self.app_start_button.configure(
+                text="Запустить",
+                state="normal",
+                fg_color=AppTheme.PRIMARY,
+                hover_color=AppTheme.PRIMARY_HOVER
+            )
+            return
+
+        mode = self.current_task.analysis_mode
+        mode_label = self.ANALYSIS_MODE_NAMES[mode]
+        self.analysis_mode_var.set(mode_label)
+        self.analysis_mode_selector.set(mode_label)
+        self.analysis_mode_selector.configure(state="normal")
+
+        if mode == "1d":
+            self.analysis_mode_description.configure(
+                text=("Одномерное преобразование Морле по строкам и/или "
+                      "столбцам изображения."),
+                text_color=AppTheme.TEXT_SECONDARY
+            )
+            if not self.extremes_section.winfo_manager():
+                self.extremes_section.pack(fill="x", padx=5, pady=2)
+            self.two_d_section.pack_forget()
+            if not self.knn_section.winfo_manager():
+                self.knn_section.pack(fill="x", padx=5, pady=2, before=self.intermediate_section)
+            if not self.output_extremes_section.winfo_manager():
+                self.output_extremes_section.pack(
+                    fill="x", padx=5, pady=2, before=self.knn_section
+                )
+            self.app_start_button.configure(
+                text="Запустить",
+                state="normal",
+                fg_color=AppTheme.PRIMARY,
+                hover_color=AppTheme.PRIMARY_HOVER
+            )
+        else:
+            self.analysis_mode_description.configure(
+                text=("Двумерное комплексное преобразование Морле по масштабам "
+                      "и ориентациям. Результат содержит модуль и фазу."),
+                text_color=AppTheme.TEXT_SECONDARY
+            )
+            self.extremes_section.pack_forget()
+            if not self.two_d_section.winfo_manager():
+                self.two_d_section.pack(fill="x", padx=5, pady=2)
+            self.output_extremes_section.pack_forget()
+            self.knn_section.pack_forget()
+            self.app_start_button.configure(
+                text="Недоступно: настройте параметры 2D",
+                state="disabled",
+                fg_color=AppTheme.DISABLED_DARK,
+                hover_color=AppTheme.DISABLED_DARK
+            )
 
     def _create_right_panel(self):
         """Создание правой панели с настройками вывода"""
@@ -1954,7 +2352,7 @@ class App(TkinterApp):
         header = ctk.CTkLabel(
             scrollable_panel.scrollable_frame,
             text="Настройки вывода и вычислений",
-            font=ctk.CTkFont(size=16, weight="bold"),
+            font=AppTheme.panel_title_font(),
             anchor="w"
         )
         header.pack(fill="x", padx=10, pady=(10, 15))
@@ -1965,8 +2363,8 @@ class App(TkinterApp):
         temp_label = ctk.CTkLabel(
             self.compute_settings_section.content,
             text="Загрузка настроек...",
-            font=ctk.CTkFont(size=11),
-            text_color="gray")
+            font=AppTheme.body_font(),
+            text_color=AppTheme.MUTED)
         temp_label.pack(pady=10)
 
         self.wavelet_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="Вейвлет-преобразование")
@@ -2008,108 +2406,60 @@ class App(TkinterApp):
             error_label = ctk.CTkLabel(
                 self.compute_settings_section.content,
                 text="Ошибка инициализации процессора",
-                font=ctk.CTkFont(size=11),
-                text_color="red"
+                font=AppTheme.body_font(),
+                text_color=AppTheme.DANGER
             )
             error_label.pack(pady=10)
             return
 
-        # Информация о бэкенде
+        # Информация о доступном и активном вычислительном устройстве.
         backend_info = self.image_processor.get_backend_info()
-        info_text = f"Устройство: {backend_info['device_name']}"
-        if backend_info['use_gpu'] and backend_info['gpu_memory'] != "N/A":
-            info_text += f" | Память: {backend_info['gpu_memory']}"
+        gpu_available = backend_info['gpu_available']
 
-        info_label = ctk.CTkLabel(
+        status_label = ctk.CTkLabel(
             self.compute_settings_section.content,
-            text=info_text,
-            font=ctk.CTkFont(size=11),
-            text_color="lightblue",
+            text="GPU доступен" if gpu_available else "GPU не обнаружен",
+            font=AppTheme.body_font(),
+            text_color=AppTheme.GPU_AVAILABLE if gpu_available else AppTheme.WARNING,
             anchor="w"
         )
-        info_label.pack(fill="x", pady=(0, 10))
+        status_label.pack(fill="x", pady=(0, 4))
 
-        # Переключатель CPU/GPU
-        gpu_available = self.image_processor.backend.is_gpu_available()
+        if gpu_available:
+            gpu_details = backend_info['gpu_device_name']
+            if backend_info['gpu_memory'] != "N/A":
+                gpu_details += f" | Память: {backend_info['gpu_memory']}"
+        else:
+            gpu_details = "Вычисления будут выполняться на CPU"
 
-        self.gpu_checkbox = ctk.CTkCheckBox(
+        details_label = ctk.CTkLabel(
             self.compute_settings_section.content,
-            text="Использовать GPU (ускорение)",
+            text=gpu_details,
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w"
+        )
+        details_label.pack(fill="x", pady=(0, 10))
+
+        self.gpu_switch = ctk.CTkSwitch(
+            self.compute_settings_section.content,
+            text="Использовать GPU",
             variable=self.use_gpu_var,
             command=self.toggle_gpu_backend,
             state="normal" if gpu_available else "disabled"
         )
-        # Устанавливаем начальное значение
         self.use_gpu_var.set(self.image_processor.backend.use_gpu)
-        self.gpu_checkbox.pack(fill="x", pady=5)
-
-        if not gpu_available:
-            warning_label = ctk.CTkLabel(
-                self.compute_settings_section.content,
-                text="GPU не обнаружен. Установите CuPy для CUDA поддержки.",
-                font=ctk.CTkFont(size=10),
-                text_color="orange",
-                anchor="w"
-            )
-            warning_label.pack(fill="x", pady=(5, 0))
-        else:
-            status_label = ctk.CTkLabel(
-                self.compute_settings_section.content,
-                text="GPU доступен для вычислений",
-                font=ctk.CTkFont(size=10),
-                text_color="green",
-                anchor="w"
-            )
-            status_label.pack(fill="x", pady=(5, 0))
-
-            # Выбор режима точности GPU
-            accuracy_frame = ctk.CTkFrame(self.compute_settings_section.content, fg_color="transparent")
-            accuracy_frame.pack(fill="x", pady=5)
-
-            accuracy_label = ctk.CTkLabel(
-                accuracy_frame,
-                text="Режим точности GPU:",
-                font=ctk.CTkFont(size=11, weight="bold"),
-                anchor="w"
-            )
-            accuracy_label.pack(fill="x")
-
-            self.accuracy_var = tk.StringVar(value="balanced")
-
-            accuracy_options = [
-                ("Высокая точность", "high"),
-                ("Сбалансированный", "balanced"),
-                ("Высокая скорость", "fast")
-            ]
-
-            for text, mode in accuracy_options:
-                rb = ctk.CTkRadioButton(
-                    accuracy_frame,
-                    text=text,
-                    variable=self.accuracy_var,
-                    value=mode,
-                    command=self.on_accuracy_mode_changed
-                )
-                rb.pack(anchor="w", pady=2)
-
-    def on_accuracy_mode_changed(self):
-        """Обработчик изменения режима точности"""
-        if hasattr(self, 'image_processor') and self.image_processor.gpu_processor:
-            self.image_processor.gpu_processor.set_accuracy_mode(self.accuracy_var.get())
-            self.progress_manager.log_info(f"Режим точности GPU изменен на: {self.accuracy_var.get()}")
-
+        self.gpu_switch.pack(fill="x", pady=(2, 8))
 
     def toggle_gpu_backend(self):
-        """Переключение между CPU и GPU"""
-        success, backend_info = self.image_processor.toggle_gpu_backend()
-
-        # Обновляем UI
-        if success:
-            new_state = "GPU" if backend_info['use_gpu'] else "CPU"
-            self.progress_manager.log_info(f"Переключено на вычисления на {new_state}")
-
-            # Обновляем информацию в UI
-            self._update_compute_settings_display()
+        """Применить состояние переключателя CPU/GPU."""
+        requested_state = self.use_gpu_var.get()
+        enabled, backend_info = self.image_processor.set_gpu_enabled(requested_state)
+        self.use_gpu_var.set(enabled)
+        active_device = "GPU" if enabled else "CPU"
+        self.progress_manager.log_info(f"Для вычислений выбран {active_device}")
+        self._update_compute_settings_display()
+        self.after(0, self._update_gpu_section)
 
 
     def _update_compute_settings_display(self):
@@ -2117,14 +2467,17 @@ class App(TkinterApp):
         if not hasattr(self, 'image_processor') or self.image_processor is None:
             return
 
-        knn_gpu_available = self.image_processor.knn_processor.is_gpu_available()
+        knn_gpu_available = (
+            self.image_processor.backend.use_gpu and
+            self.image_processor.knn_processor.is_gpu_available()
+        )
 
         # Обновляем информацию о KNN
         knn_info = f"KNN: {'GPU' if knn_gpu_available else 'CPU'}"
         if hasattr(self, 'knn_status_label'):
             self.knn_status_label.configure(
                 text=knn_info,
-                text_color="lightgreen" if knn_gpu_available else "orange"
+                text_color=AppTheme.GPU_AVAILABLE if knn_gpu_available else AppTheme.WARNING
             )
 
     def _setup_load_section(self):
@@ -2133,22 +2486,33 @@ class App(TkinterApp):
             self.load_section.content,
             text="Загрузить и обрезать изображение",
             command=self.load_image_callback,
-            height=40,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color="#2b5b84",
-            hover_color="#1e4160"
+            height=AppTheme.BUTTON_HEIGHT,
+            font=AppTheme.section_title_font(),
+            fg_color=AppTheme.PRIMARY,
+            hover_color=AppTheme.PRIMARY_HOVER
         )
         self.load_section.add_widget(self.load_button, pady=5)
 
         self.print_load_image = ctk.CTkLabel(
             self.load_section.content,
             text="Изображение не загружено",
-            font=ctk.CTkFont(size=11),
-            text_color="gray",
+            font=AppTheme.body_font(),
+            text_color=AppTheme.MUTED,
             anchor="w",
             wraplength=0  # Отключаем перенос текста
         )
         self.load_section.add_widget(self.print_load_image, pady=(0, 5))
+
+        self.image_preview_label = ctk.CTkLabel(
+            self.load_section.content,
+            text="Предварительный просмотр появится после загрузки",
+            height=AppTheme.PREVIEW_HEIGHT,
+            fg_color=AppTheme.PREVIEW_BACKGROUND,
+            text_color=AppTheme.MUTED,
+            corner_radius=8,
+            font=AppTheme.caption_font()
+        )
+        self.load_section.add_widget(self.image_preview_label, pady=(4, 4))
 
     def _setup_channel_section(self):
         """Настройка секции работы с каналами"""
@@ -2159,7 +2523,7 @@ class App(TkinterApp):
         pipette_label = ctk.CTkLabel(
             pipette_frame,
             text="Выбор цветовых каналов:",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=AppTheme.body_font(),
             anchor="w"
         )
         pipette_label.pack(fill="x")
@@ -2168,8 +2532,8 @@ class App(TkinterApp):
             pipette_frame,
             text="Активировать пипетку",
             command=self.pipette_channel,
-            height=35,
-            font=ctk.CTkFont(size=12)
+            height=AppTheme.BUTTON_HEIGHT,
+            font=AppTheme.body_font()
         )
         pipette_frame.pack(fill="x")
         self.pipette_button.pack(fill="x", pady=(5, 0))
@@ -2181,17 +2545,17 @@ class App(TkinterApp):
         gram_label = ctk.CTkLabel(
             gram_frame,
             text="Преобразование каналов:",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=AppTheme.body_font(),
             anchor="w"
         )
         gram_label.pack(fill="x")
 
         self.gram_shmidt_button = ctk.CTkButton(
             gram_frame,
-            text="Применить Грамма-Шмидта",
+            text="Преобразование Грамма-Шмидта",
             command=self.gramm_shmidt_transform,
-            height=35,
-            font=ctk.CTkFont(size=12)
+            height=AppTheme.BUTTON_HEIGHT,
+            font=AppTheme.body_font()
         )
         gram_frame.pack(fill="x")
         self.gram_shmidt_button.pack(fill="x", pady=(5, 0))
@@ -2231,7 +2595,7 @@ class App(TkinterApp):
             button_frame,
             text="Сохранить значения",
             command=self.load_scales,
-            height=35
+            height=AppTheme.BUTTON_HEIGHT
         )
         self.button_save_scales.pack(side="left", fill="x", expand=True, padx=(0, 5))
 
@@ -2239,7 +2603,7 @@ class App(TkinterApp):
             button_frame,
             text="Загрузить из файла",
             command=self.load_scales_from_file,
-            height=35
+            height=AppTheme.BUTTON_HEIGHT
         )
         self.button_load_scales_file.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
@@ -2247,8 +2611,8 @@ class App(TkinterApp):
         self.label_custom_scale = ctk.CTkLabel(
             self.scales_section.content,
             text="",
-            font=ctk.CTkFont(size=10),
-            text_color="gray",
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.MUTED,
             anchor="w",
             wraplength=0
         )
@@ -2262,8 +2626,8 @@ class App(TkinterApp):
 
         direction_label = ctk.CTkLabel(
             direction_frame,
-            text="Направления поиска:",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            text="Направления 1D-преобразования:",
+            font=AppTheme.body_font(),
             anchor="w"
         )
         direction_label.pack(fill="x")
@@ -2285,6 +2649,17 @@ class App(TkinterApp):
         )
         self.col_checkbox.pack(side="left")
 
+        self.extremes_hint_label = ctk.CTkLabel(
+            direction_frame,
+            text="Огибающие и синхронизация рассчитываются для построчного результата.",
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w",
+            justify="left",
+            wraplength=400
+        )
+        self.extremes_hint_label.pack(fill="x", pady=(2, 6))
+
         # Типы экстремумов
         type_frame = ctk.CTkFrame(self.extremes_section.content, fg_color="transparent")
         self.extremes_section.add_widget(type_frame, pady=2)
@@ -2292,7 +2667,7 @@ class App(TkinterApp):
         type_label = ctk.CTkLabel(
             type_frame,
             text="Типы экстремумов:",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=AppTheme.body_font(),
             anchor="w"
         )
         type_label.pack(fill="x")
@@ -2321,7 +2696,7 @@ class App(TkinterApp):
         knn_label = ctk.CTkLabel(
             knn_frame,
             text="Количество ближайших точек:",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=AppTheme.body_font(),
             anchor="w"
         )
         knn_label.pack(fill="x")
@@ -2367,18 +2742,22 @@ class App(TkinterApp):
         if task_count == 0:
             self.tasks_status_label.configure(
                 text="Задачи не добавлены",
-                text_color="gray"
+                text_color=AppTheme.MUTED
             )
         else:
             status_text = f"Всего задач: {task_count}"
-            active_tasks = sum(1 for task in self.image_processor.tasks
-                               if task.image_path and len(task.scales) > 0)
+            active_tasks = sum(
+                1 for task in self.image_processor.tasks
+                if (task.image_path and len(task.scales) > 0 and
+                    (task.analysis_mode == "2d" or task.process_rows or
+                     task.process_columns))
+            )
             if active_tasks > 0:
                 status_text += f" | Готовы к вычислениям: {active_tasks}"
 
             self.tasks_status_label.configure(
                 text=status_text,
-                text_color="white"
+                text_color=AppTheme.TEXT_ON_DARK
             )
 
         # Создаем виджеты для каждой задачи
@@ -2391,7 +2770,7 @@ class App(TkinterApp):
         task_frame = ctk.CTkFrame(
             self.tasks_container,
             border_width=1,
-            border_color="#3a3a3a",
+            border_color=AppTheme.BORDER,
             corner_radius=8
         )
         task_frame.pack(fill="x", padx=5, pady=3)
@@ -2409,10 +2788,21 @@ class App(TkinterApp):
         task_title = ctk.CTkLabel(
             title_frame,
             text=f"{task.task_name}",
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=AppTheme.section_title_font(),
             anchor="w"
         )
         task_title.pack(side="left", fill="x", expand=True)
+
+        mode_badge = ctk.CTkLabel(
+            title_frame,
+            text="1D" if task.analysis_mode == "1d" else "2D",
+            width=30,
+            height=AppTheme.BADGE_HEIGHT,
+            corner_radius=5,
+            fg_color=AppTheme.PRIMARY if task.analysis_mode == "1d" else AppTheme.MODE_2D,
+            font=AppTheme.caption_font()
+        )
+        mode_badge.pack(side="left", padx=(6, 4))
 
         # Статус задачи
         status_text = self._get_task_status(task)
@@ -2420,7 +2810,7 @@ class App(TkinterApp):
         task_status = ctk.CTkLabel(
             title_frame,
             text=status_text,
-            font=ctk.CTkFont(size=10, weight="bold"),
+            font=AppTheme.caption_font(),
             text_color=status_color
         )
         task_status.pack(side="right", padx=(5, 0))
@@ -2445,7 +2835,7 @@ class App(TkinterApp):
         image_label = ctk.CTkLabel(
             row1_frame,
             text=image_info,
-            font=ctk.CTkFont(size=11),
+            font=AppTheme.body_font(),
             anchor="w"
         )
         image_label.pack(side="left", fill="x", expand=True)
@@ -2459,7 +2849,7 @@ class App(TkinterApp):
         scales_label = ctk.CTkLabel(
             row2_frame,
             text=f"{scales_info}",
-            font=ctk.CTkFont(size=11),
+            font=AppTheme.body_font(),
             anchor="w"
         )
         scales_label.pack(side="left", fill="x", expand=True)
@@ -2473,7 +2863,7 @@ class App(TkinterApp):
         processing_label = ctk.CTkLabel(
             row3_frame,
             text=f"{processing_info}",
-            font=ctk.CTkFont(size=11),
+            font=AppTheme.body_font(),
             anchor="w"
         )
         processing_label.pack(side="left", fill="x", expand=True)
@@ -2501,10 +2891,10 @@ class App(TkinterApp):
             text="Активировать",
             command=make_task_active,
             width=90,
-            height=28,
-            font=ctk.CTkFont(size=11),
-            fg_color="#2b5b84",
-            hover_color="#1e4160"
+            height=AppTheme.SMALL_BUTTON_HEIGHT,
+            font=AppTheme.body_font(),
+            fg_color=AppTheme.PRIMARY,
+            hover_color=AppTheme.PRIMARY_HOVER
         )
         activate_btn.pack(side="left", padx=(0, 8))
 
@@ -2514,16 +2904,16 @@ class App(TkinterApp):
             text="Удалить",
             command=remove_task,
             width=70,
-            height=28,
-            font=ctk.CTkFont(size=11),
-            fg_color="#dc3545",
-            hover_color="#c82333"
+            height=AppTheme.SMALL_BUTTON_HEIGHT,
+            font=AppTheme.body_font(),
+            fg_color=AppTheme.DANGER,
+            hover_color=AppTheme.DANGER_HOVER
         )
         remove_btn.pack(side="left")
 
         # Подсветка текущей активной задачи
         if self.current_task and self.current_task.task_id == task.task_id:
-            task_frame.configure(border_color="#007bff", border_width=2)
+            task_frame.configure(border_color=AppTheme.ACTIVE_BORDER, border_width=2)
 
     @staticmethod
     def _get_task_status(task):
@@ -2532,21 +2922,21 @@ class App(TkinterApp):
             return "Ожидает изображение"
         elif len(task.scales) == 0:
             return "Ожидает масштабы"
-        elif task.color1 is not None and task.color2 is not None:
-            return "Готова к вычислениям"
-        else:
-            return "Готова к настройке"
+        elif task.analysis_mode == "1d" and not (
+                task.process_rows or task.process_columns):
+            return "Выберите направление"
+        return "Готова к вычислениям"
 
     @staticmethod
     def _get_status_color(status):
         """Получить цвет статуса"""
         status_colors = {
-            "Ожидает изображение": "#ffc107",  # желтый
-            "Ожидает масштабы": "#ffc107",  # желтый
-            "Готова к настройке": "#17a2b8",  # голубой
-            "Готова к вычислениям": "#28a745"  # зеленый
+            "Ожидает изображение": AppTheme.WARNING,
+            "Ожидает масштабы": AppTheme.WARNING,
+            "Выберите направление": AppTheme.WARNING,
+            "Готова к вычислениям": AppTheme.SUCCESS
         }
-        return status_colors.get(status, "#6c757d")  # серый по умолчанию
+        return status_colors.get(status, AppTheme.DISABLED)
 
     @staticmethod
     def _get_scales_info(task):
@@ -2566,7 +2956,21 @@ class App(TkinterApp):
 
     def _get_processing_info(self, task):
         """Получить информацию о настройках обработки"""
-        info_parts = [f"KNN: {task.k_neighbors}"]
+        mode_name = self.ANALYSIS_MODE_NAMES[task.analysis_mode]
+        info_parts = [mode_name]
+
+        if task.analysis_mode == "1d":
+            directions = []
+            if task.process_rows:
+                directions.append("строки")
+            if task.process_columns:
+                directions.append("столбцы")
+            info_parts.append(
+                "Направления: " + (", ".join(directions) if directions else "не выбраны")
+            )
+            info_parts.append(f"KNN: {task.k_neighbors}")
+        else:
+            info_parts.append(f"Ориентаций: {len(task.orientations)}")
 
         # Информация о цветовых каналах
         if task.color1 is not None and task.color2 is not None:
@@ -2582,22 +2986,43 @@ class App(TkinterApp):
     def _update_ui_for_current_task(self):
         """Обновление UI в соответствии с текущей задачей"""
         if self.current_task:
+            self.analysis_mode_selector.configure(state="normal")
+            self._loading_task_settings = True
+            self.row_var.set(self.current_task.process_rows)
+            self.col_var.set(self.current_task.process_columns)
+            self.max_var.set(self.current_task.find_maxima)
+            self.min_var.set(self.current_task.find_minima)
+            self.wp_var1.set(self.current_task.output_wavelet_image)
+            self.wp_var2.set(self.current_task.output_wavelet_text)
+            self.p_ex_var1.set(self.current_task.output_extremes_text)
+            self.p_ex_var2.set(self.current_task.output_extremes_image)
+            self.knn_bool_text_var.set(self.current_task.output_knn_text)
+            self.knn_bool_image_var.set(self.current_task.output_knn_image)
+            self.print_channels_txt_var.set(self.current_task.save_source_channels)
+            self.orientations_var.set(
+                ", ".join(f"{value:g}" for value in self.current_task.orientations)
+            )
+            self.morlet_omega0_var.set(f"{self.current_task.morlet_omega0:g}")
+            self.morlet_anisotropy_var.set(f"{self.current_task.morlet_anisotropy:g}")
+            self._loading_task_settings = False
             # Обновляем информацию о загруженном изображении
             if self.current_task.image_path:
                 self.load_button.configure(
                     text="Изображение загружено",
-                    fg_color="#28a745",
-                    hover_color="#218838"
+                    fg_color=AppTheme.SUCCESS,
+                    hover_color=AppTheme.SUCCESS_HOVER
                 )
                 text = f"Файл: {os.path.basename(self.current_task.image_path)}"
-                self.print_load_image.configure(text=text, text_color="white")
+                self.print_load_image.configure(text=text, text_color=AppTheme.TEXT_ON_DARK)
             else:
                 self.load_button.configure(
                     text="Загрузить и обрезать изображение",
-                    fg_color="#2b5b84",
-                    hover_color="#1e4160"
+                    fg_color=AppTheme.PRIMARY,
+                    hover_color=AppTheme.PRIMARY_HOVER
                 )
-                self.print_load_image.configure(text="Изображение не загружено", text_color="gray")
+                self.print_load_image.configure(text="Изображение не загружено", text_color=AppTheme.MUTED)
+
+            self._update_image_preview(self.current_task)
 
             # Проверяем наличие цветов для пипетки
             has_colors = (self.current_task.color1 is not None and
@@ -2611,29 +3036,29 @@ class App(TkinterApp):
                 self.pipette_button.configure(
                     text="Пипетка активирована",
                     state='disabled',
-                    fg_color="#6c757d",
-                    hover_color="#5a6268"
+                    fg_color=AppTheme.DISABLED,
+                    hover_color=AppTheme.DISABLED_HOVER
                 )
                 # Активируем кнопку Грамма-Шмидта если есть цвета
                 self.gram_shmidt_button.configure(
-                    text="Применить Грамма-Шмидта",  # Всегда сбрасываем текст
+                    text="Преобразование Грамма-Шмидта",  # Всегда сбрасываем текст
                     state='normal',
-                    fg_color="#2b5b84",
-                    hover_color="#1e4160"
+                    fg_color=AppTheme.PRIMARY,
+                    hover_color=AppTheme.PRIMARY_HOVER
                 )
             else:
                 self.pipette_button.configure(
                     text="Активировать пипетку",
                     state='normal',
-                    fg_color="#2b5b84",
-                    hover_color="#1e4160"
+                    fg_color=AppTheme.PRIMARY,
+                    hover_color=AppTheme.PRIMARY_HOVER
                 )
                 # Деактивируем кнопку Грамма-Шмидта если нет цветов
                 self.gram_shmidt_button.configure(
-                    text="Применить Грамма-Шмидта",  # Всегда сбрасываем текст
+                    text="Преобразование Грамма-Шмидта",  # Всегда сбрасываем текст
                     state='disabled',
-                    fg_color="#6c757d",
-                    hover_color="#5a6268"
+                    fg_color=AppTheme.DISABLED,
+                    hover_color=AppTheme.DISABLED_HOVER
                 )
 
             # Обновляем KNN
@@ -2643,17 +3068,17 @@ class App(TkinterApp):
             if len(self.current_task.scales) == 0:
                 self.button_save_scales.configure(
                     text="Сохранить значения",
-                    fg_color="#2b5b84",
-                    hover_color="#1e4160",
+                    fg_color=AppTheme.PRIMARY,
+                    hover_color=AppTheme.PRIMARY_HOVER,
                     state='normal'
                 )
                 self.button_load_scales_file.configure(
                     text="Загрузить из файла",
-                    fg_color="#2b5b84",
-                    hover_color="#1e4160",
+                    fg_color=AppTheme.PRIMARY,
+                    hover_color=AppTheme.PRIMARY_HOVER,
                     state='normal'
                 )
-                self.label_custom_scale.configure(text="", text_color="gray")
+                self.label_custom_scale.configure(text="", text_color=AppTheme.MUTED)
 
                 # Включаем поля ввода
                 self.entry_start.configure(state='normal')
@@ -2665,44 +3090,163 @@ class App(TkinterApp):
                     scales_text = f"Масштабы: {', '.join(map(str, self.current_task.scales))}"
                 else:
                     scales_text = f"Загружено {len(self.current_task.scales)} масштабов"
-                self.label_custom_scale.configure(text=scales_text, text_color="white")
+                self.label_custom_scale.configure(text=scales_text, text_color=AppTheme.TEXT_ON_DARK)
 
         else:
             # Сбрасываем UI если нет активной задачи
             self.load_button.configure(
                 text="Загрузить и обрезать изображение",
-                fg_color="#2b5b84",
-                hover_color="#1e4160"
+                fg_color=AppTheme.PRIMARY,
+                hover_color=AppTheme.PRIMARY_HOVER
             )
-            self.print_load_image.configure(text="Изображение не загружено", text_color="gray")
+            self.print_load_image.configure(text="Изображение не загружено", text_color=AppTheme.MUTED)
             self.pipette_button.configure(
                 text="Активировать пипетку",
                 state='normal',
-                fg_color="#2b5b84",
-                hover_color="#1e4160"
+                fg_color=AppTheme.PRIMARY,
+                hover_color=AppTheme.PRIMARY_HOVER
             )
             self.gram_shmidt_button.configure(
-                text="Применить Грамма-Шмидта",
+                text="Преобразование Грамма-Шмидта",
                 state='disabled',
-                fg_color="#6c757d",
-                hover_color="#5a6268"
+                fg_color=AppTheme.DISABLED,
+                hover_color=AppTheme.DISABLED_HOVER
             )
             self.button_save_scales.configure(
                 text="Сохранить значения",
-                fg_color="#2b5b84",
-                hover_color="#1e4160",
+                fg_color=AppTheme.PRIMARY,
+                hover_color=AppTheme.PRIMARY_HOVER,
                 state='disabled'
             )
             self.button_load_scales_file.configure(
                 text="Загрузить из файла",
-                fg_color="#2b5b84",
-                hover_color="#1e4160",
+                fg_color=AppTheme.PRIMARY,
+                hover_color=AppTheme.PRIMARY_HOVER,
                 state='disabled'
             )
-            self.label_custom_scale.configure(text="", text_color="gray")
+            self.label_custom_scale.configure(text="", text_color=AppTheme.MUTED)
+            self._update_image_preview(None)
+
+        self._apply_analysis_mode_ui()
+        self._update_action_availability()
 
         # Всегда обновляем отображение задач для подсветки активной
         self._update_tasks_display()
+
+    def _update_image_preview(self, task):
+        """Показать уменьшенную копию исходного изображения активной задачи."""
+        if not self.image_preview_label:
+            return
+
+        if task is None or task.original_image is None:
+            self.preview_ctk_image = None
+            self.image_preview_label.configure(
+                image=None,
+                text="Предварительный просмотр появится после загрузки"
+            )
+            return
+
+        source = Image.fromarray(task.original_image)
+        max_width = 430
+        max_height = AppTheme.PREVIEW_HEIGHT
+        scale = min(max_width / source.width, max_height / source.height, 1.0)
+        preview_size = (
+            max(1, int(source.width * scale)),
+            max(1, int(source.height * scale))
+        )
+        self.preview_ctk_image = ctk.CTkImage(
+            light_image=source,
+            dark_image=source,
+            size=preview_size
+        )
+        self.image_preview_label.configure(
+            image=self.preview_ctk_image,
+            text=""
+        )
+
+    def _update_action_availability(self):
+        """Применить естественную последовательность обязательных шагов."""
+        task = self.current_task
+        if task is None:
+            self._set_row_analysis_controls_enabled(False)
+            self.load_button.configure(state="disabled")
+            self.pipette_button.configure(state="disabled")
+            self.gram_shmidt_button.configure(state="disabled")
+            self.button_save_scales.configure(state="disabled")
+            self.button_load_scales_file.configure(state="disabled")
+            self.app_start_button.configure(state="disabled")
+            self.required_step_label.configure(
+                text="Шаг 1 из 3: создайте задачу",
+                text_color=AppTheme.TEXT_SECONDARY
+            )
+            return
+
+        self._set_row_analysis_controls_enabled(
+            task.analysis_mode == "1d" and task.process_rows
+        )
+        self.load_button.configure(state="normal")
+        if not task.image_path:
+            self.pipette_button.configure(state="disabled")
+            self.gram_shmidt_button.configure(state="disabled")
+            self.button_save_scales.configure(state="disabled")
+            self.button_load_scales_file.configure(state="disabled")
+            self.app_start_button.configure(state="disabled")
+            self.required_step_label.configure(
+                text="Шаг 1 из 3: загрузите изображение",
+                text_color=AppTheme.WARNING
+            )
+            return
+
+        if not task.has_colors_selected():
+            self.pipette_button.configure(state="normal")
+        self.button_save_scales.configure(state="normal")
+        self.button_load_scales_file.configure(state="normal")
+
+        if len(task.scales) == 0:
+            self.app_start_button.configure(state="disabled")
+            self.required_step_label.configure(
+                text="Шаг 2 из 3: задайте масштабы",
+                text_color=AppTheme.WARNING
+            )
+            return
+
+        if task.analysis_mode == "1d" and not (
+                task.process_rows or task.process_columns):
+            self.app_start_button.configure(state="disabled")
+            self.required_step_label.configure(
+                text="Выберите строки и/или столбцы для 1D-анализа",
+                text_color=AppTheme.WARNING
+            )
+            return
+
+        self.app_start_button.configure(
+            state="normal",
+            text="Запустить",
+            fg_color=AppTheme.PRIMARY,
+            hover_color=AppTheme.PRIMARY_HOVER
+        )
+        self.required_step_label.configure(
+            text="Шаг 3 из 3: параметры готовы",
+            text_color=AppTheme.GPU_AVAILABLE
+        )
+
+    def _set_row_analysis_controls_enabled(self, enabled):
+        """Огибающие и KNN доступны только для построчного результата 1D."""
+        state = "normal" if enabled else "disabled"
+        for widget in (
+                self.max_checkbox, self.min_checkbox, self.entry_near_point,
+                self.p_ex1_checkbox, self.p_ex2_checkbox,
+                self.knn_text_checkbox, self.knn_image_checkbox):
+            if widget is not None:
+                widget.configure(state=state)
+
+        if self.extremes_hint_label is not None:
+            self.extremes_hint_label.configure(
+                text=("Огибающие и синхронизация доступны для построчного результата."
+                      if enabled else
+                      "Недоступно: включите 1D-преобразование по строкам."),
+                text_color=(AppTheme.TEXT_SECONDARY if enabled else AppTheme.WARNING)
+            )
 
     # Обновляем методы загрузки изображения и работы с каналами для работы с текущей задачей
     def load_image_callback(self):
@@ -2718,10 +3262,10 @@ class App(TkinterApp):
             else:
                 self.load_button.configure(
                     text="Ошибка загрузки",
-                    fg_color="#dc3545",
-                    hover_color="#c82333"
+                    fg_color=AppTheme.DANGER,
+                    hover_color=AppTheme.DANGER_HOVER
                 )
-                self.print_load_image.configure(text="Ошибка загрузки изображения", text_color="red")
+                self.print_load_image.configure(text="Ошибка загрузки изображения", text_color=AppTheme.DANGER)
         except Exception as e:
             self.progress_manager.log_error(f"Ошибка при загрузке изображения: {e}")
             mb.showerror("Ошибка", f"Не удалось загрузить изображение: {e}")
@@ -2759,8 +3303,8 @@ class App(TkinterApp):
         self.gram_shmidt_button.configure(
             text="Преобразование применено",
             state='disabled',
-            fg_color="#6c757d",
-            hover_color="#5a6268"
+            fg_color=AppTheme.DISABLED,
+            hover_color=AppTheme.DISABLED_HOVER
         )
 
         # Обновляем отображение задач, чтобы показать новый статус
@@ -2778,15 +3322,16 @@ class App(TkinterApp):
             self.image_processor.load_scales_for_task(self.current_task, start, end, step)
             self.button_save_scales.configure(
                 text="Масштабы сохранены",
-                fg_color="#28a745",
-                hover_color="#218838"
+                fg_color=AppTheme.SUCCESS,
+                hover_color=AppTheme.SUCCESS_HOVER
             )
             self.button_load_scales_file.configure(state='disabled')
 
             scale_info = f"Масштабы: {start}-{end} (шаг {step})"
-            self.label_custom_scale.configure(text=scale_info, text_color="white")
+            self.label_custom_scale.configure(text=scale_info, text_color=AppTheme.TEXT_ON_DARK)
 
             self._update_tasks_display()
+            self._update_action_availability()
 
         except ValueError as e:
             mb.showerror("Ошибка", f"Пожалуйста, введите корректные числовые значения: {e}")
@@ -2820,21 +3365,22 @@ class App(TkinterApp):
             else:
                 scales_text = f"Загружено {self.current_task.num_scale} масштабов"
 
-            self.label_custom_scale.configure(text=scales_text, text_color="white")
+            self.label_custom_scale.configure(text=scales_text, text_color=AppTheme.TEXT_ON_DARK)
 
             self.button_load_scales_file.configure(
                 text="Файл загружен",
-                fg_color="#28a745",
-                hover_color="#218838"
+                fg_color=AppTheme.SUCCESS,
+                hover_color=AppTheme.SUCCESS_HOVER
             )
             self.button_save_scales.configure(
                 text="Сохранить значения",
-                fg_color="#6c757d",
-                hover_color="#5a6268",
+                fg_color=AppTheme.DISABLED,
+                hover_color=AppTheme.DISABLED_HOVER,
                 state='disabled'
             )
 
             self._update_tasks_display()
+            self._update_action_availability()
         else:
             # Если файл не выбран, разблокируем поля ввода
             self.entry_start.configure(state='normal')
@@ -2852,12 +3398,58 @@ class App(TkinterApp):
             self.current_task.k_neighbors = int(self.knn_text_var.get())
             self._update_tasks_display()
 
+    def _store_settings_for_current_task(self, *args):
+        """Сохранить значения элементов управления в активной задаче."""
+        task = getattr(self, 'current_task', None)
+        if task is None or self._loading_task_settings:
+            return
+
+        task.process_rows = bool(self.row_var.get())
+        task.process_columns = bool(self.col_var.get())
+        task.find_maxima = bool(self.max_var.get())
+        task.find_minima = bool(self.min_var.get())
+        task.output_wavelet_image = bool(self.wp_var1.get())
+        task.output_wavelet_text = bool(self.wp_var2.get())
+        task.output_extremes_text = bool(self.p_ex_var1.get())
+        task.output_extremes_image = bool(self.p_ex_var2.get())
+        task.output_knn_text = bool(self.knn_bool_text_var.get())
+        task.output_knn_image = bool(self.knn_bool_image_var.get())
+        task.save_source_channels = bool(self.print_channels_txt_var.get())
+
+        try:
+            orientations = [
+                float(value.strip())
+                for value in self.orientations_var.get().split(',')
+                if value.strip()
+            ]
+            if orientations:
+                task.orientations = orientations
+        except ValueError:
+            pass
+
+        try:
+            omega0 = float(self.morlet_omega0_var.get())
+            if omega0 > 0:
+                task.morlet_omega0 = omega0
+        except ValueError:
+            pass
+
+        try:
+            anisotropy = float(self.morlet_anisotropy_var.get())
+            if anisotropy > 0:
+                task.morlet_anisotropy = anisotropy
+        except ValueError:
+            pass
+
+        if self.app_start_button is not None:
+            self.after_idle(self._update_action_availability)
+
     def _setup_wavelet_section(self):
         """Настройка секции вейвлет-преобразования"""
         info_label = ctk.CTkLabel(
             self.wavelet_section.content,
             text="Формат вывода результатов вейвлет-преобразования:",
-            font=ctk.CTkFont(size=12),
+            font=AppTheme.body_font(),
             anchor="w",
             wraplength=0
         )
@@ -2882,7 +3474,7 @@ class App(TkinterApp):
         info_label = ctk.CTkLabel(
             self.output_extremes_section.content,
             text="Формат вывода точек экстремумов:",
-            font=ctk.CTkFont(size=12),
+            font=AppTheme.body_font(),
             anchor="w",
             wraplength=0
         )
@@ -2906,7 +3498,7 @@ class App(TkinterApp):
         info_label = ctk.CTkLabel(
             self.knn_section.content,
             text="Формат вывода K-ближайших соседей:",
-            font=ctk.CTkFont(size=12),
+            font=AppTheme.body_font(),
             anchor="w",
             wraplength=0
         )
@@ -2931,7 +3523,7 @@ class App(TkinterApp):
         info_label = ctk.CTkLabel(
             self.intermediate_section.content,
             text="Дополнительные выходные данные:",
-            font=ctk.CTkFont(size=12),
+            font=AppTheme.body_font(),
             anchor="w",
             wraplength=0
         )
@@ -2946,16 +3538,23 @@ class App(TkinterApp):
 
     def _setup_compute_section(self):
         """Настройка секции вычислений"""
+        self.required_step_label = ctk.CTkLabel(
+            self.compute_section,
+            text="Создайте задачу",
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w"
+        )
+        self.required_step_label.pack(fill="x", padx=2, pady=(0, 2))
+
         self.app_start_button = ctk.CTkButton(
             self.compute_section,
-            text="Начать вычисления",
+            text="Запустить",
             command=self.safe_compute,
-            height=50,
-            font=ctk.CTkFont(size=16, weight="bold"),
-            fg_color="#28a745",
-            hover_color="#218838",
-            border_width=2,
-            border_color="#1e7e34"
+            height=AppTheme.PRIMARY_BUTTON_HEIGHT,
+            font=AppTheme.panel_title_font(),
+            fg_color=AppTheme.PRIMARY,
+            hover_color=AppTheme.PRIMARY_HOVER
         )
         self.compute_section.pack(fill="x")
         self.app_start_button.pack(fill="x", pady=10)
@@ -2998,13 +3597,18 @@ class App(TkinterApp):
         widgets_to_disable = [
             self.load_button, self.pipette_button, self.gram_shmidt_button,
             self.button_save_scales, self.button_load_scales_file,
-            self.app_start_button, self.add_task_btn]
+            self.app_start_button, self.add_task_btn, self.analysis_mode_selector,
+            self.gpu_switch]
 
         for widget in widgets_to_disable:
             try:
                 widget.configure(state=state)
             except Exception as e:
                 self.progress_manager.log_error(str(e))
+
+        if not disable:
+            self._apply_analysis_mode_ui()
+            self._update_action_availability()
 
     def compute(self): # Основная функция вычислений для всех задач
         if not self.image_processor.tasks:
@@ -3019,6 +3623,19 @@ class App(TkinterApp):
             if len(task.scales) == 0:
                 mb.showerror("Ошибка", f"Задача {i + 1}: не заданы масштабы")
                 return
+            if task.analysis_mode == "1d" and not (
+                    task.process_rows or task.process_columns):
+                mb.showerror(
+                    "Ошибка",
+                    f"Задача {i + 1}: не выбрано направление 1D-анализа"
+                )
+                return
+            if task.analysis_mode == "2d" and not task.orientations:
+                mb.showerror(
+                    "Ошибка",
+                    f"Задача {i + 1}: не заданы ориентации 2D Morlet"
+                )
+                return
 
         try:
             timer = time.time()
@@ -3030,15 +3647,7 @@ class App(TkinterApp):
                 self.progress_manager.log_info(f"Обработка задачи {current_task_num}/{total_tasks}: {task.task_name}")
 
                 # Выполняем вычисления для задачи
-                self.image_processor.compute_for_task(
-                    task,
-                    self.wp_var1, self.wp_var2, self.print_channels_txt_var,
-                    self.row_var, self.col_var,
-                    self.max_var, self.min_var,
-                    self.p_ex_var1, self.p_ex_var2,
-                    self.knn_bool_text_var, self.knn_bool_image_var,
-                    self.pipette_button.cget('state')
-                )
+                self.image_processor.compute_for_task(task)
 
                 # Обновляем прогресс
                 progress = current_task_num / total_tasks
@@ -3080,21 +3689,21 @@ class App(TkinterApp):
         success_label = ctk.CTkLabel(
             msg_box,
             text="Вычисления выполнены успешно!",
-            font=ctk.CTkFont(size=16, weight="bold")
+            font=AppTheme.panel_title_font()
         )
         success_label.pack(pady=(20, 10))
 
         tasks_label = ctk.CTkLabel(
             msg_box,
             text=f"Обработано задач: {total_tasks}",
-            font=ctk.CTkFont(size=14, weight="bold")
+            font=AppTheme.section_title_font()
         )
         tasks_label.pack(pady=(0, 5))
 
         time_label = ctk.CTkLabel(
             msg_box,
             text=f"Затраченное время: {format_time(elapsed_time)}",
-            font=ctk.CTkFont(size=12, weight="bold")
+            font=AppTheme.body_font()
         )
         time_label.pack(pady=(0, 25))
 
@@ -3119,8 +3728,8 @@ class App(TkinterApp):
             text="Открыть папку с результатами",
             command=open_folder_action,
             width=180,
-            height=35,
-            font=ctk.CTkFont(size=12)
+            height=AppTheme.BUTTON_HEIGHT,
+            font=AppTheme.body_font()
         )
         open_folder_btn.pack(side="left", padx=(0, 15))
 
@@ -3129,8 +3738,8 @@ class App(TkinterApp):
             text="Закрыть",
             command=close_action,
             width=100,
-            height=35,
-            font=ctk.CTkFont(size=12)
+            height=AppTheme.BUTTON_HEIGHT,
+            font=AppTheme.body_font()
         )
         close_btn.pack(side="left")
 
