@@ -11,7 +11,6 @@ class Interpolator:
 
     def get_envelopes(self, coefs, max_points, min_points, direction='row'):
         if not self.gpu_backend.use_gpu or len(max_points) + len(min_points) < 2000:
-            # Для малого количества точек используем CPU
             if direction == 'row':
                 return get_row_envelopes(coefs, max_points, min_points)
             else:

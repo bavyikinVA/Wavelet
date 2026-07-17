@@ -106,7 +106,7 @@ class GPUEnvelopeProcessor:
 
             # Проверяем, достаточно ли точек для интерполяции
             valid_points = cp.sum(row_mask)
-            if valid_points >= 3:
+            if valid_points >= 4:
                 # Получаем координаты и значения
                 points_idx = cp.where(row_mask)[0]
                 values = batch_coefs[i, points_idx]
@@ -249,7 +249,7 @@ class GPUEnvelopeProcessor:
 
             # Проверяем, достаточно ли точек для интерполяции
             valid_points = cp.sum(col_mask)
-            if valid_points >= 3:
+            if valid_points >= 4:
                 # Получаем координаты и значения
                 points_idx = cp.where(col_mask)[0]
                 values = batch_coefs[i, points_idx]

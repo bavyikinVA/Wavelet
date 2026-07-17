@@ -1,23 +1,111 @@
-# Игнорировать папку .venv
+# =========================
+# Virtual environments
+# =========================
 .venv/
+venv/
+env/
+ENV/
 
-# Игнорировать папку .idea
+# =========================
+# Environment variables / secrets
+# =========================
+.env
+.env.*
+*.env
+secrets.json
+credentials.json
+*.pem
+*.key
+*.crt
+
+# =========================
+# Python cache / compiled files
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# =========================
+# IDE / editors
+# =========================
 .idea/
-
-# Игнорировать все файлы с расширением .iml (файлы конфигурации IntelliJ IDEA)
+.vscode/
 *.iml
-
-# Игнорировать файлы конфигурации IDE
 *.swp
 *.swo
+*.swn
+
+# =========================
+# Jupyter / notebooks
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Logs
+# =========================
 *.log
-*.pyc
-*.pyo
-*.pyd
+logs/
+*.out
+
+# =========================
+# Tests / coverage
+# =========================
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# =========================
+# Build / package artifacts
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.bak
+*.old
+
+# =========================
+# Database files
+# =========================
 *.db
+*.sqlite
+*.sqlite3
 
-dist/main_wavelets/_internal/
+# =========================
+# Frontend, if project has frontend
+# =========================
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.local
 
-
-dist/main_wavelets/__pycache__/
-
+# =========================
+# Project-generated image outputs
+# =========================
+output/
+outputs/
+results/
+reports/
+plots/
+histograms/
+visualizations/
+processed/
+processed_images/

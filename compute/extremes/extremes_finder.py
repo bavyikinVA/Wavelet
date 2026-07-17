@@ -1,14 +1,11 @@
 import cupy as cp
 
-
 class ExtremesFinder:
     @staticmethod
     def find_extremes_gpu(coefs_gpu, row_var, col_var, max_var, min_var):
         """
         GPU версия поиска экстремумов
-        coefs_gpu: cupy array (rows, cols)
         """
-        # Преобразуем в GPU массив если нужно
         if not isinstance(coefs_gpu, cp.ndarray):
             coefs_gpu = cp.asarray(coefs_gpu, dtype=cp.float32)
 
@@ -27,7 +24,6 @@ class ExtremesFinder:
                 max_mask = (center > left) & (center > right)
                 if cp.any(max_mask):
                     max_coords = cp.where(max_mask)
-                    # Преобразуем в список на CPU
                     max_y = max_coords[0].get()
                     max_x = max_coords[1].get()
                     points_max_by_row = [[int(x + 1), int(y)] for y, x in zip(max_y, max_x)]

@@ -1,9 +1,12 @@
 import os
 import warnings
+from compute.knn.knn_cpu import process_extremes_with_knn
+from compute.extremes.extremes_finder import ExtremesFinder
+from compute.extremes.interpolator import Interpolator
 
 
 def setup_cuda_environment():
-    """Настройка окружения CUDA перед импортом любых библиотек"""
+    """Настройка окружения CUDA"""
     warnings.filterwarnings("ignore", message="CUDA path could not be detected")
 
     # Автоматический поиск пути CUDA
@@ -41,15 +44,16 @@ import time
 import tkinter as tk
 import traceback
 from multiprocessing import Pool, freeze_support
-from tkinter import filedialog
 from tkinter import messagebox as mb
 
 import customtkinter as ctk
 import cv2
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 import numpy as np
 
-from compute.extremes import interpol
 from Gram_Shmidt import change_channels
 from compute.processing_task import ProcessingTask
 from image_cropper_app import run_cropper
@@ -448,8 +452,7 @@ class ImageProcessor:
                 progress = 0.1 + (current_scale / total_scales) * 0.9
                 self.progress.update_progress(
                     progress,
-                    f"Сохранение результатов: {colors[channel]}, масштаб {task.scales[scale]}"
-                )
+                    f"Сохранение результатов: {colors[channel]}, масштаб {task.scales[scale]}")
 
                 if info_out == 0 or info_out == 10:
                     filename = f"Расчет_вейвлетов_{type_matrix_str}_Масштаб_{task.scales[scale]}_{colors[channel]}.txt"
@@ -458,15 +461,19 @@ class ImageProcessor:
                     self.progress.log_debug(f"Сохранен текстовый файл: {file_path}")
 
                 if info_out == 0 or info_out == 1:
-                    plt.figure()
-                    plt.imshow(array_2d, cmap='viridis')
-                    plt.title(f'Wavelets: Scale = {task.scales[scale]}, Channel = {colors[channel]}')
-                    plt.colorbar()
-                    plt.savefig(os.path.join(scale_folder_path,
-                                             f'График_расчетов_В_П_{type_matrix_str}_Масштаб_{task.scales[scale]}_{colors[channel]}.png'),
-                                dpi=300, bbox_inches='tight')
-                    plt.close()
-                    self.progress.log_debug(f"Сохранен график для масштаба {task.scales[scale]}")
+                    fig, ax = plt.subplots(figsize=(6, 5))
+
+                    im = ax.imshow(array_2d, cmap='viridis', interpolation='nearest')
+
+                    ax.set_title(f'Wavelets: Scale={task.scales[scale]}, Channel={colors[channel]}')
+                    fig.colorbar(im, ax=ax)
+                    fig.savefig(
+                        os.path.join(
+                            scale_folder_path,
+                            f'График_расчетов_В_П_{type_matrix_str}_Масштаб_{task.scales[scale]}_{colors[channel]}.png'),
+                        dpi=300)
+
+                    plt.close(fig)
 
     @staticmethod
     def find_extremes(coefs, row_var, col_var, max_var, min_var):
@@ -512,147 +519,366 @@ class ImageProcessor:
     def compute_points(self, task, row_var, col_var, max_var, min_var,
                        knn_var, knn_bool_text_var, knn_bool_image_var,
                        print_text_var, print_graphic, pipette_state):
+        """
+        Поиск экстремумов после вейвлет-преобразования.
+
+        Реализовано:
+        - используется только построчная матрица Str, потому что анализ идёт вдоль строк изображения;
+        - для гистограммы берутся только максимумы верхней огибающей;
+        - сохраняются обычные и сжатые гистограммы по блокам масштабов;
+        - дополнительно рассчитывается межстрочная синхронизация максимумов верхней огибающей;
+        - межстрочная синхронизация считается по бинарным событиям вдоль оси X;
+        - масштабы внутри блока объединяются через OR;
+        - для каждой пары строк считается метрика Jaccard/Dice/Phi.
+        """
 
         self.progress.update_progress(0.1, "Начало поиска экстремумов...")
         self.progress.log_info("Запущена функция подсчета экстремумов")
 
         use_gpu_knn = self.backend.use_gpu and self.knn_processor.is_gpu_available()
 
-        if use_gpu_knn and knn_var:
-            self.progress.log_info("Использование GPU для KNN вычислений")
-        if use_gpu_knn and knn_var:
-            self.progress.log_info("Использование CPU для KNN вычислений")
-
+        if knn_var:
+            if use_gpu_knn:
+                self.progress.log_info("Использование GPU для KNN вычислений")
+            else:
+                self.progress.log_info("Использование CPU для KNN вычислений")
 
         extremes = []
 
-        # общее количество операций для прогресс-бара
-        total_operations = 2 * (1 if pipette_state == 'normal' else 3) * task.num_scale
+        # Для этой задачи нужен только Str: построчное вейвлет-преобразование.
+        channels_count = 1 if pipette_state == 'normal' else 3
+        total_operations = channels_count * task.num_scale
         current_operation = 0
 
-        for type_data in range(2):
-            direction = "построчно" if type_data == 0 else "по столбцам"
-            channels_to_process = [0] if pipette_state == 'normal' else range(3)
+        type_data = 0
+        direction = "построчно"
+        type_matrix_str = "Str"
 
-            for channel in channels_to_process:
-                channel_name = ['Красный', 'Зелёный', 'Синий'][channel]
+        channels_to_process = [0] if pipette_state == 'normal' else range(3)
+        colors = ['Красный', 'Зелёный', 'Синий']
+        channel_codes = ['red', 'green', 'blue']
 
-                for scale in range(task.num_scale):
-                    current_operation += 1
+        # Размеры блоков масштабов для сжатых гистограмм и межстрочной синхронизации.
+        # Можно задать в task.scale_block_sizes, например [5].
+        scale_block_sizes = getattr(task, 'scale_block_sizes', [5])
+        if isinstance(scale_block_sizes, int):
+            scale_block_sizes = [scale_block_sizes]
 
-                    # обновление прогресс-бара
-                    progress = 0.1 + (current_operation / total_operations) * 0.8
-                    self.progress.update_progress(
-                        progress,
-                        f"Поиск экстремумов: {channel_name}, масштаб {task.scales[scale]}, {direction}"
+        # Настройки межстрочной синхронизации.
+        # row_sync_stride=25 означает сравнивать строки 0, 25, 50, ...
+        # tolerance=1 расширяет событие по X на ±1 пиксель, чтобы учитывать небольшой сдвиг.
+        row_sync_stride = int(getattr(task, 'row_sync_stride', 1))
+        row_sync_tolerance = int(getattr(task, 'row_sync_tolerance', 1))
+        row_sync_metrics = getattr(task, 'row_sync_metrics', ['jaccard'])
+        if isinstance(row_sync_metrics, str):
+            row_sync_metrics = [row_sync_metrics]
+
+        for channel in channels_to_process:
+            channel_name = colors[channel]
+            channel_code = channel_codes[channel]
+
+            row_hist_scales = []
+            row_hist_max_counts = []
+            row_index_for_histogram = None
+
+            # Для межстрочной синхронизации сохраняем точки максимумов верхней огибающей
+            # отдельно для каждого масштаба.
+            upper_points_by_scale = {}
+
+            for scale in range(task.num_scale):
+                current_operation += 1
+
+                progress = 0.1 + (current_operation / max(total_operations, 1)) * 0.8
+                self.progress.update_progress(
+                    progress,
+                    f"Поиск экстремумов: {channel_name}, масштаб {task.scales[scale]}, {direction}"
+                )
+
+                # Получение коэффициентов вейвлета Str: [channel][scale] -> 2D матрица.
+                coefs_2d = task.result[type_data][channel][scale]
+                coefs_2d = np.round(coefs_2d, decimals=3)
+
+                # Для построения верхней огибающей нужны максимумы по строкам.
+                # Остальные направления оставлены для совместимости с текущим сохранением/KNN.
+                if self.backend.use_gpu:
+                    coefs_2d, pmaxr, pmaxc, pminr, pminc = ExtremesFinder.find_extremes_gpu(
+                        coefs_2d,
+                        row_var=row_var,
+                        col_var=col_var,
+                        max_var=max_var,
+                        min_var=min_var
                     )
-
-                    # Получение коэффициентов вейвлета
-                    coefs_2d = task.result[type_data][channel][scale]
-                    coefs_2d = np.round(coefs_2d, decimals=3)
-
-                    # Поиск экстремумов
+                else:
                     coefs_2d, pmaxr, pmaxc, pminr, pminc = self.find_extremes(
-                        coefs=coefs_2d, row_var=row_var, col_var=col_var,
-                        max_var=max_var, min_var=min_var)
-
-                    # логирование статистики найденных точек
-                    self.progress.log_info(
-                        f"Масштаб {task.scales[scale]}, {channel_name}, {direction}: "
-                        f"макс_строк={len(pmaxr)}, мин_строк={len(pminr)}, "
-                        f"макс_столб={len(pmaxc)}, мин_столб={len(pminc)}"
+                        coefs=coefs_2d,
+                        row_var=row_var,
+                        col_var=col_var,
+                        max_var=max_var,
+                        min_var=min_var
                     )
 
-                    colors = ['Красный', 'Зелёный', 'Синий']
-                    type_matrix_str = "Str" if type_data == 0 else "Tr"
+                self.progress.log_info(
+                    f"Масштаб {task.scales[scale]}, {channel_name}, {direction}: "
+                    f"макс_строк={len(pmaxr)}, мин_строк={len(pminr)}, "
+                    f"макс_столб={len(pmaxc)}, мин_столб={len(pminc)}"
+                )
 
-                    # Получение огибающих
-                    upper_max_row_points, lower_min_row_points = interpol.get_row_envelopes(coefs_2d, pmaxr, pminr)
-                    upper_max_col_points, lower_min_col_points = interpol.get_column_envelopes(coefs_2d, pmaxc, pminc)
+                interpolator = Interpolator(self.backend)
 
-                    # Валидация точек
-                    if not isinstance(upper_max_row_points, (list, np.ndarray)) or len(upper_max_row_points) == 0:
-                        upper_max_row_points = []
-                    if not isinstance(lower_min_row_points, (list, np.ndarray)) or len(lower_min_row_points) == 0:
-                        lower_min_row_points = []
-                    if not isinstance(upper_max_col_points, (list, np.ndarray)) or len(upper_max_col_points) == 0:
-                        upper_max_col_points = []
-                    if not isinstance(lower_min_col_points, (list, np.ndarray)) or len(lower_min_col_points) == 0:
-                        lower_min_col_points = []
+                upper_max_row_points, lower_min_row_points = interpolator.get_envelopes(
+                    coefs_2d,
+                    pmaxr,
+                    pminr,
+                    direction='row'
+                )
 
-                    # Подготовка данных для сохранения
-                    extremes_to_process = []
-                    titles = []
+                upper_max_col_points, lower_min_col_points = interpolator.get_envelopes(
+                    coefs_2d,
+                    pmaxc,
+                    pminc,
+                    direction='col'
+                )
 
-                    if max_var:
-                        if row_var:
-                            extremes_to_process.append(upper_max_row_points)
-                            titles.append(
-                                f"{type_matrix_str}_Точки_максимума_по_строкам_масштаб_{task.scales[scale]}_{colors[channel]}")
-                        if col_var:
-                            extremes_to_process.append(upper_max_col_points)
-                            titles.append(
-                                f"{type_matrix_str}_Точки_максимума_по_cтолбцам_масштаб_{task.scales[scale]}_{colors[channel]}")
-                    if min_var:
-                        if row_var:
-                            extremes_to_process.append(lower_min_row_points)
-                            titles.append(
-                                f"{type_matrix_str}_Точки_минимума_по_строкам_масштаб_{task.scales[scale]}_{colors[channel]}")
-                        if col_var:
-                            extremes_to_process.append(lower_min_col_points)
-                            titles.append(
-                                f"{type_matrix_str}_Точки_минимума_по_cтолбцам_масштаб_{task.scales[scale]}_{colors[channel]}")
+                # Валидация точек.
+                if not isinstance(upper_max_row_points, (list, np.ndarray)) or len(upper_max_row_points) == 0:
+                    upper_max_row_points = []
+                if not isinstance(lower_min_row_points, (list, np.ndarray)) or len(lower_min_row_points) == 0:
+                    lower_min_row_points = []
+                if not isinstance(upper_max_col_points, (list, np.ndarray)) or len(upper_max_col_points) == 0:
+                    upper_max_col_points = []
+                if not isinstance(lower_min_col_points, (list, np.ndarray)) or len(lower_min_col_points) == 0:
+                    lower_min_col_points = []
 
-                    # Сохранение результатов
-                    scale_folder = self.find_scale_folder(task, task.scales[scale])
-                    for i, p in enumerate(extremes_to_process):
-                        if len(p) > 0:
-                            if print_text_var:
-                                self.save_extremes_to_file(scale_folder, titles[i], p)
-                                self.progress.log_debug(f"Сохранен текстовый файл: {titles[i]}.txt")
-                            if print_graphic:
-                                self.save_extremes_graphic(scale_folder, titles[i], p, coefs_2d.shape)
-                                self.progress.log_debug(f"Сохранен график: {titles[i]}.png")
+                scale_value = task.scales[scale]
+                upper_points_by_scale[scale_value] = upper_max_row_points
 
-                    # Подготовка данных для KNN
-                    knn_extremes = {
-                        'type_data': type_data,
-                        'channel': channel,
-                        'scale': task.scales[scale],
-                        'max_by_row': upper_max_row_points if (row_var and max_var) else [],
-                        'max_by_column': upper_max_col_points if (col_var and max_var) else [],
-                        'min_by_row': lower_min_row_points if (row_var and min_var) else [],
-                        'min_by_column': lower_min_col_points if (col_var and min_var) else []
-                    }
-                    extremes.append(knn_extremes)
+                # Гистограмма: считаем только максимумы верхней огибающей на средней строке изображения.
+                if row_index_for_histogram is None:
+                    row_index_for_histogram = coefs_2d.shape[0] // 2
 
-                    # Обработка KNN
-                    if knn_bool_text_var or knn_bool_image_var:
-                        self.progress.update_progress(0.85, "Обработка KNN...")
+                upper_count_on_row = self.count_points_on_row(
+                    upper_max_row_points,
+                    row_index_for_histogram
+                )
 
-                        from compute.knn.knn_cpu import process_extremes_with_knn
-                        process_extremes_with_knn(
-                            knn_extremes,
-                            scale_folder,
-                            knn_var,
-                            task.original_image,
-                            knn_bool_text_var,
-                            knn_bool_image_var,
-                            use_gpu=use_gpu_knn,
-                            progress_callback=self.progress.update_progress,
-                            log_callback=self.progress.log_info
+                row_hist_scales.append(scale_value)
+                row_hist_max_counts.append(upper_count_on_row)
+
+                self.progress.log_info(
+                    f"Масштаб {scale_value}, {channel_name}, "
+                    f"строка y={row_index_for_histogram}: "
+                    f"максимумов верхней огибающей={upper_count_on_row}"
+                )
+
+                # Подготовка данных для стандартного сохранения точек экстремумов.
+                extremes_to_process = []
+                titles = []
+
+                if max_var:
+                    if row_var:
+                        extremes_to_process.append(upper_max_row_points)
+                        titles.append(
+                            f"{type_matrix_str}_Точки_максимума_по_строкам_масштаб_{scale_value}_{channel_name}"
                         )
+                    if col_var:
+                        extremes_to_process.append(upper_max_col_points)
+                        titles.append(
+                            f"{type_matrix_str}_Точки_максимума_по_cтолбцам_масштаб_{scale_value}_{channel_name}"
+                        )
+
+                if min_var:
+                    if row_var:
+                        extremes_to_process.append(lower_min_row_points)
+                        titles.append(
+                            f"{type_matrix_str}_Точки_минимума_по_строкам_масштаб_{scale_value}_{channel_name}"
+                        )
+                    if col_var:
+                        extremes_to_process.append(lower_min_col_points)
+                        titles.append(
+                            f"{type_matrix_str}_Точки_минимума_по_cтолбцам_масштаб_{scale_value}_{channel_name}"
+                        )
+
+                scale_folder = self.find_scale_folder(task, scale_value)
+
+                for i, p in enumerate(extremes_to_process):
+                    if len(p) > 0:
+                        if print_text_var:
+                            self.save_extremes_to_file(scale_folder, titles[i], p)
+                            self.progress.log_debug(f"Сохранен текстовый файл: {titles[i]}.txt")
+
+                        if print_graphic:
+                            self.save_extremes_graphic(
+                                scale_folder,
+                                titles[i],
+                                p,
+                                coefs_2d=coefs_2d
+                            )
+                            self.progress.log_debug(
+                                f"Сохранен график экстремумов огибающей: {titles[i]}.png"
+                            )
+
+                # Подготовка данных для KNN. Оставлено для совместимости с текущей архитектурой.
+                knn_extremes = {
+                    'type_data': type_data,
+                    'channel': channel,
+                    'scale': scale_value,
+                    'max_by_row': upper_max_row_points if (row_var and max_var) else [],
+                    'max_by_column': upper_max_col_points if (col_var and max_var) else [],
+                    'min_by_row': lower_min_row_points if (row_var and min_var) else [],
+                    'min_by_column': lower_min_col_points if (col_var and min_var) else []
+                }
+                extremes.append(knn_extremes)
+
+                if knn_bool_text_var or knn_bool_image_var:
+                    self.progress.update_progress(0.85, "Обработка KNN...")
+                    process_extremes_with_knn(
+                        knn_extremes,
+                        scale_folder,
+                        knn_var,
+                        task.original_image,
+                        knn_bool_text_var,
+                        knn_bool_image_var,
+                        use_gpu=use_gpu_knn,
+                        progress_callback=self.progress.update_progress,
+                        log_callback=self.progress.log_info
+                    )
+
+            # После всех масштабов текущего канала сохраняем итоговую гистограмму.
+            if len(row_hist_scales) > 0:
+                histogram_dir = os.path.join(
+                    task.task_folder_path,
+                    "Гистограммы_экстремумов_огибающих"
+                )
+
+                histogram_file_base = (
+                    f"hist_upper_envelope_maxima_row_y_{row_index_for_histogram}_{channel_code}"
+                )
+
+                saved_png_path, saved_csv_path = self.save_upper_envelope_maxima_row_histogram(
+                    histogram_dir,
+                    histogram_file_base,
+                    row_hist_scales,
+                    row_hist_max_counts,
+                    row_index_for_histogram,
+                    channel_name=channel_name
+                )
+
+                if saved_png_path:
+                    self.progress.log_info(
+                        f"Гистограмма максимумов верхней огибающей сохранена: {saved_png_path}"
+                    )
+                else:
+                    self.progress.log_error(
+                        f"Не удалось сохранить PNG-гистограмму максимумов верхней огибающей для канала {channel_name}"
+                    )
+
+                if saved_csv_path:
+                    self.progress.log_info(
+                        f"CSV с данными гистограммы сохранён: {saved_csv_path}"
+                    )
+
+                # Сжатые гистограммы по блокам масштабов.
+                for block_size in scale_block_sizes:
+                    try:
+                        block_size = int(block_size)
+                    except (TypeError, ValueError):
+                        self.progress.log_error(
+                            f"Некорректный размер блока масштабов: {block_size}"
+                        )
+                        continue
+
+                    if block_size <= 1:
+                        continue
+
+                    block_labels, block_counts, block_ranges = self.compress_scale_counts_to_blocks(
+                        row_hist_scales,
+                        row_hist_max_counts,
+                        block_size
+                    )
+
+                    block_file_base = (
+                        f"hist_upper_envelope_maxima_row_y_{row_index_for_histogram}_"
+                        f"{channel_code}_blocks_{block_size}"
+                    )
+
+                    block_png_path, block_csv_path = self.save_upper_envelope_maxima_block_histogram(
+                        histogram_dir,
+                        block_file_base,
+                        block_labels,
+                        block_counts,
+                        block_ranges,
+                        row_index_for_histogram,
+                        block_size,
+                        channel_name=channel_name
+                    )
+
+                    if block_png_path:
+                        self.progress.log_info(
+                            f"Сжатая гистограмма по блокам масштабов сохранена: {block_png_path}"
+                        )
+                    else:
+                        self.progress.log_error(
+                            f"Не удалось сохранить сжатую гистограмму для канала {channel_name}, "
+                            f"размер блока={block_size}"
+                        )
+
+                    if block_csv_path:
+                        self.progress.log_info(
+                            f"CSV с данными сжатой гистограммы сохранён: {block_csv_path}"
+                        )
+
+                # Межстрочная синхронизация.
+                # Сравниваем бинарные ряды разных строк по X внутри блоков масштабов.
+                if len(upper_points_by_scale) > 0:
+                    image_height, image_width = task.original_image.shape[:2]
+
+                    safe_stride = max(1, row_sync_stride)
+                    rows_to_analyze = list(range(0, image_height, safe_stride))
+                    middle_row = image_height // 2
+                    if middle_row not in rows_to_analyze:
+                        rows_to_analyze.append(middle_row)
+                        rows_to_analyze = sorted(rows_to_analyze)
+
+                    sync_dir = os.path.join(
+                        task.task_folder_path,
+                        "Синхронизация_строк"
+                    )
+
+                    sync_title = f"row_sync_upper_envelope_maxima_{channel_code}"
+
+                    for block_size in scale_block_sizes:
+                        try:
+                            block_size = int(block_size)
+                        except (TypeError, ValueError):
+                            continue
+
+                        if block_size <= 0:
+                            continue
+
+                        for metric_name in row_sync_metrics:
+                            self.calculate_row_synchronization_for_scale_block(
+                                path=sync_dir,
+                                title=sync_title,
+                                points_by_scale=upper_points_by_scale,
+                                scales=row_hist_scales,
+                                rows_to_analyze=rows_to_analyze,
+                                image_width=image_width,
+                                block_size=block_size,
+                                tolerance=row_sync_tolerance,
+                                metric_name=metric_name,
+                                channel_name=channel_name
+                            )
 
         self.progress.update_progress(0.95, "Завершение поиска экстремумов...")
 
-        # Подсчет общей статистики
-        total_points = sum(len(extreme['max_by_row']) + len(extreme['max_by_column']) +
-                           len(extreme['min_by_row']) + len(extreme['min_by_column'])
-                           for extreme in extremes)
+        total_points = sum(
+            len(extreme['max_by_row']) + len(extreme['max_by_column']) +
+            len(extreme['min_by_row']) + len(extreme['min_by_column'])
+            for extreme in extremes
+        )
 
         self.progress.log_info(f"Всего найдено точек экстремумов: {total_points}")
         self.progress.update_progress(1.0, "Поиск экстремумов завершен")
-
         return extremes
 
     @staticmethod
@@ -671,44 +897,719 @@ class ImageProcessor:
         except Exception as e:
             print(f"Ошибка при сохранении файла {file_path}: {str(e)}")
 
+    # @staticmethod
+    # def save_extremes_graphic(path, title, points_local, original_img_shape):
+    #     """Сохранение графиков точек экстремумов"""
+    #     if not points_local:
+    #         print(f"Нет точек для отображения: {title}")
+    #         return
+
+    #     try:
+    #         plt.figure(figsize=(10, 10))
+
+    #         data = np.array(points_local)
+    #         x = data[:, 0]
+    #         y = data[:, 1]
+
+    #         # оси с сохранением пропорций
+    #         ax = plt.gca()
+
+    #         if original_img_shape is not None:
+    #             height, width = original_img_shape[:2]
+    #             ax.set_xlim(0, width)
+    #             ax.set_ylim(height, 0)  # инвертируем ось Y
+    #             ax.set_aspect('equal')  # фиксируем соотношение сторон 1:1
+
+    #         # рисуем точки
+    #         plt.scatter(x, y, s=1, alpha=0.6)
+    #         plt.title(title)
+
+    #         plt.grid(True)
+    #         plt.xlabel('X (пиксели)')
+    #         plt.ylabel('Y (пиксели)')
+
+    #         filename = os.path.join(path, f"{title}.png")
+    #         plt.savefig(filename, bbox_inches='tight', dpi=96)
+    #         plt.close()
+    #         print(f"График сохранён: {filename}")
+
+    #     except Exception as e:
+    #         print(f"Ошибка при сохранении графика {title}: {str(e)}")
     @staticmethod
-    def save_extremes_graphic(path, title, points_local, original_img_shape):
-        """Сохранение графиков точек экстремумов"""
-        if not points_local:
+    def save_extremes_graphic(path, title, points_local, coefs_2d=None, original_img_shape=None):
+        """
+        Сохранение изображения с точками экстремумов огибающих.
+
+        Если передана матрица coefs_2d, точки накладываются на результат
+        вейвлет-преобразования. Если coefs_2d не передана, рисуется только
+        поле с точками.
+        """
+        if points_local is None or len(points_local) == 0:
             print(f"Нет точек для отображения: {title}")
             return
 
         try:
-            plt.figure(figsize=(10, 10))
+            points = np.asarray(points_local)
 
-            data = np.array(points_local)
-            x = data[:, 0]
-            y = data[:, 1]
+            if points.ndim != 2 or points.shape[1] != 2:
+                print(f"Некорректный формат точек для {title}: {points.shape}")
+                return
 
-            # оси с сохранением пропорций
-            ax = plt.gca()
+            x = points[:, 0]
+            y = points[:, 1]
 
-            if original_img_shape is not None:
-                height, width = original_img_shape[:2]
+            fig, ax = plt.subplots(figsize=(10, 10))
+
+            if coefs_2d is not None:
+                background = np.asarray(coefs_2d)
+
+                # Для контрастной визуализации ограничиваем выбросы
+                vmin, vmax = np.percentile(background, [1, 99])
+
+                ax.imshow(
+                    background,
+                    cmap='gray',
+                    interpolation='nearest',
+                    vmin=vmin,
+                    vmax=vmax
+                )
+
+                height, width = background.shape[:2]
                 ax.set_xlim(0, width)
-                ax.set_ylim(height, 0)  # инвертируем ось Y
-                ax.set_aspect('equal')  # фиксируем соотношение сторон 1:1
+                ax.set_ylim(height, 0)
+            else:
+                if original_img_shape is not None:
+                    height, width = original_img_shape[:2]
+                    ax.set_xlim(0, width)
+                    ax.set_ylim(height, 0)
 
-            # рисуем точки
-            plt.scatter(x, y, s=1, alpha=0.6)
-            plt.title(title)
+            ax.scatter(
+                x,
+                y,
+                s=6,
+                c='red',
+                marker='o',
+                alpha=0.85,
+                linewidths=0
+            )
 
-            plt.grid(True)
-            plt.xlabel('X (пиксели)')
-            plt.ylabel('Y (пиксели)')
+            ax.set_title(title)
+            ax.set_xlabel('X, пиксели')
+            ax.set_ylabel('Y, пиксели')
+            ax.set_aspect('equal')
+            ax.grid(False)
 
             filename = os.path.join(path, f"{title}.png")
-            plt.savefig(filename, bbox_inches='tight', dpi=96)
-            plt.close()
-            print(f"График сохранён: {filename}")
+            plt.savefig(filename, bbox_inches='tight', dpi=150)
+            plt.close(fig)
+
+            print(f"График экстремумов огибающей сохранён: {filename}")
 
         except Exception as e:
             print(f"Ошибка при сохранении графика {title}: {str(e)}")
+
+    @staticmethod
+    def count_points_on_row(points, row_index):
+        """
+        Считает количество точек экстремумов, лежащих на заданной строке изображения.
+
+        points: список точек в формате [(x, y), ...]
+        row_index: номер строки y
+        """
+        if points is None or len(points) == 0:
+            return 0
+
+        points = np.asarray(points)
+
+        if points.ndim != 2 or points.shape[1] != 2:
+            return 0
+
+        y = points[:, 1]
+
+        return int(np.sum(y == row_index))
+
+    @staticmethod
+    def save_upper_envelope_maxima_row_histogram(
+            path,
+            file_base_name,
+            scales,
+            max_counts,
+            row_index,
+            channel_name=None
+    ):
+        """
+        Строит и сохраняет гистограмму распределения количества максимумов
+        верхней огибающей на выбранной строке изображения в зависимости от масштаба.
+
+        Возвращает:
+            (png_path, csv_path)
+        """
+        png_path = None
+        csv_path = None
+
+        try:
+            if scales is None or len(scales) == 0:
+                print(f"Нет данных для построения гистограммы: {file_base_name}")
+                return None, None
+
+            os.makedirs(path, exist_ok=True)
+
+            scales = np.asarray(scales)
+            max_counts = np.asarray(max_counts)
+
+            if len(scales) != len(max_counts):
+                raise ValueError(
+                    f"Размеры scales и max_counts не совпадают: "
+                    f"{len(scales)} != {len(max_counts)}"
+                )
+
+            # Дополнительно сохраняем численные данные, чтобы можно было проверить график.
+            csv_path = os.path.join(path, f"{file_base_name}.csv")
+            with open(csv_path, 'w', encoding='utf-8') as file:
+                file.write("scale,upper_envelope_maxima_count,row_index\n")
+                for scale, count in zip(scales, max_counts):
+                    file.write(f"{scale},{int(count)},{row_index}\n")
+
+            x = np.arange(len(scales))
+
+            fig, ax = plt.subplots(figsize=(14, 6))
+
+            ax.bar(
+                x,
+                max_counts,
+                label='Максимумы верхней огибающей'
+            )
+
+            title_channel = f"Канал: {channel_name}" if channel_name else ""
+            ax.set_title(
+                "Распределение максимумов верхней огибающей по масштабам\n"
+                f"{title_channel}, строка изображения y = {row_index}"
+            )
+            ax.set_xlabel("Масштаб вейвлет-преобразования")
+            ax.set_ylabel("Количество максимумов верхней огибающей")
+
+            ax.set_xticks(x)
+            ax.set_xticklabels([str(s) for s in scales], rotation=90)
+
+            ax.grid(axis='y', alpha=0.3)
+            ax.legend()
+
+            png_path = os.path.join(path, f"{file_base_name}.png")
+            fig.savefig(png_path, bbox_inches='tight', dpi=150)
+            plt.close(fig)
+
+            # Проверяем, что файл реально появился на диске.
+            if not os.path.exists(png_path):
+                raise FileNotFoundError(f"PNG-файл не был создан: {png_path}")
+
+            if os.path.getsize(png_path) == 0:
+                raise IOError(f"PNG-файл создан, но он пустой: {png_path}")
+
+            return png_path, csv_path
+
+        except Exception as e:
+            print(f"Ошибка при построении гистограммы {file_base_name}: {str(e)}")
+            try:
+                plt.close('all')
+            except Exception:
+                pass
+            return None, csv_path
+
+    @staticmethod
+    def compress_scale_counts_to_blocks(scales, counts, block_size):
+        """
+        Сжимает последовательность масштабов в блоки фиксированного размера.
+
+        Пример:
+            scales = [5, 6, 7, 8, 9, 10]
+            counts = [25, 18, 15, 12, 15, 10]
+            block_size = 3
+
+        Результат:
+            block_labels = ['5-7', '8-10']
+            block_counts = [58, 37]
+            block_ranges = [(5, 7, [5, 6, 7]), (8, 10, [8, 9, 10])]
+
+        Значение блока — сумма количества максимумов верхней огибающей
+        на масштабах, входящих в этот блок.
+        """
+        if scales is None or counts is None:
+            return [], [], []
+
+        scales = list(scales)
+        counts = [int(c) for c in counts]
+
+        if len(scales) != len(counts):
+            raise ValueError(
+                f"Размеры scales и counts не совпадают: {len(scales)} != {len(counts)}"
+            )
+
+        if block_size <= 0:
+            raise ValueError(f"Размер блока должен быть положительным, получено: {block_size}")
+
+        block_labels = []
+        block_counts = []
+        block_ranges = []
+
+        for start_idx in range(0, len(scales), block_size):
+            end_idx = min(start_idx + block_size, len(scales))
+
+            block_scales = scales[start_idx:end_idx]
+            block_values = counts[start_idx:end_idx]
+
+            if not block_scales:
+                continue
+
+            scale_start = block_scales[0]
+            scale_end = block_scales[-1]
+            block_sum = int(np.sum(block_values))
+
+            if scale_start == scale_end:
+                label = str(scale_start)
+            else:
+                label = f"{scale_start}-{scale_end}"
+
+            block_labels.append(label)
+            block_counts.append(block_sum)
+            block_ranges.append((scale_start, scale_end, block_scales))
+
+        return block_labels, block_counts, block_ranges
+
+    @staticmethod
+    def save_upper_envelope_maxima_block_histogram(
+            path,
+            file_base_name,
+            block_labels,
+            block_counts,
+            block_ranges,
+            row_index,
+            block_size,
+            channel_name=None
+    ):
+        """
+        Сохраняет сжатую гистограмму по блокам масштабов.
+
+        Каждый столбец соответствует диапазону масштабов.
+        Высота столбца — сумма количества максимумов верхней огибающей
+        по всем масштабам внутри блока.
+
+        Возвращает:
+            (png_path, csv_path)
+        """
+        png_path = None
+        csv_path = None
+
+        try:
+            if block_labels is None or len(block_labels) == 0:
+                print(f"Нет данных для построения сжатой гистограммы: {file_base_name}")
+                return None, None
+
+            os.makedirs(path, exist_ok=True)
+
+            block_counts = [int(c) for c in block_counts]
+
+            if len(block_labels) != len(block_counts):
+                raise ValueError(
+                    f"Размеры block_labels и block_counts не совпадают: "
+                    f"{len(block_labels)} != {len(block_counts)}"
+                )
+
+            csv_path = os.path.join(path, f"{file_base_name}.csv")
+            with open(csv_path, 'w', encoding='utf-8') as file:
+                file.write(
+                    "block_label,block_start_scale,block_end_scale,"
+                    "scales_in_block,upper_envelope_maxima_sum,row_index,block_size\n"
+                )
+
+                for label, count, block_range in zip(block_labels, block_counts, block_ranges):
+                    scale_start, scale_end, block_scales = block_range
+                    scales_as_text = "|".join(str(s) for s in block_scales)
+                    file.write(
+                        f"{label},{scale_start},{scale_end},"
+                        f"{scales_as_text},{int(count)},{row_index},{block_size}\n"
+                    )
+
+            x = np.arange(len(block_labels))
+
+            fig, ax = plt.subplots(figsize=(14, 6))
+
+            ax.bar(
+                x,
+                block_counts,
+                label=f'Сумма максимумов в блоке, размер блока = {block_size}'
+            )
+
+            title_channel = f"Канал: {channel_name}" if channel_name else ""
+            ax.set_title(
+                "Сжатое распределение максимумов верхней огибающей по блокам масштабов\n"
+                f"{title_channel}, строка изображения y = {row_index}, "
+                f"размер блока = {block_size}"
+            )
+            ax.set_xlabel("Блок масштабов")
+            ax.set_ylabel("Суммарное количество максимумов верхней огибающей")
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(block_labels, rotation=90)
+
+            ax.grid(axis='y', alpha=0.3)
+            ax.legend()
+
+            png_path = os.path.join(path, f"{file_base_name}.png")
+            fig.savefig(png_path, bbox_inches='tight', dpi=150)
+            plt.close(fig)
+
+            if not os.path.exists(png_path):
+                raise FileNotFoundError(f"PNG-файл не был создан: {png_path}")
+
+            if os.path.getsize(png_path) == 0:
+                raise IOError(f"PNG-файл создан, но он пустой: {png_path}")
+
+            return png_path, csv_path
+
+        except Exception as e:
+            print(f"Ошибка при построении сжатой гистограммы {file_base_name}: {str(e)}")
+            try:
+                plt.close('all')
+            except Exception:
+                pass
+            return None, csv_path
+
+
+    @staticmethod
+    def build_binary_row_from_points(points, row_index, width, tolerance=0):
+        """
+        Строит бинарный ряд длины width для одной строки изображения.
+
+        1 означает, что в позиции x есть максимум верхней огибающей.
+        tolerance расширяет событие по X на несколько пикселей влево/вправо.
+        """
+        binary = np.zeros(width, dtype=np.uint8)
+
+        if points is None or len(points) == 0:
+            return binary
+
+        points = np.asarray(points)
+
+        if points.ndim != 2 or points.shape[1] != 2:
+            return binary
+
+        row_mask = points[:, 1].astype(int) == int(row_index)
+        x_values = points[row_mask][:, 0].astype(int)
+
+        for x in x_values:
+            if x < 0 or x >= width:
+                continue
+            left = max(0, x - tolerance)
+            right = min(width, x + tolerance + 1)
+            binary[left:right] = 1
+
+        return binary
+
+    @staticmethod
+    def calculate_binary_sync_metrics(binary_a, binary_b):
+        """
+        Считает метрики синхронизации между двумя бинарными рядами.
+        """
+        binary_a = np.asarray(binary_a).astype(bool)
+        binary_b = np.asarray(binary_b).astype(bool)
+
+        if binary_a.shape != binary_b.shape:
+            raise ValueError(
+                f"Размеры бинарных рядов не совпадают: {binary_a.shape} != {binary_b.shape}"
+            )
+
+        n11 = int(np.sum(binary_a & binary_b))
+        n10 = int(np.sum(binary_a & ~binary_b))
+        n01 = int(np.sum(~binary_a & binary_b))
+        n00 = int(np.sum(~binary_a & ~binary_b))
+
+        denom_jaccard = n11 + n10 + n01
+        jaccard = n11 / denom_jaccard if denom_jaccard > 0 else 0.0
+
+        denom_dice = 2 * n11 + n10 + n01
+        dice = (2 * n11) / denom_dice if denom_dice > 0 else 0.0
+
+        denom_phi = np.sqrt(
+            (n11 + n10) *
+            (n01 + n00) *
+            (n11 + n01) *
+            (n10 + n00)
+        )
+        phi = ((n11 * n00) - (n10 * n01)) / denom_phi if denom_phi > 0 else 0.0
+
+        return {
+            "n11": n11,
+            "n10": n10,
+            "n01": n01,
+            "n00": n00,
+            "jaccard": float(jaccard),
+            "dice": float(dice),
+            "phi": float(phi)
+        }
+
+    @staticmethod
+    def save_row_sync_heatmap(path, file_base_name, sync_matrix, rows, metric_name, block_label, channel_name=None):
+        """
+        Сохраняет heatmap синхронизации между строками изображения.
+        """
+        try:
+            os.makedirs(path, exist_ok=True)
+
+            sync_matrix = np.asarray(sync_matrix, dtype=float)
+            rows = list(rows)
+
+            fig, ax = plt.subplots(figsize=(10, 8))
+
+            if metric_name == "phi":
+                vmin, vmax = -1, 1
+                cmap = "coolwarm"
+            else:
+                vmin, vmax = 0, 1
+                cmap = "viridis"
+
+            im = ax.imshow(
+                sync_matrix,
+                cmap=cmap,
+                interpolation="nearest",
+                vmin=vmin,
+                vmax=vmax
+            )
+
+            title_channel = f"Канал: {channel_name}" if channel_name else ""
+            ax.set_title(
+                f"Межстрочная синхронизация максимумов верхней огибающей\n"
+                f"{title_channel}, блок масштабов {block_label}, метрика: {metric_name}"
+            )
+            ax.set_xlabel("Строка изображения")
+            ax.set_ylabel("Строка изображения")
+
+            max_ticks = 20
+            tick_step = max(1, len(rows) // max_ticks)
+
+            tick_positions = np.arange(0, len(rows), tick_step)
+            tick_labels = [str(rows[i]) for i in tick_positions]
+
+            ax.set_xticks(tick_positions)
+            ax.set_yticks(tick_positions)
+            ax.set_xticklabels(tick_labels, rotation=90)
+            ax.set_yticklabels(tick_labels)
+
+            cbar = fig.colorbar(im, ax=ax)
+            cbar.set_label(metric_name)
+
+            png_path = os.path.join(path, f"{file_base_name}.png")
+            fig.savefig(png_path, bbox_inches="tight", dpi=150)
+            plt.close(fig)
+
+            if not os.path.exists(png_path):
+                raise FileNotFoundError(f"PNG-файл не был создан: {png_path}")
+            if os.path.getsize(png_path) == 0:
+                raise IOError(f"PNG-файл создан, но он пустой: {png_path}")
+
+            return png_path
+
+        except Exception as e:
+            print(f"Ошибка при сохранении heatmap синхронизации строк {file_base_name}: {e}")
+            try:
+                plt.close('all')
+            except Exception:
+                pass
+            return None
+
+    @staticmethod
+    def save_row_sync_matrix_csv(path, file_base_name, sync_matrix, rows):
+        """
+        Сохраняет матрицу синхронизации строк в CSV.
+        """
+        try:
+            os.makedirs(path, exist_ok=True)
+            csv_path = os.path.join(path, f"{file_base_name}.csv")
+
+            sync_matrix = np.asarray(sync_matrix, dtype=float)
+            rows = list(rows)
+
+            with open(csv_path, "w", encoding="utf-8") as file:
+                file.write("row," + ",".join(str(r) for r in rows) + "\n")
+                for row_value, matrix_row in zip(rows, sync_matrix):
+                    values = ",".join(f"{float(v):.6f}" for v in matrix_row)
+                    file.write(f"{row_value},{values}\n")
+
+            return csv_path
+
+        except Exception as e:
+            print(f"Ошибка при сохранении CSV матрицы синхронизации строк {file_base_name}: {e}")
+            return None
+
+    @staticmethod
+    def save_row_sync_pair_metrics_csv(path, file_base_name, pair_rows):
+        """
+        Сохраняет подробную таблицу метрик по всем парам строк.
+        """
+        try:
+            os.makedirs(path, exist_ok=True)
+            csv_path = os.path.join(path, f"{file_base_name}_pairs.csv")
+
+            with open(csv_path, "w", encoding="utf-8") as file:
+                file.write(
+                    "row_a,row_b,n11,n10,n01,n00,jaccard,dice,phi\n"
+                )
+                for item in pair_rows:
+                    file.write(
+                        f"{item['row_a']},{item['row_b']},"
+                        f"{item['n11']},{item['n10']},{item['n01']},{item['n00']},"
+                        f"{item['jaccard']:.6f},{item['dice']:.6f},{item['phi']:.6f}\n"
+                    )
+
+            return csv_path
+
+        except Exception as e:
+            print(f"Ошибка при сохранении подробной CSV таблицы пар строк {file_base_name}: {e}")
+            return None
+
+    def calculate_row_synchronization_for_scale_block(
+            self,
+            path,
+            title,
+            points_by_scale,
+            scales,
+            rows_to_analyze,
+            image_width,
+            block_size=5,
+            tolerance=1,
+            metric_name="jaccard",
+            channel_name=None
+    ):
+        """
+        Рассчитывает межстрочную синхронизацию максимумов верхней огибающей.
+
+        Для каждого блока масштабов:
+        1. Для каждой строки строится бинарный ряд по X.
+        2. События внутри блока масштабов объединяются через OR.
+        3. Для каждой пары строк строится таблица сопряжённости n11/n10/n01/n00.
+        4. Сохраняется heatmap выбранной метрики и CSV-таблицы.
+        """
+        try:
+            os.makedirs(path, exist_ok=True)
+
+            scales = list(scales)
+            rows_to_analyze = sorted(set(int(r) for r in rows_to_analyze))
+            metric_name = str(metric_name).lower()
+
+            if metric_name not in {"jaccard", "dice", "phi"}:
+                self.progress.log_error(
+                    f"Неизвестная метрика синхронизации: {metric_name}. Использую jaccard."
+                )
+                metric_name = "jaccard"
+
+            if len(scales) == 0 or len(rows_to_analyze) == 0:
+                self.progress.log_error("Нет данных для расчёта межстрочной синхронизации")
+                return []
+
+            results = []
+
+            for block_start in range(0, len(scales), block_size):
+                block_scales = scales[block_start:block_start + block_size]
+                if len(block_scales) == 0:
+                    continue
+
+                block_label = f"{block_scales[0]}-{block_scales[-1]}" if block_scales[0] != block_scales[-1] else str(block_scales[0])
+
+                # Для каждой строки строим бинарный ряд по X, объединяя масштабы блока через OR.
+                row_binary_events = {}
+
+                for row in rows_to_analyze:
+                    block_binary = np.zeros(image_width, dtype=np.uint8)
+
+                    for scale_value in block_scales:
+                        points = points_by_scale.get(scale_value, [])
+                        row_binary = self.build_binary_row_from_points(
+                            points,
+                            row_index=row,
+                            width=image_width,
+                            tolerance=tolerance
+                        )
+                        block_binary = np.logical_or(block_binary, row_binary).astype(np.uint8)
+
+                    row_binary_events[row] = block_binary
+
+                n_rows = len(rows_to_analyze)
+                sync_matrix = np.zeros((n_rows, n_rows), dtype=float)
+                pair_rows = []
+
+                for i, row_a in enumerate(rows_to_analyze):
+                    for j, row_b in enumerate(rows_to_analyze):
+                        metrics = self.calculate_binary_sync_metrics(
+                            row_binary_events[row_a],
+                            row_binary_events[row_b]
+                        )
+
+                        # Диагональ принудительно равна 1 для читаемой heatmap.
+                        value = 1.0 if i == j else metrics.get(metric_name, 0.0)
+                        sync_matrix[i, j] = value
+
+                        pair_rows.append({
+                            "row_a": row_a,
+                            "row_b": row_b,
+                            **metrics
+                        })
+
+                safe_block_label = str(block_label).replace('-', '_')
+                file_base_name = (
+                    f"{title}_block_{safe_block_label}_size_{block_size}_{metric_name}"
+                )
+
+                heatmap_path = self.save_row_sync_heatmap(
+                    path,
+                    file_base_name,
+                    sync_matrix,
+                    rows_to_analyze,
+                    metric_name,
+                    block_label,
+                    channel_name=channel_name
+                )
+
+                matrix_csv_path = self.save_row_sync_matrix_csv(
+                    path,
+                    file_base_name,
+                    sync_matrix,
+                    rows_to_analyze
+                )
+
+                pairs_csv_path = self.save_row_sync_pair_metrics_csv(
+                    path,
+                    file_base_name,
+                    pair_rows
+                )
+
+                if heatmap_path:
+                    self.progress.log_info(f"Heatmap межстрочной синхронизации сохранён: {heatmap_path}")
+                else:
+                    self.progress.log_error(
+                        f"Не удалось сохранить heatmap межстрочной синхронизации: {file_base_name}"
+                    )
+
+                if matrix_csv_path:
+                    self.progress.log_info(f"CSV матрицы межстрочной синхронизации сохранён: {matrix_csv_path}")
+
+                if pairs_csv_path:
+                    self.progress.log_info(f"CSV парных метрик межстрочной синхронизации сохранён: {pairs_csv_path}")
+
+                results.append({
+                    "block_label": block_label,
+                    "block_scales": block_scales,
+                    "metric_name": metric_name,
+                    "rows": rows_to_analyze,
+                    "matrix": sync_matrix,
+                    "heatmap_path": heatmap_path,
+                    "matrix_csv_path": matrix_csv_path,
+                    "pairs_csv_path": pairs_csv_path
+                })
+
+            return results
+
+        except Exception as e:
+            self.progress.log_error(f"Ошибка при расчёте межстрочной синхронизации: {e}")
+            return []
 
     def find_scale_folder(self, task, scale):
         """Находит папку масштаба для текущей задачи"""
@@ -1058,38 +1959,34 @@ class App(TkinterApp):
         )
         header.pack(fill="x", padx=10, pady=(10, 15))
 
-        # НОВАЯ СЕКЦИЯ: Настройки вычислений
         self.compute_settings_section = CollapsibleFrame(scrollable_panel.scrollable_frame,
-                                                         title="⚙️ Настройки вычислений")
+                                                         title="Настройки вычислений")
         self.compute_settings_section.pack(fill="x", padx=5, pady=2)
-        # Создаем временный контент, который обновим позже
         temp_label = ctk.CTkLabel(
             self.compute_settings_section.content,
             text="Загрузка настроек...",
             font=ctk.CTkFont(size=11),
-            text_color="gray"
-        )
+            text_color="gray")
         temp_label.pack(pady=10)
 
-        # Секция вейвлет-преобразования
-        self.wavelet_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="🌀 Вейвлет-преобразование")
+        self.wavelet_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="Вейвлет-преобразование")
         self.wavelet_section.pack(fill="x", padx=5, pady=2)
         self._setup_wavelet_section()
 
         # Секция точек экстремумов (вывод)
         self.output_extremes_section = CollapsibleFrame(scrollable_panel.scrollable_frame,
-                                                        title="📈 Вывод точек экстремумов")
+                                                        title="Вывод точек экстремумов")
         self.output_extremes_section.pack(fill="x", padx=5, pady=2)
         self._setup_output_extremes_section()
 
         # Секция K-ближайших соседей
-        self.knn_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="🔍 K-ближайшие соседи")
+        self.knn_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="K-ближайшие соседи")
         self.knn_section.pack(fill="x", padx=5, pady=2)
         self._setup_knn_section()
 
         # Секция промежуточных вычислений
         self.intermediate_section = CollapsibleFrame(scrollable_panel.scrollable_frame,
-                                                     title="📋 Промежуточные вычисления")
+                                                     title="Промежуточные вычисления")
         self.intermediate_section.pack(fill="x", padx=5, pady=2)
         self._setup_intermediate_section()
 
@@ -1158,7 +2055,7 @@ class App(TkinterApp):
         else:
             status_label = ctk.CTkLabel(
                 self.compute_settings_section.content,
-                text="✅ GPU доступен для вычислений",
+                text="GPU доступен для вычислений",
                 font=ctk.CTkFont(size=10),
                 text_color="green",
                 anchor="w"
@@ -1234,7 +2131,7 @@ class App(TkinterApp):
         """Настройка секции загрузки изображения"""
         self.load_button = ctk.CTkButton(
             self.load_section.content,
-            text="📁 Загрузить и обрезать изображение",
+            text="Загрузить и обрезать изображение",
             command=self.load_image_callback,
             height=40,
             font=ctk.CTkFont(size=13, weight="bold"),
@@ -1269,7 +2166,7 @@ class App(TkinterApp):
 
         self.pipette_button = ctk.CTkButton(
             pipette_frame,
-            text="🎨 Активировать пипетку",
+            text="Активировать пипетку",
             command=self.pipette_channel,
             height=35,
             font=ctk.CTkFont(size=12)
@@ -1291,7 +2188,7 @@ class App(TkinterApp):
 
         self.gram_shmidt_button = ctk.CTkButton(
             gram_frame,
-            text="🔄 Применить Грамма-Шмидта",
+            text="Применить Грамма-Шмидта",
             command=self.gramm_shmidt_transform,
             height=35,
             font=ctk.CTkFont(size=12)
@@ -1332,7 +2229,7 @@ class App(TkinterApp):
 
         self.button_save_scales = ctk.CTkButton(
             button_frame,
-            text="💾 Сохранить значения",
+            text="Сохранить значения",
             command=self.load_scales,
             height=35
         )
@@ -1340,7 +2237,7 @@ class App(TkinterApp):
 
         self.button_load_scales_file = ctk.CTkButton(
             button_frame,
-            text="📂 Загрузить из файла",
+            text="Загрузить из файла",
             command=self.load_scales_from_file,
             height=35
         )
@@ -1538,12 +2435,12 @@ class App(TkinterApp):
 
         # Информация об изображении
         if task.image_path:
-            image_info = f"📁 {os.path.basename(task.image_path)}"
+            image_info = f"{os.path.basename(task.image_path)}"
             if hasattr(task, 'original_image') and task.original_image is not None:
                 height, width = task.original_image.shape[:2]
                 image_info += f" ({width}×{height}px)"
         else:
-            image_info = "📁 Изображение не загружено"
+            image_info = "Изображение не загружено"
 
         image_label = ctk.CTkLabel(
             row1_frame,
@@ -1561,7 +2458,7 @@ class App(TkinterApp):
         scales_info = self._get_scales_info(task)
         scales_label = ctk.CTkLabel(
             row2_frame,
-            text=f"📏 {scales_info}",
+            text=f"{scales_info}",
             font=ctk.CTkFont(size=11),
             anchor="w"
         )
@@ -1575,7 +2472,7 @@ class App(TkinterApp):
         processing_info = self._get_processing_info(task)
         processing_label = ctk.CTkLabel(
             row3_frame,
-            text=f"⚙️ {processing_info}",
+            text=f"{processing_info}",
             font=ctk.CTkFont(size=11),
             anchor="w"
         )
@@ -1688,7 +2585,7 @@ class App(TkinterApp):
             # Обновляем информацию о загруженном изображении
             if self.current_task.image_path:
                 self.load_button.configure(
-                    text="✅ Изображение загружено",
+                    text="Изображение загружено",
                     fg_color="#28a745",
                     hover_color="#218838"
                 )
@@ -1696,7 +2593,7 @@ class App(TkinterApp):
                 self.print_load_image.configure(text=text, text_color="white")
             else:
                 self.load_button.configure(
-                    text="📁 Загрузить и обрезать изображение",
+                    text="Загрузить и обрезать изображение",
                     fg_color="#2b5b84",
                     hover_color="#1e4160"
                 )
@@ -1712,28 +2609,28 @@ class App(TkinterApp):
 
             if has_colors:
                 self.pipette_button.configure(
-                    text="✅ Пипетка активирована",
+                    text="Пипетка активирована",
                     state='disabled',
                     fg_color="#6c757d",
                     hover_color="#5a6268"
                 )
                 # Активируем кнопку Грамма-Шмидта если есть цвета
                 self.gram_shmidt_button.configure(
-                    text="🔄 Применить Грамма-Шмидта",  # Всегда сбрасываем текст
+                    text="Применить Грамма-Шмидта",  # Всегда сбрасываем текст
                     state='normal',
                     fg_color="#2b5b84",
                     hover_color="#1e4160"
                 )
             else:
                 self.pipette_button.configure(
-                    text="🎨 Активировать пипетку",
+                    text="Активировать пипетку",
                     state='normal',
                     fg_color="#2b5b84",
                     hover_color="#1e4160"
                 )
                 # Деактивируем кнопку Грамма-Шмидта если нет цветов
                 self.gram_shmidt_button.configure(
-                    text="🔄 Применить Грамма-Шмидта",  # Всегда сбрасываем текст
+                    text="Применить Грамма-Шмидта",  # Всегда сбрасываем текст
                     state='disabled',
                     fg_color="#6c757d",
                     hover_color="#5a6268"
@@ -1745,13 +2642,13 @@ class App(TkinterApp):
             # Сбрасываем состояние кнопок масштабов для новой задачи
             if len(self.current_task.scales) == 0:
                 self.button_save_scales.configure(
-                    text="💾 Сохранить значения",
+                    text="Сохранить значения",
                     fg_color="#2b5b84",
                     hover_color="#1e4160",
                     state='normal'
                 )
                 self.button_load_scales_file.configure(
-                    text="📂 Загрузить из файла",
+                    text="Загрузить из файла",
                     fg_color="#2b5b84",
                     hover_color="#1e4160",
                     state='normal'
@@ -1773,31 +2670,31 @@ class App(TkinterApp):
         else:
             # Сбрасываем UI если нет активной задачи
             self.load_button.configure(
-                text="📁 Загрузить и обрезать изображение",
+                text="Загрузить и обрезать изображение",
                 fg_color="#2b5b84",
                 hover_color="#1e4160"
             )
             self.print_load_image.configure(text="Изображение не загружено", text_color="gray")
             self.pipette_button.configure(
-                text="🎨 Активировать пипетку",
+                text="Активировать пипетку",
                 state='normal',
                 fg_color="#2b5b84",
                 hover_color="#1e4160"
             )
             self.gram_shmidt_button.configure(
-                text="🔄 Применить Грамма-Шмидта",
+                text="Применить Грамма-Шмидта",
                 state='disabled',
                 fg_color="#6c757d",
                 hover_color="#5a6268"
             )
             self.button_save_scales.configure(
-                text="💾 Сохранить значения",
+                text="Сохранить значения",
                 fg_color="#2b5b84",
                 hover_color="#1e4160",
                 state='disabled'
             )
             self.button_load_scales_file.configure(
-                text="📂 Загрузить из файла",
+                text="Загрузить из файла",
                 fg_color="#2b5b84",
                 hover_color="#1e4160",
                 state='disabled'
@@ -1820,7 +2717,7 @@ class App(TkinterApp):
                 self._update_tasks_display()
             else:
                 self.load_button.configure(
-                    text="❌ Ошибка загрузки",
+                    text="Ошибка загрузки",
                     fg_color="#dc3545",
                     hover_color="#c82333"
                 )
@@ -1860,7 +2757,7 @@ class App(TkinterApp):
 
         self.image_processor.gram_shmidt_transform_for_task(self.current_task)
         self.gram_shmidt_button.configure(
-            text="✅ Преобразование применено",
+            text="Преобразование применено",
             state='disabled',
             fg_color="#6c757d",
             hover_color="#5a6268"
@@ -1880,7 +2777,7 @@ class App(TkinterApp):
             step = int(self.entry_step.get() or "1")
             self.image_processor.load_scales_for_task(self.current_task, start, end, step)
             self.button_save_scales.configure(
-                text="✅ Масштабы сохранены",
+                text="Масштабы сохранены",
                 fg_color="#28a745",
                 hover_color="#218838"
             )
@@ -1926,12 +2823,12 @@ class App(TkinterApp):
             self.label_custom_scale.configure(text=scales_text, text_color="white")
 
             self.button_load_scales_file.configure(
-                text="✅ Файл загружен",
+                text="Файл загружен",
                 fg_color="#28a745",
                 hover_color="#218838"
             )
             self.button_save_scales.configure(
-                text="💾 Сохранить значения",
+                text="Сохранить значения",
                 fg_color="#6c757d",
                 hover_color="#5a6268",
                 state='disabled'
@@ -1968,14 +2865,14 @@ class App(TkinterApp):
 
         self.wp1_checkbox = ctk.CTkCheckBox(
             self.wavelet_section.content,
-            text="📊 Вывести изображением",
+            text="Вывести изображением",
             variable=self.wp_var1
         )
         self.wavelet_section.add_widget(self.wp1_checkbox, fill="x")
 
         self.wp2_checkbox = ctk.CTkCheckBox(
             self.wavelet_section.content,
-            text="📄 Вывести текстовым файлом",
+            text="Вывести текстовым файлом",
             variable=self.wp_var2
         )
         self.wavelet_section.add_widget(self.wp2_checkbox, fill="x")
@@ -1993,13 +2890,13 @@ class App(TkinterApp):
 
         self.p_ex2_checkbox = ctk.CTkCheckBox(
             self.output_extremes_section.content,
-            text="📊 Вывести изображением",
+            text="Вывести изображением",
             variable=self.p_ex_var2
         )
         self.output_extremes_section.add_widget(self.p_ex2_checkbox, fill="x")
         self.p_ex1_checkbox = ctk.CTkCheckBox(
             self.output_extremes_section.content,
-            text="📄 Вывести текстовым файлом",
+            text="Вывести текстовым файлом",
             variable=self.p_ex_var1
         )
         self.output_extremes_section.add_widget(self.p_ex1_checkbox, fill="x")
@@ -2017,14 +2914,14 @@ class App(TkinterApp):
 
         self.knn_text_checkbox = ctk.CTkCheckBox(
             self.knn_section.content,
-            text="📄 Вывести текстовым файлом",
+            text="Вывести текстовым файлом",
             variable=self.knn_bool_text_var
         )
         self.knn_section.add_widget(self.knn_text_checkbox, fill="x")
 
         self.knn_image_checkbox = ctk.CTkCheckBox(
             self.knn_section.content,
-            text="📊 Вывести изображением",
+            text="Вывести изображением",
             variable=self.knn_bool_image_var
         )
         self.knn_section.add_widget(self.knn_image_checkbox, fill="x")
@@ -2042,7 +2939,7 @@ class App(TkinterApp):
 
         self.print_channels_txt_checkbox = ctk.CTkCheckBox(
             self.intermediate_section.content,
-            text="💾 Исходные матрицы RGB",
+            text="Исходные матрицы RGB",
             variable=self.print_channels_txt_var
         )
         self.intermediate_section.add_widget(self.print_channels_txt_checkbox, fill="x")
@@ -2051,7 +2948,7 @@ class App(TkinterApp):
         """Настройка секции вычислений"""
         self.app_start_button = ctk.CTkButton(
             self.compute_section,
-            text="🚀 Начать вычисления",
+            text="Начать вычисления",
             command=self.safe_compute,
             height=50,
             font=ctk.CTkFont(size=16, weight="bold"),
