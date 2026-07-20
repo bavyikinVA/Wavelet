@@ -74,7 +74,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import numpy as np
-from PIL import Image
 
 from Gram_Shmidt import change_channels
 from compute.processing_task import ProcessingTask
@@ -170,6 +169,7 @@ class ImageProcessor:
             if not all(isinstance(ch, np.ndarray) for ch in task.data):
                 raise ValueError("Один или несколько каналов изображения не являются массивами NumPy")
             task.data_copy = [channel.copy() for channel in task.data]
+            task.gram_schmidt_applied = False
             self.progress.log_info("Изображение успешно обработано")
             return True
         else:
@@ -242,6 +242,7 @@ class ImageProcessor:
     def gram_shmidt_transform_for_task(self, task):
         self.progress.log_info("Применение преобразования Грамма-Шмидта...")
         task.data = change_channels(task.color1, task.color2, task.data)
+        task.gram_schmidt_applied = True
         self.progress.log_info("Преобразование Грамма-Шмидта завершено")
 
     def load_scales_for_task(self, task, start, end, step):
@@ -783,25 +784,26 @@ class ImageProcessor:
                     lower_min_col_points = []
 
                 scale_value = task.scales[scale]
-                upper_points_by_scale[scale_value] = upper_max_row_points
+                if task.calculate_synchronization:
+                    upper_points_by_scale[scale_value] = upper_max_row_points
 
                 # Гистограмма: считаем только максимумы верхней огибающей на средней строке изображения.
-                if row_index_for_histogram is None:
-                    row_index_for_histogram = coefs_2d.shape[0] // 2
+                if task.calculate_statistics or task.calculate_synchronization:
+                    if row_index_for_histogram is None:
+                        row_index_for_histogram = coefs_2d.shape[0] // 2
+                    row_hist_scales.append(scale_value)
 
-                upper_count_on_row = self.count_points_on_row(
-                    upper_max_row_points,
-                    row_index_for_histogram
-                )
-
-                row_hist_scales.append(scale_value)
-                row_hist_max_counts.append(upper_count_on_row)
-
-                self.progress.log_info(
-                    f"Масштаб {scale_value}, {channel_name}, "
-                    f"строка y={row_index_for_histogram}: "
-                    f"максимумов верхней огибающей={upper_count_on_row}"
-                )
+                if task.calculate_statistics:
+                    upper_count_on_row = self.count_points_on_row(
+                        upper_max_row_points,
+                        row_index_for_histogram
+                    )
+                    row_hist_max_counts.append(upper_count_on_row)
+                    self.progress.log_info(
+                        f"Масштаб {scale_value}, {channel_name}, "
+                        f"строка y={row_index_for_histogram}: "
+                        f"максимумов верхней огибающей={upper_count_on_row}"
+                    )
 
                 # Подготовка данных для стандартного сохранения точек экстремумов.
                 extremes_to_process = []
@@ -893,14 +895,18 @@ class ImageProcessor:
                     row_hist_scales,
                     row_hist_max_counts,
                     row_index_for_histogram,
-                    channel_name=channel_name
+                    channel_name=channel_name,
+                    save_png=(task.calculate_statistics
+                              and task.statistics_output_image),
+                    save_csv=(task.calculate_statistics
+                              and task.statistics_output_csv)
                 )
 
                 if saved_png_path:
                     self.progress.log_info(
                         f"Гистограмма максимумов верхней огибающей сохранена: {saved_png_path}"
                     )
-                else:
+                elif task.calculate_statistics and task.statistics_output_image:
                     self.progress.log_error(
                         f"Не удалось сохранить PNG-гистограмму максимумов верхней огибающей для канала {channel_name}"
                     )
@@ -911,7 +917,8 @@ class ImageProcessor:
                     )
 
                 # Сжатые гистограммы по блокам масштабов.
-                for block_size in scale_block_sizes:
+                for block_size in (
+                        scale_block_sizes if task.calculate_statistics else []):
                     try:
                         block_size = int(block_size)
                     except (TypeError, ValueError):
@@ -942,14 +949,16 @@ class ImageProcessor:
                         block_ranges,
                         row_index_for_histogram,
                         block_size,
-                        channel_name=channel_name
+                        channel_name=channel_name,
+                        save_png=task.statistics_output_image,
+                        save_csv=task.statistics_output_csv
                     )
 
                     if block_png_path:
                         self.progress.log_info(
                             f"Сжатая гистограмма по блокам масштабов сохранена: {block_png_path}"
                         )
-                    else:
+                    elif task.statistics_output_image:
                         self.progress.log_error(
                             f"Не удалось сохранить сжатую гистограмму для канала {channel_name}, "
                             f"размер блока={block_size}"
@@ -962,7 +971,8 @@ class ImageProcessor:
 
                 # Межстрочная синхронизация.
                 # Сравниваем бинарные ряды разных строк по X внутри блоков масштабов.
-                if len(upper_points_by_scale) > 0:
+                if (task.calculate_synchronization
+                        and len(upper_points_by_scale) > 0):
                     image_height, image_width = task.original_image.shape[:2]
 
                     safe_stride = max(1, row_sync_stride)
@@ -999,7 +1009,14 @@ class ImageProcessor:
                                 block_size=block_size,
                                 tolerance=row_sync_tolerance,
                                 metric_name=metric_name,
-                                channel_name=channel_name
+                                channel_name=channel_name,
+                                save_heatmap=task.synchronization_output_heatmap,
+                                save_matrix_csv=(
+                                    task.synchronization_output_matrix_csv
+                                ),
+                                save_pairs_csv=(
+                                    task.synchronization_output_pairs_csv
+                                )
                             )
 
         self.progress.update_progress(0.95, "Завершение поиска экстремумов...")
@@ -1168,7 +1185,9 @@ class ImageProcessor:
             scales,
             max_counts,
             row_index,
-            channel_name=None
+            channel_name=None,
+            save_png=True,
+            save_csv=True
     ):
         """
         Строит и сохраняет гистограмму распределения количества максимумов
@@ -1181,6 +1200,8 @@ class ImageProcessor:
         csv_path = None
 
         try:
+            if not save_png and not save_csv:
+                return None, None
             if scales is None or len(scales) == 0:
                 print(f"Нет данных для построения гистограммы: {file_base_name}")
                 return None, None
@@ -1197,11 +1218,15 @@ class ImageProcessor:
                 )
 
             # Дополнительно сохраняем численные данные, чтобы можно было проверить график.
-            csv_path = os.path.join(path, f"{file_base_name}.csv")
-            with open(csv_path, 'w', encoding='utf-8') as file:
-                file.write("scale,upper_envelope_maxima_count,row_index\n")
-                for scale, count in zip(scales, max_counts):
-                    file.write(f"{scale},{int(count)},{row_index}\n")
+            if save_csv:
+                csv_path = os.path.join(path, f"{file_base_name}.csv")
+                with open(csv_path, 'w', encoding='utf-8') as file:
+                    file.write("scale,upper_envelope_maxima_count,row_index\n")
+                    for scale, count in zip(scales, max_counts):
+                        file.write(f"{scale},{int(count)},{row_index}\n")
+
+            if not save_png:
+                return None, csv_path
 
             x = np.arange(len(scales))
 
@@ -1317,7 +1342,9 @@ class ImageProcessor:
             block_ranges,
             row_index,
             block_size,
-            channel_name=None
+            channel_name=None,
+            save_png=True,
+            save_csv=True
     ):
         """
         Сохраняет сжатую гистограмму по блокам масштабов.
@@ -1333,6 +1360,8 @@ class ImageProcessor:
         csv_path = None
 
         try:
+            if not save_png and not save_csv:
+                return None, None
             if block_labels is None or len(block_labels) == 0:
                 print(f"Нет данных для построения сжатой гистограммы: {file_base_name}")
                 return None, None
@@ -1347,20 +1376,24 @@ class ImageProcessor:
                     f"{len(block_labels)} != {len(block_counts)}"
                 )
 
-            csv_path = os.path.join(path, f"{file_base_name}.csv")
-            with open(csv_path, 'w', encoding='utf-8') as file:
-                file.write(
-                    "block_label,block_start_scale,block_end_scale,"
-                    "scales_in_block,upper_envelope_maxima_sum,row_index,block_size\n"
-                )
-
-                for label, count, block_range in zip(block_labels, block_counts, block_ranges):
-                    scale_start, scale_end, block_scales = block_range
-                    scales_as_text = "|".join(str(s) for s in block_scales)
+            if save_csv:
+                csv_path = os.path.join(path, f"{file_base_name}.csv")
+                with open(csv_path, 'w', encoding='utf-8') as file:
                     file.write(
-                        f"{label},{scale_start},{scale_end},"
-                        f"{scales_as_text},{int(count)},{row_index},{block_size}\n"
+                        "block_label,block_start_scale,block_end_scale,"
+                        "scales_in_block,upper_envelope_maxima_sum,row_index,block_size\n"
                     )
+                    for label, count, block_range in zip(
+                            block_labels, block_counts, block_ranges):
+                        scale_start, scale_end, block_scales = block_range
+                        scales_as_text = "|".join(str(s) for s in block_scales)
+                        file.write(
+                            f"{label},{scale_start},{scale_end},"
+                            f"{scales_as_text},{int(count)},{row_index},{block_size}\n"
+                        )
+
+            if not save_png:
+                return None, csv_path
 
             x = np.arange(len(block_labels))
 
@@ -1610,7 +1643,10 @@ class ImageProcessor:
             block_size=5,
             tolerance=1,
             metric_name="jaccard",
-            channel_name=None
+            channel_name=None,
+            save_heatmap=True,
+            save_matrix_csv=True,
+            save_pairs_csv=True
     ):
         """
         Рассчитывает межстрочную синхронизацию максимумов верхней огибающей.
@@ -1691,32 +1727,28 @@ class ImageProcessor:
                     f"{title}_block_{safe_block_label}_size_{block_size}_{metric_name}"
                 )
 
-                heatmap_path = self.save_row_sync_heatmap(
-                    path,
-                    file_base_name,
-                    sync_matrix,
-                    rows_to_analyze,
-                    metric_name,
-                    block_label,
-                    channel_name=channel_name
-                )
+                heatmap_path = None
+                if save_heatmap:
+                    heatmap_path = self.save_row_sync_heatmap(
+                        path, file_base_name, sync_matrix, rows_to_analyze,
+                        metric_name, block_label, channel_name=channel_name
+                    )
 
-                matrix_csv_path = self.save_row_sync_matrix_csv(
-                    path,
-                    file_base_name,
-                    sync_matrix,
-                    rows_to_analyze
-                )
+                matrix_csv_path = None
+                if save_matrix_csv:
+                    matrix_csv_path = self.save_row_sync_matrix_csv(
+                        path, file_base_name, sync_matrix, rows_to_analyze
+                    )
 
-                pairs_csv_path = self.save_row_sync_pair_metrics_csv(
-                    path,
-                    file_base_name,
-                    pair_rows
-                )
+                pairs_csv_path = None
+                if save_pairs_csv:
+                    pairs_csv_path = self.save_row_sync_pair_metrics_csv(
+                        path, file_base_name, pair_rows
+                    )
 
                 if heatmap_path:
                     self.progress.log_info(f"Heatmap межстрочной синхронизации сохранён: {heatmap_path}")
-                else:
+                elif save_heatmap:
                     self.progress.log_error(
                         f"Не удалось сохранить heatmap межстрочной синхронизации: {file_base_name}"
                     )
@@ -1851,33 +1883,6 @@ class App(TkinterApp):
         # инициализация всех атрибутов UI
         self._initialize_ui_variables()
 
-        self.app_header = ctk.CTkFrame(self, fg_color="transparent")
-        self.app_header.pack(
-            fill="x",
-            padx=AppTheme.WINDOW_PADDING,
-            pady=(AppTheme.WINDOW_PADDING, 2)
-        )
-        ctk.CTkLabel(
-            self.app_header,
-            text="Wavelet Analysis",
-            font=AppTheme.page_title_font(),
-            anchor="w"
-        ).pack(side="left")
-        ctk.CTkLabel(
-            self.app_header,
-            text="Анализ изображений и одномерных сигналов",
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w"
-        ).pack(side="left", padx=(12, 0), pady=(4, 0))
-        ctk.CTkButton(
-            self.app_header,
-            text="ML — следующий этап",
-            state="disabled",
-            width=150,
-            height=AppTheme.SMALL_BUTTON_HEIGHT
-        ).pack(side="right")
-
         # создаем главный контейнер с тремя панелями
         self.main_container = ctk.CTkFrame(self)
         self.main_container.pack(
@@ -1922,7 +1927,11 @@ class App(TkinterApp):
                 self.wp_var1, self.wp_var2, self.p_ex_var1, self.p_ex_var2,
                 self.knn_bool_text_var, self.knn_bool_image_var,
                 self.print_channels_txt_var, self.orientations_var,
-                self.morlet_omega0_var, self.morlet_anisotropy_var):
+                self.morlet_omega0_var, self.morlet_anisotropy_var,
+                self.calculate_statistics_var, self.statistics_image_var,
+                self.statistics_csv_var, self.calculate_sync_var,
+                self.sync_heatmap_var, self.sync_matrix_csv_var,
+                self.sync_pairs_csv_var):
             variable.trace_add('write', self._store_settings_for_current_task)
 
         # Переменная для GPU/CPU переключения
@@ -2035,6 +2044,13 @@ class App(TkinterApp):
         self.knn_bool_text_var = tk.BooleanVar(value=False)
         self.knn_bool_image_var = tk.BooleanVar(value=False)
         self.print_channels_txt_var = tk.BooleanVar(value=False)
+        self.calculate_statistics_var = tk.BooleanVar(value=True)
+        self.statistics_image_var = tk.BooleanVar(value=True)
+        self.statistics_csv_var = tk.BooleanVar(value=True)
+        self.calculate_sync_var = tk.BooleanVar(value=True)
+        self.sync_heatmap_var = tk.BooleanVar(value=True)
+        self.sync_matrix_csv_var = tk.BooleanVar(value=True)
+        self.sync_pairs_csv_var = tk.BooleanVar(value=True)
 
         self.data = tk.StringVar()
         self.knn_text_var = tk.StringVar(value="0")
@@ -2045,8 +2061,6 @@ class App(TkinterApp):
         # Widget references
         self.load_button = None
         self.print_load_image = None
-        self.image_preview_label = None
-        self.preview_ctk_image = None
         self.pipette_button = None
         self.gram_shmidt_button = None
         self.entry_start = None
@@ -2065,6 +2079,11 @@ class App(TkinterApp):
         self.analysis_mode_description = None
         self.two_d_section = None
         self.extremes_hint_label = None
+        self.statistics_section = None
+        self.calculate_statistics_switch = None
+        self.calculate_sync_switch = None
+        self.statistics_output_widgets = []
+        self.synchronization_output_widgets = []
 
     def _create_tasks_panel(self):
         """Создание панели управления задачами"""
@@ -2284,8 +2303,11 @@ class App(TkinterApp):
             self.extremes_section.pack(fill="x", padx=5, pady=2)
             self.two_d_section.pack_forget()
             self.knn_section.pack(fill="x", padx=5, pady=2, before=self.intermediate_section)
-            self.output_extremes_section.pack(
+            self.statistics_section.pack(
                 fill="x", padx=5, pady=2, before=self.knn_section
+            )
+            self.output_extremes_section.pack(
+                fill="x", padx=5, pady=2, before=self.statistics_section
             )
             self.app_start_button.configure(
                 text="Запустить",
@@ -2312,9 +2334,13 @@ class App(TkinterApp):
             self.two_d_section.pack_forget()
             if not self.knn_section.winfo_manager():
                 self.knn_section.pack(fill="x", padx=5, pady=2, before=self.intermediate_section)
+            if not self.statistics_section.winfo_manager():
+                self.statistics_section.pack(
+                    fill="x", padx=5, pady=2, before=self.knn_section
+                )
             if not self.output_extremes_section.winfo_manager():
                 self.output_extremes_section.pack(
-                    fill="x", padx=5, pady=2, before=self.knn_section
+                    fill="x", padx=5, pady=2, before=self.statistics_section
                 )
             self.app_start_button.configure(
                 text="Запустить",
@@ -2332,6 +2358,7 @@ class App(TkinterApp):
             if not self.two_d_section.winfo_manager():
                 self.two_d_section.pack(fill="x", padx=5, pady=2)
             self.output_extremes_section.pack_forget()
+            self.statistics_section.pack_forget()
             self.knn_section.pack_forget()
             self.app_start_button.configure(
                 text="Недоступно: настройте параметры 2D",
@@ -2376,17 +2403,28 @@ class App(TkinterApp):
                                                         title="Вывод точек экстремумов")
         self.output_extremes_section.pack(fill="x", padx=5, pady=2)
         self._setup_output_extremes_section()
+        self.output_extremes_section.toggle()
+
+        self.statistics_section = CollapsibleFrame(
+            scrollable_panel.scrollable_frame,
+            title="Статистики и синхронизации"
+        )
+        self.statistics_section.pack(fill="x", padx=5, pady=2)
+        self._setup_statistics_section()
+        self.statistics_section.toggle()
 
         # Секция K-ближайших соседей
         self.knn_section = CollapsibleFrame(scrollable_panel.scrollable_frame, title="K-ближайшие соседи")
         self.knn_section.pack(fill="x", padx=5, pady=2)
         self._setup_knn_section()
+        self.knn_section.toggle()
 
         # Секция промежуточных вычислений
         self.intermediate_section = CollapsibleFrame(scrollable_panel.scrollable_frame,
                                                      title="Промежуточные вычисления")
         self.intermediate_section.pack(fill="x", padx=5, pady=2)
         self._setup_intermediate_section()
+        self.intermediate_section.toggle()
 
         # Кнопка вычислений
         self.compute_section = ctk.CTkFrame(scrollable_panel.scrollable_frame, fg_color="transparent")
@@ -2503,16 +2541,6 @@ class App(TkinterApp):
         )
         self.load_section.add_widget(self.print_load_image, pady=(0, 5))
 
-        self.image_preview_label = ctk.CTkLabel(
-            self.load_section.content,
-            text="Предварительный просмотр появится после загрузки",
-            height=AppTheme.PREVIEW_HEIGHT,
-            fg_color=AppTheme.PREVIEW_BACKGROUND,
-            text_color=AppTheme.MUTED,
-            corner_radius=8,
-            font=AppTheme.caption_font()
-        )
-        self.load_section.add_widget(self.image_preview_label, pady=(4, 4))
 
     def _setup_channel_section(self):
         """Настройка секции работы с каналами"""
@@ -2854,19 +2882,16 @@ class App(TkinterApp):
         )
         scales_label.pack(side="left", fill="x", expand=True)
 
-        # Третья строка информации
-        row3_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
-        row3_frame.pack(fill="x", pady=2)
-
-        # Информация о настройках обработки
-        processing_info = self._get_processing_info(task)
-        processing_label = ctk.CTkLabel(
-            row3_frame,
-            text=f"{processing_info}",
-            font=AppTheme.body_font(),
-            anchor="w"
-        )
-        processing_label.pack(side="left", fill="x", expand=True)
+        # Каждая настройка выводится отдельной строкой, чтобы текст не обрезался.
+        for line in self._get_processing_lines(task):
+            line_label = ctk.CTkLabel(
+                info_frame,
+                text=line,
+                font=AppTheme.body_font(),
+                anchor="w",
+                justify="left"
+            )
+            line_label.pack(fill="x", pady=1)
 
         # Кнопки управления задачей
         button_frame = ctk.CTkFrame(task_frame, fg_color="transparent")
@@ -2954,10 +2979,10 @@ class App(TkinterApp):
             max_scale = max(task.scales)
             return f"Масштабы: от {min_scale} до {max_scale}. Кол-во: {len(task.scales)}"
 
-    def _get_processing_info(self, task):
-        """Получить информацию о настройках обработки"""
+    def _get_processing_lines(self, task):
+        """Получить отдельные строки состояния для карточки задачи."""
         mode_name = self.ANALYSIS_MODE_NAMES[task.analysis_mode]
-        info_parts = [mode_name]
+        lines = []
 
         if task.analysis_mode == "1d":
             directions = []
@@ -2965,23 +2990,32 @@ class App(TkinterApp):
                 directions.append("строки")
             if task.process_columns:
                 directions.append("столбцы")
-            info_parts.append(
-                "Направления: " + (", ".join(directions) if directions else "не выбраны")
+            lines.append(
+                f"{mode_name}. Направления: " +
+                (", ".join(directions) if directions else "не выбраны")
             )
-            info_parts.append(f"KNN: {task.k_neighbors}")
+            lines.append(f"KNN: {task.k_neighbors} ближайших соседей")
         else:
-            info_parts.append(f"Ориентаций: {len(task.orientations)}")
+            lines.append(f"{mode_name}. Ориентаций: {len(task.orientations)}")
+            lines.append("KNN: не используется в режиме 2D")
 
-        # Информация о цветовых каналах
-        if task.color1 is not None and task.color2 is not None:
-            info_parts.append("Пипетка настроена")
+        if task.has_colors_selected():
+            color1 = [int(value) for value in task.color1[:3]]
+            color2 = [int(value) for value in task.color2[:3]]
+            lines.append("Пипетка: настроена")
+            lines.append(
+                f"Цвет 1: R={color1[0]}, G={color1[1]}, B={color1[2]}"
+            )
+            lines.append(
+                f"Цвет 2: R={color2[0]}, G={color2[1]}, B={color2[2]}"
+            )
+        else:
+            lines.append("Пипетка: не настроена")
 
-            # Проверяем, применено ли преобразование Грамма-Шмидта
-            # если кнопка Грамма-Шмидта отключена, значит преобразование применено
-            if hasattr(self, 'gram_shmidt_button') and self.gram_shmidt_button.cget('state') == 'disabled':
-                info_parts.append("Грамм-Шмидт применен")
+        if task.is_gram_schmidt_applied():
+            lines.append("Преобразование Грамма-Шмидта: применено")
 
-        return " • ".join(info_parts) if info_parts else "Базовые настройки"
+        return lines
 
     def _update_ui_for_current_task(self):
         """Обновление UI в соответствии с текущей задачей"""
@@ -2999,6 +3033,27 @@ class App(TkinterApp):
             self.knn_bool_text_var.set(self.current_task.output_knn_text)
             self.knn_bool_image_var.set(self.current_task.output_knn_image)
             self.print_channels_txt_var.set(self.current_task.save_source_channels)
+            self.calculate_statistics_var.set(
+                self.current_task.calculate_statistics
+            )
+            self.statistics_image_var.set(
+                self.current_task.statistics_output_image
+            )
+            self.statistics_csv_var.set(
+                self.current_task.statistics_output_csv
+            )
+            self.calculate_sync_var.set(
+                self.current_task.calculate_synchronization
+            )
+            self.sync_heatmap_var.set(
+                self.current_task.synchronization_output_heatmap
+            )
+            self.sync_matrix_csv_var.set(
+                self.current_task.synchronization_output_matrix_csv
+            )
+            self.sync_pairs_csv_var.set(
+                self.current_task.synchronization_output_pairs_csv
+            )
             self.orientations_var.set(
                 ", ".join(f"{value:g}" for value in self.current_task.orientations)
             )
@@ -3021,8 +3076,6 @@ class App(TkinterApp):
                     hover_color=AppTheme.PRIMARY_HOVER
                 )
                 self.print_load_image.configure(text="Изображение не загружено", text_color=AppTheme.MUTED)
-
-            self._update_image_preview(self.current_task)
 
             # Проверяем наличие цветов для пипетки
             has_colors = (self.current_task.color1 is not None and
@@ -3125,44 +3178,13 @@ class App(TkinterApp):
                 state='disabled'
             )
             self.label_custom_scale.configure(text="", text_color=AppTheme.MUTED)
-            self._update_image_preview(None)
 
         self._apply_analysis_mode_ui()
+        self._update_statistics_controls_state()
         self._update_action_availability()
 
         # Всегда обновляем отображение задач для подсветки активной
         self._update_tasks_display()
-
-    def _update_image_preview(self, task):
-        """Показать уменьшенную копию исходного изображения активной задачи."""
-        if not self.image_preview_label:
-            return
-
-        if task is None or task.original_image is None:
-            self.preview_ctk_image = None
-            self.image_preview_label.configure(
-                image=None,
-                text="Предварительный просмотр появится после загрузки"
-            )
-            return
-
-        source = Image.fromarray(task.original_image)
-        max_width = 430
-        max_height = AppTheme.PREVIEW_HEIGHT
-        scale = min(max_width / source.width, max_height / source.height, 1.0)
-        preview_size = (
-            max(1, int(source.width * scale)),
-            max(1, int(source.height * scale))
-        )
-        self.preview_ctk_image = ctk.CTkImage(
-            light_image=source,
-            dark_image=source,
-            size=preview_size
-        )
-        self.image_preview_label.configure(
-            image=self.preview_ctk_image,
-            text=""
-        )
 
     def _update_action_availability(self):
         """Применить естественную последовательность обязательных шагов."""
@@ -3247,6 +3269,7 @@ class App(TkinterApp):
                       "Недоступно: включите 1D-преобразование по строкам."),
                 text_color=(AppTheme.TEXT_SECONDARY if enabled else AppTheme.WARNING)
             )
+        self._update_statistics_controls_state()
 
     # Обновляем методы загрузки изображения и работы с каналами для работы с текущей задачей
     def load_image_callback(self):
@@ -3415,6 +3438,17 @@ class App(TkinterApp):
         task.output_knn_text = bool(self.knn_bool_text_var.get())
         task.output_knn_image = bool(self.knn_bool_image_var.get())
         task.save_source_channels = bool(self.print_channels_txt_var.get())
+        task.calculate_statistics = bool(self.calculate_statistics_var.get())
+        task.statistics_output_image = bool(self.statistics_image_var.get())
+        task.statistics_output_csv = bool(self.statistics_csv_var.get())
+        task.calculate_synchronization = bool(self.calculate_sync_var.get())
+        task.synchronization_output_heatmap = bool(self.sync_heatmap_var.get())
+        task.synchronization_output_matrix_csv = bool(
+            self.sync_matrix_csv_var.get()
+        )
+        task.synchronization_output_pairs_csv = bool(
+            self.sync_pairs_csv_var.get()
+        )
 
         try:
             orientations = [
@@ -3492,6 +3526,105 @@ class App(TkinterApp):
             variable=self.p_ex_var1
         )
         self.output_extremes_section.add_widget(self.p_ex1_checkbox, fill="x")
+
+    def _setup_statistics_section(self):
+        """Настройки расчёта и сохранения статистик и синхронизаций."""
+        self.calculate_statistics_switch = ctk.CTkSwitch(
+            self.statistics_section.content,
+            text="Считать статистики экстремумов",
+            variable=self.calculate_statistics_var,
+            command=self._update_statistics_controls_state
+        )
+        self.statistics_section.add_widget(
+            self.calculate_statistics_switch, pady=(0, 6)
+        )
+
+        statistics_image = ctk.CTkCheckBox(
+            self.statistics_section.content,
+            text="Гистограммы PNG",
+            variable=self.statistics_image_var
+        )
+        self.statistics_section.add_widget(statistics_image)
+        statistics_csv = ctk.CTkCheckBox(
+            self.statistics_section.content,
+            text="Таблицы статистик CSV",
+            variable=self.statistics_csv_var
+        )
+        self.statistics_section.add_widget(statistics_csv, pady=(2, 10))
+        self.statistics_output_widgets = [statistics_image, statistics_csv]
+
+        self.calculate_sync_switch = ctk.CTkSwitch(
+            self.statistics_section.content,
+            text="Считать межстрочные синхронизации",
+            variable=self.calculate_sync_var,
+            command=self._update_statistics_controls_state
+        )
+        self.statistics_section.add_widget(
+            self.calculate_sync_switch, pady=(4, 6)
+        )
+
+        sync_heatmap = ctk.CTkCheckBox(
+            self.statistics_section.content,
+            text="Heatmap синхронизаций PNG",
+            variable=self.sync_heatmap_var
+        )
+        self.statistics_section.add_widget(sync_heatmap)
+        sync_matrix = ctk.CTkCheckBox(
+            self.statistics_section.content,
+            text="Матрица синхронизаций CSV",
+            variable=self.sync_matrix_csv_var
+        )
+        self.statistics_section.add_widget(sync_matrix)
+        sync_pairs = ctk.CTkCheckBox(
+            self.statistics_section.content,
+            text="Метрики пар строк CSV",
+            variable=self.sync_pairs_csv_var
+        )
+        self.statistics_section.add_widget(sync_pairs)
+        self.synchronization_output_widgets = [
+            sync_heatmap, sync_matrix, sync_pairs
+        ]
+
+        ctk.CTkLabel(
+            self.statistics_section.content,
+            text=("Синхронизации используют максимумы верхней огибающей "
+                  "построчного 1D-преобразования."),
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w",
+            justify="left",
+            wraplength=400
+        ).pack(fill="x", padx=5, pady=(8, 0))
+        self._update_statistics_controls_state()
+
+    def _update_statistics_controls_state(self):
+        """Блокировать форматы вывода, когда соответствующий расчёт отключён."""
+        task = getattr(self, "current_task", None)
+        row_analysis_available = bool(
+            task is not None
+            and task.analysis_mode == "1d"
+            and task.process_rows
+        )
+        switch_state = "normal" if row_analysis_available else "disabled"
+        if self.calculate_statistics_switch is not None:
+            self.calculate_statistics_switch.configure(state=switch_state)
+        if self.calculate_sync_switch is not None:
+            self.calculate_sync_switch.configure(state=switch_state)
+
+        statistics_state = (
+            "normal"
+            if row_analysis_available and self.calculate_statistics_var.get()
+            else "disabled"
+        )
+        sync_state = (
+            "normal"
+            if row_analysis_available and self.calculate_sync_var.get()
+            else "disabled"
+        )
+        for widget in self.statistics_output_widgets:
+            widget.configure(state=statistics_state)
+        for widget in self.synchronization_output_widgets:
+            widget.configure(state=sync_state)
 
     def _setup_knn_section(self):
         """Настройка секции K-ближайших соседей"""

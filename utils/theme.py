@@ -27,7 +27,6 @@ class AppTheme:
     MUTED = "gray"
     GPU_AVAILABLE = "#69b47c"
     MODE_2D = "#6a5330"
-    PREVIEW_BACKGROUND = ("#e7e9ec", "#202226")
 
     # Размеры и интервалы
     WINDOW_PADDING = 8
@@ -39,7 +38,6 @@ class AppTheme:
     COMPACT_CONTROL_HEIGHT = 26
     BADGE_HEIGHT = 20
     PRIMARY_BUTTON_HEIGHT = 46
-    PREVIEW_HEIGHT = 170
     LOG_EXPANDED_HEIGHT = 120
 
     @staticmethod

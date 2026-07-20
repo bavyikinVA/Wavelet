@@ -18,6 +18,7 @@ class ProcessingTask:
         self.data_copy = []  # копия данных для сравнения
         self.color1 = None
         self.color2 = None
+        self.gram_schmidt_applied = False
         self.scales = np.array([])
         self.num_scale = 0
 
@@ -40,6 +41,19 @@ class ProcessingTask:
         self.output_knn_text = False
         self.output_knn_image = False
         self.save_source_channels = False
+
+        # Статистики экстремумов и межстрочная синхронизация
+        self.calculate_statistics = True
+        self.statistics_output_image = True
+        self.statistics_output_csv = True
+        self.calculate_synchronization = True
+        self.synchronization_output_heatmap = True
+        self.synchronization_output_matrix_csv = True
+        self.synchronization_output_pairs_csv = True
+        self.scale_block_sizes = [5]
+        self.row_sync_stride = 1
+        self.row_sync_tolerance = 1
+        self.row_sync_metrics = ["jaccard"]
 
         self.k_neighbors = 5
         self.task_folder_path = ""
@@ -64,6 +78,8 @@ class ProcessingTask:
             'process_rows': self.process_rows,
             'process_columns': self.process_columns,
             'orientations': self.orientations.copy(),
+            'calculate_statistics': self.calculate_statistics,
+            'calculate_synchronization': self.calculate_synchronization,
             'colors_selected': has_colors,
         }
 
@@ -88,9 +104,4 @@ class ProcessingTask:
 
     def is_gram_schmidt_applied(self):
         """Проверка, применено ли преобразование Грамма-Шмидта"""
-        if not self.data or not self.data_copy:
-            return False
-        if len(self.data) != len(self.data_copy):
-            return False
-        return any(not np.array_equal(self.data[i], self.data_copy[i])
-                   for i in range(len(self.data)))
+        return bool(self.gram_schmidt_applied)
