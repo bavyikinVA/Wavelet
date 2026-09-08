@@ -2,6 +2,7 @@ import tkinter as tk
 import customtkinter as ctk
 from typing import Optional, Callable
 from utils.theme import AppTheme
+from utils.animation import animate_visibility
 
 
 class TkinterApp(ctk.CTk):
@@ -11,6 +12,13 @@ class TkinterApp(ctk.CTk):
         self._pending_callbacks = {}  # Словарь активных after callbacks
         self._child_windows = []  # Список дочерних окон
         self.protocol("WM_DELETE_WINDOW", self.safe_destroy)
+        self._buffered_paint = False
+        self.bind('<Map>', self._enable_buffered_paint, add='+')
+
+    def _enable_buffered_paint(self, event):
+        if event.widget is self and not self._buffered_paint:
+            from utils.rendering import enable_buffered_paint
+            self._buffered_paint = enable_buffered_paint(self)
 
     def register_child_window(self, window):
         """Регистрация дочернего окна для безопасного закрытия"""
@@ -271,10 +279,11 @@ class CollapsibleFrame(ctk.CTkFrame):
 
         if self.is_expanded:
             self.toggle_btn.configure(text=f"▼ {self.title}")
-            self.content.pack(fill="x", padx=10, pady=(5, 10))
         else:
             self.toggle_btn.configure(text=f"▶ {self.title}")
-            self.content.pack_forget()
+        animate_visibility(self.content, self.is_expanded,
+                           lambda: self.content.pack(fill='x', padx=10, pady=(5, 10)),
+                           self.content.pack_forget)
 
     def add_widget(self, widget, **pack_args):
         """Добавить виджет в контентную область"""

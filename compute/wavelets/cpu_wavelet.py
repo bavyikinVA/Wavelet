@@ -28,16 +28,9 @@ def morlet_wavelet_single_scale_with_padding(data, scale, j, pad_width):
     data_len = len(data)
 
     for k in range(-pad_width, data_len + pad_width):
-        # определяем индекс с учетом симметричного отражения
-        if k < 0:
-            # отражение слева
-            actual_k = -k - 1
-        elif k >= data_len:
-            # отражение справа
-            actual_k = 2 * data_len - k - 1
-        else:
-            # внутренняя часть
-            actual_k = k
+        # Symmetric padding repeats edge samples, even beyond one reflection.
+        reflected = k % (2 * data_len)
+        actual_k = reflected if reflected < data_len else 2 * data_len - 1 - reflected
 
         t = (k - j) / scale
         w0 += data[actual_k] * 0.75 * np.exp(-(t * t) / 2) * np.cos(2 * np.pi * t)
@@ -47,12 +40,16 @@ def morlet_wavelet_single_scale_with_padding(data, scale, j, pad_width):
 
 @jit(nopython=True, parallel=True)
 def morlet_wavelet_with_padding(data, scales):
-    max_scale = max(scales)
-    pad_width = int(7 * max_scale) // 2 + 1
-
+    if len(data) == 0 or len(scales) == 0:
+        raise ValueError("Сигнал и список масштабов не должны быть пустыми")
+    for scale in scales:
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError("Все масштабы должны быть конечными числами больше нуля")
     coef = np.zeros((len(scales), len(data)))
 
     for i in prange(len(scales)):
+        # Each scale has the same support on CPU and GPU, independent of peers.
+        pad_width = int(7 * scales[i]) // 2 + 1
         for j in range(len(data)):
             coef[i, j] = morlet_wavelet_single_scale_with_padding(
                 data, scales[i], j, pad_width

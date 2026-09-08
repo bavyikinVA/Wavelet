@@ -21,11 +21,11 @@ def morlet_kernel_2d(
     пространстве. Из осциллирующей части вычитается поправка
     ``exp(-omega0**2 / 2)``, обеспечивающая практически нулевое среднее.
     """
-    if scale <= 0:
+    if not np.isfinite(scale) or scale <= 0:
         raise ValueError("Масштаб должен быть положительным")
-    if omega0 <= 0:
+    if not np.isfinite(omega0) or omega0 <= 0:
         raise ValueError("Центральная частота должна быть положительной")
-    if anisotropy <= 0:
+    if not np.isfinite(anisotropy) or anisotropy <= 0:
         raise ValueError("Анизотропность должна быть положительной")
 
     radius = max(2, int(math.ceil(truncate * scale * max(1.0, anisotropy))))

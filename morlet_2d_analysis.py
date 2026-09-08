@@ -23,9 +23,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -662,26 +661,6 @@ def create_run_directory(config: AnalysisConfig) -> Path:
     return run_directory
 
 
-def save_metadata(
-    config: AnalysisConfig,
-    image_shape: Sequence[int],
-    run_directory: Path,
-) -> None:
-    """Сохраняет параметры, необходимые для повторения расчёта."""
-
-    metadata = asdict(config)
-    metadata["image_path"] = str(config.image_path)
-    metadata["output_root"] = str(config.output_root)
-    metadata["image_shape"] = list(image_shape)
-    metadata["created_at"] = datetime.now().isoformat(timespec="seconds")
-    metadata["scale_wavelength_note"] = (
-        "Приближённая длина волны в пикселях: 2*pi*scale/omega0"
-    )
-
-    with (run_directory / "metadata.json").open("w", encoding="utf-8") as file:
-        json.dump(metadata, file, ensure_ascii=False, indent=2)
-
-
 # -----------------------------------------------------------------------------
 # Полный сценарий анализа
 # -----------------------------------------------------------------------------
@@ -788,7 +767,6 @@ def main() -> None:
     image_bgr = read_image_unicode(config.image_path)
     channels = select_channels(image_bgr, config.channel)
     run_directory = create_run_directory(config)
-    save_metadata(config, image_bgr.shape, run_directory)
 
     print("Двумерный анализ Морле запущен")
     print(f"Изображение: {config.image_path}")

@@ -159,6 +159,7 @@ def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image
     total_extreme_types = len(extreme_types)
     processed_types = 0
 
+    results = {}
     for extreme_type in extreme_types:
         processed_types += 1
         points = np.array(extreme_dict[extreme_type])
@@ -185,6 +186,10 @@ def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image
             points,
             neighbors_dict,
             image_coords=True)
+        results[extreme_type] = {
+            "points": points,
+            "neighbors": neighbors_with_angles,
+        }
 
         graph_filename = f"KNN_{type_names[type_data]}_Graph_Scale_{scale}_Channel_{color_names[channel]}_{extreme_type}.png"
         info_filename = f"KNN_{type_names[type_data]}_Info_Scale_{scale}_Channel_{color_names[channel]}_{extreme_type}.txt"
@@ -205,6 +210,7 @@ def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image
 
     if log_callback:
         log_callback(f"Завершена обработка KNN для масштаба {scale}")
+    return results
 
 
 def compute_angles_for_neighbors(points: np.ndarray, neighbors_dict: dict, image_coords: bool = True):
@@ -324,6 +330,8 @@ def draw_knn_graph(points, neighbors_dict, scale, channel, extreme_type, filenam
             progress_callback(0.9, "Сохранение...")
 
         fig.savefig(filename, dpi=180, bbox_inches='tight')
+        save_knn_info(os.path.splitext(filename)[0] + '.txt', points, neighbors_dict,
+                      scale, channel, extreme_type, k, log_callback=log_callback)
         plt.close(fig)
 
         if log_callback:

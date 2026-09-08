@@ -1,17 +1,40 @@
 import numpy as np
 
 
+# Numerical independence threshold: sin(angle), invariant to RGB brightness.
+MIN_COLOR_SINE = 1e-6
+
+
+def _unit_color(value):
+    try:
+        color = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Цвет должен содержать три числовых RGB-компонента") from error
+    if color.shape != (3,) or not np.isfinite(color).all():
+        raise ValueError("Цвет должен содержать три конечных RGB-компонента")
+    magnitude = np.max(np.abs(color))
+    if magnitude == 0:
+        raise ValueError("Черный цвет не задает направление. Выберите ненулевой цвет")
+    # Scaling first avoids overflow/underflow in the norm.
+    scaled = color / magnitude
+    return scaled / np.linalg.norm(scaled)
+
+
 def change_channels(v1, v2, data):
     def gram_schmidt(v1_, v2_):
-        v1_ = np.array(v1_, dtype=np.float64)
-        v2_ = np.array(v2_, dtype=np.float64)
-
-        v1_normalize = v1_ / np.linalg.norm(v1_)
+        v1_normalize = _unit_color(v1_)
+        v2_ = _unit_color(v2_)
 
         v2_proj = np.dot(v2_, v1_normalize) * v1_normalize
         v2_orth = v2_ - v2_proj
 
-        v2_orth_normalize = v2_orth / np.linalg.norm(v2_orth)
+        sine = np.linalg.norm(v2_orth)
+        if sine <= MIN_COLOR_SINE:
+            raise ValueError(
+                "Выбранные цвета совпадают или слишком близки по направлению. "
+                "Выберите другой цветовой оттенок, а не только другую яркость"
+            )
+        v2_orth_normalize = v2_orth / sine
 
         return v1_normalize, v2_orth_normalize
 
@@ -28,7 +51,6 @@ def change_channels(v1, v2, data):
 
     # Transformation matrix
     p = np.array([v1_norm, v2_orth_norm, v3_norm]).T
-    print(p)
     # Transform image data
     data_transposed = np.transpose(data, (2, 0, 1))
     data_new = p @ data_transposed

@@ -1,6 +1,7 @@
 import numpy as np
 import logging
 import cupy as cp
+from compute.validation import validate_scales
 
 logger = logging.getLogger(__name__)
 
@@ -25,13 +26,12 @@ class CupyWaveletGPU:
             float sqrt_scale = sqrtf(scale);
 
             for (int k = -pad_width; k < data_len + pad_width; k++) {
-                int actual_k = k;
-                // Symmetric reflection
-                if (k < 0) {
-                    actual_k = -k - 1;
-                } else if (k >= data_len) {
-                    actual_k = 2 * data_len - k - 1;
-                }
+                // C++ remainder can be negative; normalize before reflecting.
+                int period = 2 * data_len;
+                int reflected = k % period;
+                if (reflected < 0) reflected += period;
+                int actual_k = reflected < data_len
+                    ? reflected : period - 1 - reflected;
 
                 float t = (k - j) * inv_scale;
                 float exp_val = expf(-(t * t) * 0.5f);
@@ -44,8 +44,12 @@ class CupyWaveletGPU:
         ''', 'morlet_single_scale')
 
     def compute_batch_signals(self, data_batch: np.ndarray, scales: np.ndarray) -> np.ndarray:
+        scales = validate_scales(scales)
+        if data_batch.ndim != 2 or 0 in data_batch.shape:
+            raise ValueError("Ожидается непустая матрица сигналов")
         data_batch = data_batch.astype(np.float32)
         scales = scales.astype(np.float32)
+        validate_scales(scales)
 
         num_signals, signal_length = data_batch.shape
         num_scales = len(scales)

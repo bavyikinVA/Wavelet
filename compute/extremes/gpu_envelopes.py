@@ -96,8 +96,8 @@ class GPUEnvelopeProcessor:
         # 1. Создаем равномерную сетку для всех строк
         t = cp.arange(cols, dtype=cp.float32)
 
-        # 2. Инициализируем результат исходными значениями
-        result = batch_coefs.copy()
+        # Missing support is undefined; never substitute the original signal.
+        result = cp.full(batch_coefs.shape, cp.nan, dtype=cp.float32)
 
         # 3. Для каждой строки в batch выполняем интерполяцию
         for i in range(batch_size):
@@ -106,7 +106,7 @@ class GPUEnvelopeProcessor:
 
             # Проверяем, достаточно ли точек для интерполяции
             valid_points = cp.sum(row_mask)
-            if valid_points >= 4:
+            if valid_points >= 1:
                 # Получаем координаты и значения
                 points_idx = cp.where(row_mask)[0]
                 values = batch_coefs[i, points_idx]
@@ -239,8 +239,8 @@ class GPUEnvelopeProcessor:
         # 1. Создаем равномерную сетку для всех столбцов (теперь это строки)
         t = cp.arange(rows, dtype=cp.float32)
 
-        # 2. Инициализируем результат исходными значениями
-        result = batch_coefs.copy()
+        # One point is constant; two or more define a linear interpolant.
+        result = cp.full(batch_coefs.shape, cp.nan, dtype=cp.float32)
 
         # 3. Для каждого столбца в batch выполняем интерполяцию
         for i in range(batch_size):
@@ -249,7 +249,7 @@ class GPUEnvelopeProcessor:
 
             # Проверяем, достаточно ли точек для интерполяции
             valid_points = cp.sum(col_mask)
-            if valid_points >= 4:
+            if valid_points >= 1:
                 # Получаем координаты и значения
                 points_idx = cp.where(col_mask)[0]
                 values = batch_coefs[i, points_idx]

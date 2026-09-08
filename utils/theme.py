@@ -27,6 +27,14 @@ class AppTheme:
     MUTED = "gray"
     GPU_AVAILABLE = "#69b47c"
     MODE_2D = "#6a5330"
+    # Навигация намеренно ахроматическая: глобальная синяя тема CTk не должна
+    # окрашивать заголовки рабочих вкладок.
+    NAV_BACKGROUND = "#242424"
+    NAV_SELECTED_BACKGROUND = "#2b2b2b"
+    NAV_ACTIVE = "#9b9b9b"
+    NAV_HOVER = "#303030"
+    NAV_TEXT_ACTIVE = "#f2f2f2"
+    NAV_TEXT_INACTIVE = "#a9a9a9"
 
     # Размеры и интервалы
     WINDOW_PADDING = 8
@@ -38,6 +46,10 @@ class AppTheme:
     COMPACT_CONTROL_HEIGHT = 26
     BADGE_HEIGHT = 20
     PRIMARY_BUTTON_HEIGHT = 46
+    NAV_HEIGHT = 50
+    ACTION_BUTTON_WIDTH = 230
+    SIDEBAR_WIDTH = 420
+    DROPDOWN_WIDTH = 320
     LOG_EXPANDED_HEIGHT = 120
 
     @staticmethod

@@ -1,11 +1,11 @@
-import cupy as cp
-
 class ExtremesFinder:
     @staticmethod
     def find_extremes_gpu(coefs_gpu, row_var, col_var, max_var, min_var):
         """
         GPU версия поиска экстремумов
         """
+        import cupy as cp
+
         if not isinstance(coefs_gpu, cp.ndarray):
             coefs_gpu = cp.asarray(coefs_gpu, dtype=cp.float32)
 
