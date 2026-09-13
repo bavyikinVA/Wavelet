@@ -131,24 +131,24 @@ class ProcessingTask:
         self.calculate_extrema = False
         self.calculate_envelopes = False
         self.calculate_knn = False
-        self.output_wavelet_image = True
-        self.output_wavelet_text = False
+        self.output_wavelet_image = False
+        self.output_wavelet_text = True
         self.output_wavelet_numpy = False
-        self.output_extremes_text = False
+        self.output_extremes_text = True
         self.output_extremes_image = False
-        self.output_envelopes_text = False
-        self.output_envelopes_image = True
-        self.output_knn_text = False
+        self.output_envelopes_text = True
+        self.output_envelopes_image = False
+        self.output_knn_text = True
         self.output_knn_image = False
         self.save_source_channels = False
         self.save_centering_means = False
 
         # Статистики экстремумов и межстрочная синхронизация
         self.calculate_statistics = False
-        self.statistics_output_image = True
+        self.statistics_output_image = False
         self.statistics_output_csv = True
         self.calculate_synchronization = False
-        self.synchronization_output_heatmap = True
+        self.synchronization_output_heatmap = False
         self.synchronization_output_matrix_csv = True
         self.synchronization_output_pairs_csv = True
         self.scale_block_sizes = [5]

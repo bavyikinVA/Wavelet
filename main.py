@@ -2312,22 +2312,22 @@ class App(TkinterApp):
         self.col_var = tk.BooleanVar(value=True)
         self.max_var = tk.BooleanVar(value=True)
         self.min_var = tk.BooleanVar(value=True)
-        self.wp_var1 = tk.BooleanVar(value=True)
-        self.wp_var2 = tk.BooleanVar(value=False)
+        self.wp_var1 = tk.BooleanVar(value=False)
+        self.wp_var2 = tk.BooleanVar(value=True)
         self.wavelet_numpy_var = tk.BooleanVar(value=False)
-        self.p_ex_var1 = tk.BooleanVar(value=False)
+        self.p_ex_var1 = tk.BooleanVar(value=True)
         self.p_ex_var2 = tk.BooleanVar(value=False)
-        self.envelope_text_var = tk.BooleanVar(value=False)
-        self.envelope_image_var = tk.BooleanVar(value=True)
-        self.knn_bool_text_var = tk.BooleanVar(value=False)
+        self.envelope_text_var = tk.BooleanVar(value=True)
+        self.envelope_image_var = tk.BooleanVar(value=False)
+        self.knn_bool_text_var = tk.BooleanVar(value=True)
         self.knn_bool_image_var = tk.BooleanVar(value=False)
         self.print_channels_txt_var = tk.BooleanVar(value=False)
         self.centering_means_var = tk.BooleanVar(value=False)
         self.calculate_statistics_var = tk.BooleanVar(value=False)
-        self.statistics_image_var = tk.BooleanVar(value=True)
+        self.statistics_image_var = tk.BooleanVar(value=False)
         self.statistics_csv_var = tk.BooleanVar(value=True)
         self.calculate_sync_var = tk.BooleanVar(value=False)
-        self.sync_heatmap_var = tk.BooleanVar(value=True)
+        self.sync_heatmap_var = tk.BooleanVar(value=False)
         self.sync_matrix_csv_var = tk.BooleanVar(value=True)
         self.sync_pairs_csv_var = tk.BooleanVar(value=True)
         self.scale_block_sizes_var = tk.StringVar(value="5")
@@ -2459,7 +2459,7 @@ class App(TkinterApp):
         yield "Подготовка навигации и загрузки данных…"
         self.workspace_tabs = WorkspaceTabs(
             self.workspace_frame,
-            ("Данные", "Анализ", "Настройка вывода", "Результаты", "ML", "Предыдущие запуски"),
+            ("Данные", "Параметры расчёта", "Результаты", "ML", "Предыдущие запуски"),
             navigation_master=self.layout_controls,
         )
         self.workspace_tabs.grid(
@@ -2471,14 +2471,8 @@ class App(TkinterApp):
         )
         yield "Подготовка параметров анализа…"
         self.analysis_panel = self._create_analysis_tab(
-            self.workspace_tabs.tab("Анализ")
+            self.workspace_tabs.tab("Параметры расчёта")
         )
-        yield "Подготовка настроек расчёта…"
-        self.right_panel = self._create_right_panel(
-            parent=self.workspace_tabs.tab("Настройка вывода"),
-            include_compute=True
-        )
-        self.right_panel.pack(fill="both", expand=True)
         self.workspace_tabs.on_select = self._ensure_workspace_tab
         self.workspace_tabs.set("Данные")
 
@@ -2828,8 +2822,8 @@ class App(TkinterApp):
         self._setup_channel_section()
         self.data_next_button = ctk.CTkButton(
             content,
-            text="Далее: параметры анализа",
-            command=lambda: self.workspace_tabs.set("Анализ"),
+            text="Далее: параметры расчёта",
+            command=lambda: self.workspace_tabs.set("Параметры расчёта"),
             width=AppTheme.ACTION_BUTTON_WIDTH,
             height=AppTheme.BUTTON_HEIGHT,
             state="disabled"
@@ -2838,15 +2832,18 @@ class App(TkinterApp):
         return panel
 
     def _create_analysis_tab(self, parent):
+        """Единая страница параметров расчёта и экспорта результатов."""
         panel = ctk.CTkFrame(parent, fg_color="transparent")
         panel.pack(fill="both", expand=True)
         scrollable = ScrollableFrame(panel)
         scrollable.pack(fill="both", expand=True)
         content = scrollable.scrollable_frame
+        self.analysis_content = content
+
         self._add_tab_heading(
             content,
-            "Параметры анализа",
-            None
+            "Параметры расчёта",
+            "Выберите режим, этапы вычислений и форматы сохранения результатов."
         )
 
         self._setup_analysis_mode_section(content)
@@ -2859,19 +2856,59 @@ class App(TkinterApp):
         self._setup_2d_section()
 
         self.extremes_section = CollapsibleFrame(
-            content, title="Экстремумы и параметры KNN"
+            content, title="Параметры 1D-преобразования и экстремумов"
         )
         self.extremes_section.pack(fill="x", padx=5, pady=2)
         self._setup_extremes_section()
-        self.analysis_next_button = ctk.CTkButton(
-            content,
-            text="Далее: настройка вывода",
-            command=lambda: self.workspace_tabs.set("Настройка вывода"),
-            width=AppTheme.ACTION_BUTTON_WIDTH,
-            height=AppTheme.BUTTON_HEIGHT,
-            state="disabled"
+
+        self.compute_settings_section = CollapsibleFrame(
+            content, title="Вычислительное устройство"
         )
-        self.analysis_next_button.pack(anchor="e", padx=12, pady=(14, 10))
+        self.compute_settings_section.pack(fill="x", padx=5, pady=2)
+        temp_label = ctk.CTkLabel(
+            self.compute_settings_section.content,
+            text="Загрузка настроек...",
+            font=AppTheme.body_font(),
+            text_color=AppTheme.MUTED
+        )
+        temp_label.pack(pady=10)
+
+        self.pipeline_section = CollapsibleFrame(content, title="Сценарий анализа")
+        self.pipeline_section.pack(fill="x", padx=5, pady=2)
+        self._setup_pipeline_section()
+
+        self.wavelet_section = CollapsibleFrame(content, title="Экспорт: вейвлеты")
+        self.wavelet_section.pack(fill="x", padx=5, pady=2)
+        self._setup_wavelet_section()
+
+        self.output_extremes_section = CollapsibleFrame(
+            content, title="Экспорт: экстремумы и огибающие"
+        )
+        self.output_extremes_section.pack(fill="x", padx=5, pady=2)
+        self._setup_output_extremes_section()
+
+        self.knn_section = CollapsibleFrame(content, title="KNN и углы")
+        self.knn_section.pack(fill="x", padx=5, pady=2)
+        self._setup_knn_section()
+
+        self.statistics_section = CollapsibleFrame(
+            content, title="Статистики и синхронизации"
+        )
+        self.statistics_section.pack(fill="x", padx=5, pady=2)
+        self._setup_statistics_section()
+
+        self.intermediate_section = CollapsibleFrame(
+            content, title="Дополнительный экспорт"
+        )
+        self.intermediate_section.pack(fill="x", padx=5, pady=2)
+        self._setup_intermediate_section()
+
+        self.compute_section = ctk.CTkFrame(content, fg_color="transparent")
+        self.compute_section.pack(fill="x", padx=5, pady=20)
+        self._setup_compute_section()
+
+        self.analysis_next_button = None
+        self.after_idle(self._setup_compute_settings_section)
         return panel
 
     def _create_ml_tab(self, parent):
@@ -3027,7 +3064,7 @@ class App(TkinterApp):
         has_knn = bool(getattr(task, "knn_results", None))
         source_status = (
             "KNN-признаки готовы к кластеризации" if has_knn else
-            "KNN-признаки ещё не рассчитаны. На вкладке «Настройка вывода» "
+            "KNN-признаки ещё не рассчитаны. На вкладке «Параметры расчёта» "
             "выберите сценарий «Подготовка данных для ML» и запустите расчёт."
         )
         if page_created:
@@ -3454,8 +3491,9 @@ class App(TkinterApp):
         self._update_tasks_display()
 
     def _apply_analysis_mode_ui(self):
-        """Показать только настройки, корректные для режима активной задачи."""
-        if not self.current_task:
+        """Показать настройки, применимые к текущему режиму анализа."""
+        task = getattr(self, "current_task", None)
+        if task is None:
             self.analysis_mode_var.set("1D-анализ")
             self.analysis_mode_selector.set("1D-анализ")
             self.analysis_mode_selector.configure(state="disabled")
@@ -3467,96 +3505,48 @@ class App(TkinterApp):
                 text="Источник: сначала загрузите изображение",
                 text_color=AppTheme.TEXT_SECONDARY
             )
-            if not self.extremes_section.winfo_manager():
-                self.extremes_section.pack(
-                    fill="x", padx=5, pady=2,
-                    before=self.analysis_next_button
-                )
-            self.two_d_section.pack_forget()
-            self.knn_section.pack(fill="x", padx=5, pady=2, before=self.intermediate_section)
-            self.statistics_section.pack(
-                fill="x", padx=5, pady=2, before=self.knn_section
-            )
-            self.output_extremes_section.pack(
-                fill="x", padx=5, pady=2, before=self.statistics_section
-            )
-            self.app_start_button.configure(
-                text="Запустить задачу",
-                state="normal",
-                fg_color=AppTheme.PRIMARY,
-                hover_color=AppTheme.PRIMARY_HOVER
-            )
             return
 
-        mode = self.current_task.analysis_mode
+        mode = task.analysis_mode
         mode_label = self.ANALYSIS_MODE_NAMES[mode]
         self.analysis_mode_var.set(mode_label)
         self.analysis_mode_selector.set(mode_label)
-        source_loaded = bool(self.current_task.image_path)
+        source_loaded = bool(task.image_path)
         self.analysis_mode_selector.configure(
             state="normal" if source_loaded else "disabled"
         )
         self.analysis_source_label.configure(
-            text=(
-                f"Источник: {os.path.basename(self.current_task.image_path)}"
-                if source_loaded else
-                "Источник: сначала загрузите изображение"
-            ),
-            text_color=(
-                AppTheme.TEXT_ON_DARK if source_loaded
-                else AppTheme.TEXT_SECONDARY
-            )
+            text=(f"Источник: {os.path.basename(task.image_path)}"
+                  if source_loaded else "Источник: сначала загрузите изображение"),
+            text_color=(AppTheme.TEXT_ON_DARK if source_loaded
+                        else AppTheme.TEXT_SECONDARY)
         )
 
         if mode == "1d":
             self.analysis_mode_description.configure(
-                text=("Одномерное преобразование Морле по строкам и/или "
-                      "столбцам изображения."),
+                text="Одномерное преобразование Морле по строкам и/или столбцам изображения.",
                 text_color=AppTheme.TEXT_SECONDARY
             )
-            if not self.extremes_section.winfo_manager():
-                self.extremes_section.pack(
-                    fill="x", padx=5, pady=2,
-                    before=self.analysis_next_button
-                )
             self.two_d_section.pack_forget()
-            if not self.knn_section.winfo_manager():
-                self.knn_section.pack(fill="x", padx=5, pady=2, before=self.intermediate_section)
-            if not self.statistics_section.winfo_manager():
-                self.statistics_section.pack(
-                    fill="x", padx=5, pady=2, before=self.knn_section
-                )
-            if not self.output_extremes_section.winfo_manager():
-                self.output_extremes_section.pack(
-                    fill="x", padx=5, pady=2, before=self.statistics_section
-                )
-            self.app_start_button.configure(
-                text="Запустить задачу",
-                state="normal",
-                fg_color=AppTheme.PRIMARY,
-                hover_color=AppTheme.PRIMARY_HOVER
-            )
+            for section in (self.extremes_section, self.pipeline_section,
+                            self.output_extremes_section, self.knn_section,
+                            self.statistics_section):
+                if not section.winfo_manager():
+                    section.pack(fill="x", padx=5, pady=2, before=self.intermediate_section)
         else:
             self.analysis_mode_description.configure(
                 text=("Двумерное комплексное преобразование Морле по масштабам "
                       "и ориентациям. Результат содержит модуль и фазу."),
                 text_color=AppTheme.TEXT_SECONDARY
             )
-            self.extremes_section.pack_forget()
+            for section in (self.extremes_section, self.pipeline_section,
+                            self.output_extremes_section, self.knn_section,
+                            self.statistics_section):
+                section.pack_forget()
             if not self.two_d_section.winfo_manager():
-                self.two_d_section.pack(
-                    fill="x", padx=5, pady=2,
-                    before=self.analysis_next_button
-                )
-            self.output_extremes_section.pack_forget()
-            self.statistics_section.pack_forget()
-            self.knn_section.pack_forget()
-            self.app_start_button.configure(
-                text="Недоступно: настройте параметры 2D",
-                state="disabled",
-                fg_color=AppTheme.DISABLED_DARK,
-                hover_color=AppTheme.DISABLED_DARK
-            )
+                self.two_d_section.pack(fill="x", padx=5, pady=2, before=self.compute_settings_section)
+
+        self._update_pipeline_controls_state()
 
     def _create_right_panel(self, parent=None, include_compute=True):
         """Создание правой панели с настройками вывода"""
@@ -3831,7 +3821,7 @@ class App(TkinterApp):
 
         self.button_save_scales = ctk.CTkButton(
             button_frame,
-            text="Сохранить значения",
+            text="Применить масштабы",
             command=self.load_scales,
             height=AppTheme.BUTTON_HEIGHT
         )
@@ -3857,97 +3847,62 @@ class App(TkinterApp):
         self.scales_section.add_widget(self.label_custom_scale, pady=(5, 0))
 
     def _setup_extremes_section(self):
-        """Настройка секции точек экстремумов"""
-        # Направления поиска
-        direction_frame = ctk.CTkFrame(self.extremes_section.content, fg_color="transparent")
-        self.extremes_section.add_widget(direction_frame, pady=2)
-
-        direction_label = ctk.CTkLabel(
-            direction_frame,
-            text="Направления 1D-преобразования:",
-            font=AppTheme.body_font(),
-            anchor="w"
+        """Параметры 1D-направлений и типов экстремумов."""
+        direction_frame = ctk.CTkFrame(
+            self.extremes_section.content, fg_color="transparent"
         )
-        direction_label.pack(fill="x")
-
+        self.extremes_section.add_widget(direction_frame, pady=2)
+        ctk.CTkLabel(
+            direction_frame, text="Направления 1D-преобразования:",
+            font=AppTheme.body_font(), anchor="w"
+        ).pack(fill="x")
         directions_subframe = ctk.CTkFrame(direction_frame, fg_color="transparent")
         directions_subframe.pack(fill="x", pady=5)
-
         self.row_checkbox = ctk.CTkCheckBox(
-            directions_subframe,
-            text="По строкам",
-            variable=self.row_var
+            directions_subframe, text="По строкам", variable=self.row_var,
+            command=self._on_direction_changed
         )
         self.row_checkbox.pack(side="left", padx=(0, 10))
-
         self.col_checkbox = ctk.CTkCheckBox(
-            directions_subframe,
-            text="По столбцам",
-            variable=self.col_var
+            directions_subframe, text="По столбцам", variable=self.col_var,
+            command=self._on_direction_changed
         )
         self.col_checkbox.pack(side="left")
 
         self.extremes_hint_label = ctk.CTkLabel(
             direction_frame,
-            text="Огибающие и синхронизация рассчитываются для построчного результата.",
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w",
-            justify="left",
-            wraplength=400
+            text="Экстремумы и последующие этапы доступны для построчного результата.",
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w", justify="left", wraplength=500
         )
         self.extremes_hint_label.pack(fill="x", pady=(2, 6))
 
-        # Типы экстремумов
-        type_frame = ctk.CTkFrame(self.extremes_section.content, fg_color="transparent")
-        self.extremes_section.add_widget(type_frame, pady=2)
-
-        type_label = ctk.CTkLabel(
-            type_frame,
-            text="Типы экстремумов:",
-            font=AppTheme.body_font(),
-            anchor="w"
+        type_frame = ctk.CTkFrame(
+            self.extremes_section.content, fg_color="transparent"
         )
-        type_label.pack(fill="x")
-
+        self.extremes_section.add_widget(type_frame, pady=2)
+        ctk.CTkLabel(
+            type_frame, text="Типы экстремумов:",
+            font=AppTheme.body_font(), anchor="w"
+        ).pack(fill="x")
         types_subframe = ctk.CTkFrame(type_frame, fg_color="transparent")
         types_subframe.pack(fill="x", pady=5)
-
         self.max_checkbox = ctk.CTkCheckBox(
-            types_subframe,
-            text="Максимумы",
-            variable=self.max_var
+            types_subframe, text="Максимумы", variable=self.max_var,
+            command=self._store_settings_for_current_task
         )
         self.max_checkbox.pack(side="left", padx=(0, 10))
-
         self.min_checkbox = ctk.CTkCheckBox(
-            types_subframe,
-            text="Минимумы",
-            variable=self.min_var
+            types_subframe, text="Минимумы", variable=self.min_var,
+            command=self._store_settings_for_current_task
         )
         self.min_checkbox.pack(side="left")
 
-        # K-ближайшие соседи
-        knn_frame = ctk.CTkFrame(self.extremes_section.content, fg_color="transparent")
-        self.extremes_section.add_widget(knn_frame, pady=(10, 2))
-
-        knn_label = ctk.CTkLabel(
-            knn_frame,
-            text="Количество ближайших точек:",
-            font=AppTheme.body_font(),
-            anchor="w"
-        )
-        knn_label.pack(fill="x")
-
-        self.entry_near_point = ctk.CTkEntry(
-            knn_frame,
-            textvariable=self.knn_text_var,
-            placeholder_text="5"
-        )
-        self.entry_near_point.pack(fill="x", pady=(5, 0))
-        self.entry_near_point.bind("<Button-1>", self.on_entry_click)
-        self.entry_near_point.bind("<KeyPress>", self.on_entry_click)
-        self.entry_near_point.bind("<<Paste>>", self.on_entry_click)
+    def _on_direction_changed(self):
+        """Сразу синхронизировать направления и доступность зависимых этапов."""
+        self._store_settings_for_current_task()
+        self._update_pipeline_controls_state()
+        self._update_action_availability()
 
     def add_new_task(self):
         try:
@@ -4458,7 +4413,7 @@ class App(TkinterApp):
                 hover_color=AppTheme.DISABLED_HOVER
             )
             self.button_save_scales.configure(
-                text="Сохранить значения",
+                text="Применить масштабы",
                 fg_color=AppTheme.PRIMARY,
                 hover_color=AppTheme.PRIMARY_HOVER,
                 state='disabled'
@@ -4896,6 +4851,22 @@ class App(TkinterApp):
         )
         self.calculate_knn_switch.pack(fill="x", padx=5, pady=4)
 
+        self.calculate_statistics_switch = ctk.CTkSwitch(
+            self.pipeline_section.content,
+            text="Считать статистики экстремумов",
+            variable=self.calculate_statistics_var,
+            command=self._on_statistics_stage_changed
+        )
+        self.calculate_statistics_switch.pack(fill="x", padx=5, pady=4)
+
+        self.calculate_sync_switch = ctk.CTkSwitch(
+            self.pipeline_section.content,
+            text="Считать межстрочные синхронизации",
+            variable=self.calculate_sync_var,
+            command=self._on_statistics_stage_changed
+        )
+        self.calculate_sync_switch.pack(fill="x", padx=5, pady=4)
+
         ctk.CTkLabel(
             self.pipeline_section.content,
             text="Фактическая цепочка",
@@ -4950,7 +4921,9 @@ class App(TkinterApp):
                     self.pipeline_preset_selector,
                     self.calculate_extrema_switch,
                     self.calculate_envelopes_switch,
-                    self.calculate_knn_switch):
+                    self.calculate_knn_switch,
+                    self.calculate_statistics_switch,
+                    self.calculate_sync_switch):
                 if widget is not None:
                     widget.configure(state="disabled")
             if self.pipeline_dependency_label is not None:
@@ -4971,7 +4944,9 @@ class App(TkinterApp):
         for widget in (
                 self.calculate_extrema_switch,
                 self.calculate_envelopes_switch,
-                self.calculate_knn_switch):
+                self.calculate_knn_switch,
+                self.calculate_statistics_switch,
+                self.calculate_sync_switch):
             if widget is not None:
                 widget.configure(state=stage_state)
 
@@ -5047,7 +5022,7 @@ class App(TkinterApp):
         """Настройка секции вейвлет-преобразования"""
         info_label = ctk.CTkLabel(
             self.wavelet_section.content,
-            text="Формат вывода результатов вейвлет-преобразования:",
+            text="Вейвлет-преобразование выполняется всегда. Форматы экспорта:",
             font=AppTheme.body_font(),
             anchor="w",
             wraplength=0
@@ -5056,14 +5031,14 @@ class App(TkinterApp):
 
         self.wp1_checkbox = ctk.CTkCheckBox(
             self.wavelet_section.content,
-            text="Вывести изображением",
+            text="Изображение PNG",
             variable=self.wp_var1
         )
         self.wavelet_section.add_widget(self.wp1_checkbox, fill="x")
 
         self.wp2_checkbox = ctk.CTkCheckBox(
             self.wavelet_section.content,
-            text="Вывести текстовым файлом",
+            text="Данные TXT (рекомендуется для визуализатора)",
             variable=self.wp_var2
         )
         self.wavelet_section.add_widget(self.wp2_checkbox, fill="x")
@@ -5089,13 +5064,13 @@ class App(TkinterApp):
 
         self.p_ex2_checkbox = ctk.CTkCheckBox(
             self.output_extremes_section.content,
-            text="Вывести изображением",
+            text="Изображение PNG",
             variable=self.p_ex_var2
         )
         self.output_extremes_section.add_widget(self.p_ex2_checkbox, fill="x")
         self.p_ex1_checkbox = ctk.CTkCheckBox(
             self.output_extremes_section.content,
-            text="Вывести текстовым файлом",
+            text="Данные TXT",
             variable=self.p_ex_var1
         )
         self.output_extremes_section.add_widget(self.p_ex1_checkbox, fill="x")
@@ -5114,7 +5089,7 @@ class App(TkinterApp):
         )
         self.envelope_image_checkbox = ctk.CTkCheckBox(
             self.output_extremes_section.content,
-            text="Сохранить огибающие PNG",
+            text="Изображение PNG",
             variable=self.envelope_image_var
         )
         self.output_extremes_section.add_widget(
@@ -5122,7 +5097,7 @@ class App(TkinterApp):
         )
         self.envelope_text_checkbox = ctk.CTkCheckBox(
             self.output_extremes_section.content,
-            text="Сохранить огибающие TXT",
+            text="Данные TXT",
             variable=self.envelope_text_var
         )
         self.output_extremes_section.add_widget(
@@ -5133,144 +5108,103 @@ class App(TkinterApp):
         ]
 
     def _setup_statistics_section(self):
-        """Настройки расчёта и сохранения статистик и синхронизаций."""
-        self.calculate_statistics_switch = ctk.CTkSwitch(
-            self.statistics_section.content,
-            text="Считать статистики экстремумов",
-            variable=self.calculate_statistics_var,
-            command=self._on_statistics_stage_changed
-        )
-        self.statistics_section.add_widget(
-            self.calculate_statistics_switch, pady=(0, 6)
-        )
+        """Параметры и экспорт статистик/синхронизаций без дублирования этапов."""
+        ctk.CTkLabel(
+            self.statistics_section.content, text="Статистики экстремумов",
+            font=AppTheme.section_title_font(), anchor="w"
+        ).pack(fill="x", padx=5, pady=(0, 6))
 
         block_size_label = ctk.CTkLabel(
             self.statistics_section.content,
             text="Размеры блоков масштабов (через запятую)",
-            font=AppTheme.caption_font(),
-            anchor="w"
+            font=AppTheme.caption_font(), anchor="w"
         )
         self.statistics_section.add_widget(block_size_label, pady=(2, 2))
         self.scale_block_sizes_entry = ctk.CTkEntry(
-            self.statistics_section.content,
-            textvariable=self.scale_block_sizes_var,
+            self.statistics_section.content, textvariable=self.scale_block_sizes_var,
             placeholder_text="5"
         )
-        self.statistics_section.add_widget(
-            self.scale_block_sizes_entry, pady=(0, 6)
-        )
-        self.statistics_parameter_widgets = [
-            self.scale_block_sizes_entry
-        ]
+        self.statistics_section.add_widget(self.scale_block_sizes_entry, pady=(0, 6))
+        self.statistics_parameter_widgets = [self.scale_block_sizes_entry]
 
-        statistics_image = ctk.CTkCheckBox(
-            self.statistics_section.content,
-            text="Гистограммы PNG",
-            variable=self.statistics_image_var
-        )
-        self.statistics_section.add_widget(statistics_image)
         statistics_csv = ctk.CTkCheckBox(
-            self.statistics_section.content,
-            text="Таблицы статистик CSV",
+            self.statistics_section.content, text="Данные CSV",
             variable=self.statistics_csv_var
         )
-        self.statistics_section.add_widget(statistics_csv, pady=(2, 10))
-        self.statistics_output_widgets = [statistics_image, statistics_csv]
+        self.statistics_section.add_widget(statistics_csv)
+        statistics_image = ctk.CTkCheckBox(
+            self.statistics_section.content, text="Гистограммы PNG",
+            variable=self.statistics_image_var
+        )
+        self.statistics_section.add_widget(statistics_image, pady=(2, 10))
+        self.statistics_output_widgets = [statistics_csv, statistics_image]
 
-        self.calculate_sync_switch = ctk.CTkSwitch(
-            self.statistics_section.content,
-            text="Считать межстрочные синхронизации",
-            variable=self.calculate_sync_var,
-            command=self._on_statistics_stage_changed
-        )
-        self.statistics_section.add_widget(
-            self.calculate_sync_switch, pady=(4, 6)
-        )
+        ctk.CTkLabel(
+            self.statistics_section.content, text="Межстрочная синхронизация",
+            font=AppTheme.section_title_font(), anchor="w"
+        ).pack(fill="x", padx=5, pady=(8, 6))
 
         sync_stride_label = ctk.CTkLabel(
-            self.statistics_section.content,
-            text="Шаг выбора строк",
-            font=AppTheme.caption_font(),
-            anchor="w"
+            self.statistics_section.content, text="Шаг выбора строк",
+            font=AppTheme.caption_font(), anchor="w"
         )
         self.statistics_section.add_widget(sync_stride_label, pady=(2, 2))
         self.sync_stride_entry = ctk.CTkEntry(
-            self.statistics_section.content,
-            textvariable=self.sync_stride_var,
+            self.statistics_section.content, textvariable=self.sync_stride_var,
             placeholder_text="1"
         )
         self.statistics_section.add_widget(self.sync_stride_entry, pady=(0, 4))
 
         sync_tolerance_label = ctk.CTkLabel(
-            self.statistics_section.content,
-            text="Допустимое смещение по X, пиксели",
-            font=AppTheme.caption_font(),
-            anchor="w"
+            self.statistics_section.content, text="Допустимое смещение по X, пиксели",
+            font=AppTheme.caption_font(), anchor="w"
         )
         self.statistics_section.add_widget(sync_tolerance_label, pady=(2, 2))
         self.sync_tolerance_entry = ctk.CTkEntry(
-            self.statistics_section.content,
-            textvariable=self.sync_tolerance_var,
+            self.statistics_section.content, textvariable=self.sync_tolerance_var,
             placeholder_text="1"
         )
-        self.statistics_section.add_widget(
-            self.sync_tolerance_entry, pady=(0, 4)
-        )
+        self.statistics_section.add_widget(self.sync_tolerance_entry, pady=(0, 4))
 
         sync_metric_label = ctk.CTkLabel(
-            self.statistics_section.content,
-            text="Метрика синхронизации",
-            font=AppTheme.caption_font(),
-            anchor="w"
+            self.statistics_section.content, text="Метрика синхронизации",
+            font=AppTheme.caption_font(), anchor="w"
         )
         self.statistics_section.add_widget(sync_metric_label, pady=(2, 2))
         self.sync_metric_selector = ctk.CTkOptionMenu(
-            self.statistics_section.content,
-            values=["jaccard", "dice", "phi"],
-            variable=self.sync_metric_var,
-            width=180
+            self.statistics_section.content, values=["jaccard", "dice", "phi"],
+            variable=self.sync_metric_var, width=180
         )
         self.statistics_section.add_widget(
-            self.sync_metric_selector,
-            fill="none", anchor="w", pady=(0, 6)
+            self.sync_metric_selector, fill="none", anchor="w", pady=(0, 6)
         )
         self.synchronization_parameter_widgets = [
-            self.sync_stride_entry,
-            self.sync_tolerance_entry,
-            self.sync_metric_selector,
+            self.sync_stride_entry, self.sync_tolerance_entry, self.sync_metric_selector
         ]
 
-        sync_heatmap = ctk.CTkCheckBox(
-            self.statistics_section.content,
-            text="Heatmap синхронизаций PNG",
-            variable=self.sync_heatmap_var
-        )
-        self.statistics_section.add_widget(sync_heatmap)
         sync_matrix = ctk.CTkCheckBox(
-            self.statistics_section.content,
-            text="Матрица синхронизаций CSV",
+            self.statistics_section.content, text="Матрица синхронизаций CSV",
             variable=self.sync_matrix_csv_var
         )
         self.statistics_section.add_widget(sync_matrix)
         sync_pairs = ctk.CTkCheckBox(
-            self.statistics_section.content,
-            text="Метрики пар строк CSV",
+            self.statistics_section.content, text="Метрики пар строк CSV",
             variable=self.sync_pairs_csv_var
         )
         self.statistics_section.add_widget(sync_pairs)
-        self.synchronization_output_widgets = [
-            sync_heatmap, sync_matrix, sync_pairs
-        ]
+        sync_heatmap = ctk.CTkCheckBox(
+            self.statistics_section.content, text="Heatmap PNG",
+            variable=self.sync_heatmap_var
+        )
+        self.statistics_section.add_widget(sync_heatmap)
+        self.synchronization_output_widgets = [sync_matrix, sync_pairs, sync_heatmap]
 
         ctk.CTkLabel(
             self.statistics_section.content,
             text=("Синхронизации используют максимумы верхней огибающей "
                   "построчного 1D-преобразования."),
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w",
-            justify="left",
-            wraplength=400
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w", justify="left", wraplength=500
         ).pack(fill="x", padx=5, pady=(8, 0))
         self._update_statistics_controls_state()
 
@@ -5316,32 +5250,35 @@ class App(TkinterApp):
             widget.configure(state=sync_state)
 
     def _setup_knn_section(self):
-        """Настройка секции K-ближайших соседей"""
-        info_label = ctk.CTkLabel(
-            self.knn_section.content,
-            text="Формат вывода K-ближайших соседей:",
-            font=AppTheme.body_font(),
-            anchor="w",
-            wraplength=0
+        """Параметры KNN и форматы экспорта."""
+        ctk.CTkLabel(
+            self.knn_section.content, text="Количество ближайших точек:",
+            font=AppTheme.body_font(), anchor="w"
+        ).pack(fill="x", padx=5, pady=(0, 4))
+        self.entry_near_point = ctk.CTkEntry(
+            self.knn_section.content, textvariable=self.knn_text_var,
+            placeholder_text="5"
         )
-        self.knn_section.add_widget(info_label, pady=(0, 10))
+        self.knn_section.add_widget(self.entry_near_point, pady=(0, 10))
+        self.entry_near_point.bind("<Button-1>", self.on_entry_click)
+        self.entry_near_point.bind("<KeyPress>", self.on_entry_click)
+        self.entry_near_point.bind("<<Paste>>", self.on_entry_click)
 
+        ctk.CTkLabel(
+            self.knn_section.content, text="Экспорт результатов KNN и углов:",
+            font=AppTheme.body_font(), anchor="w"
+        ).pack(fill="x", padx=5, pady=(0, 6))
         self.knn_text_checkbox = ctk.CTkCheckBox(
-            self.knn_section.content,
-            text="Вывести текстовым файлом",
+            self.knn_section.content, text="Данные TXT",
             variable=self.knn_bool_text_var
         )
         self.knn_section.add_widget(self.knn_text_checkbox, fill="x")
-
         self.knn_image_checkbox = ctk.CTkCheckBox(
-            self.knn_section.content,
-            text="Вывести изображением",
+            self.knn_section.content, text="Изображение PNG",
             variable=self.knn_bool_image_var
         )
         self.knn_section.add_widget(self.knn_image_checkbox, fill="x")
-        self.knn_output_widgets = [
-            self.knn_text_checkbox, self.knn_image_checkbox
-        ]
+        self.knn_output_widgets = [self.knn_text_checkbox, self.knn_image_checkbox]
 
     def _setup_intermediate_section(self):
         """Настройка секции промежуточных вычислений"""
