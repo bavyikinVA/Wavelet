@@ -8,6 +8,7 @@ def animate_visibility(widget, visible, show, hide, axis='height', duration_ms=1
     if state is None:
         state = widget._disclosure = dict(job=None, visible=bool(widget.winfo_manager()),
                                           pack=widget.pack_propagate(), grid=widget.grid_propagate())
+        state['layout'] = 'pack' if any(child.winfo_manager() == 'pack' for child in widget.winfo_children()) else 'grid'
         def cleanup(event):
             if event.widget is widget and state['job'] is not None:
                 widget.after_cancel(state['job'])
@@ -30,8 +31,8 @@ def animate_visibility(widget, visible, show, hide, axis='height', duration_ms=1
                 state['expanded'] = requested / scale
     state['visible'] = visible
     end = state['expanded'] if visible else 0
-    widget.pack_propagate(False)
-    widget.grid_propagate(False)
+    propagate = widget.pack_propagate if state['layout'] == 'pack' else widget.grid_propagate
+    propagate(False)
     widget.configure(**{axis: max(1, start)})
     show()
     started = time.monotonic()
@@ -47,7 +48,6 @@ def animate_visibility(widget, visible, show, hide, axis='height', duration_ms=1
             if not visible:
                 hide()
             widget.configure(**{axis: state['expanded']})
-            widget.pack_propagate(state['pack'])
-            widget.grid_propagate(state['grid'])
+            propagate(bool(state[state['layout']]))
 
     state['job'] = widget.after(0, tick)

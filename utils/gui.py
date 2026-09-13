@@ -6,6 +6,10 @@ from utils.animation import animate_visibility
 
 
 class TkinterApp(ctk.CTk):
+    # Avoid CTk's nested update() during Windows titlebar setup, including
+    # mainloop startup. Application callbacks must run in the regular loop.
+    _deactivate_windows_window_header_manipulation = True
+
     def __init__(self):
         super().__init__()
         self._is_destroyed = False
@@ -16,6 +20,9 @@ class TkinterApp(ctk.CTk):
         self.bind('<Map>', self._enable_buffered_paint, add='+')
 
     def _enable_buffered_paint(self, event):
+        if event.widget is self:
+            from utils.rendering import enable_dark_titlebar
+            enable_dark_titlebar(self)
         if event.widget is self and not self._buffered_paint:
             from utils.rendering import enable_buffered_paint
             self._buffered_paint = enable_buffered_paint(self)

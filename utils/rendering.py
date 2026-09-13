@@ -2,6 +2,27 @@
 import sys
 
 
+def enable_dark_titlebar(widget):
+    """Apply the native dark caption without CTk's nested update() calls."""
+    if sys.platform != 'win32':
+        return False
+    import ctypes
+    from ctypes import wintypes
+    user = ctypes.WinDLL('user32', use_last_error=True)
+    user.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user.GetAncestor.restype = wintypes.HWND
+    handle = user.GetAncestor(widget.winfo_id(), 2)
+    dwm = ctypes.WinDLL('dwmapi')
+    dwm.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD,
+                                         ctypes.c_void_p, wintypes.DWORD]
+    dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+    dark = wintypes.BOOL(True)
+    for attribute in (20, 19):
+        if dwm.DwmSetWindowAttribute(handle, attribute, ctypes.byref(dark), ctypes.sizeof(dark)) == 0:
+            return True
+    return False
+
+
 def enable_buffered_paint(widget):
     if sys.platform != 'win32':
         return False

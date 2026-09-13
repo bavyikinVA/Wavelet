@@ -12,7 +12,7 @@ def save_run_image(task):
         raise ValueError("Нет изображения для сохранения в каталог запуска")
     if not task.task_folder_path:
         raise ValueError("Каталог запуска не создан")
-    path = os.path.join(task.task_folder_path, "Изображение.png")
+    path = os.path.join(task.task_folder_path, "image.png")
     # original_image is the RGB input returned by the cropper, before channel
     # transformation. Saving transformed floats as RGB would lose information.
     Image.fromarray(task.original_image).save(path, format="PNG")

@@ -11,11 +11,24 @@ def _process_row_wrapper(args):
     return morlet_wavelet_with_padding(row_data, scales)
 
 class ComputeBackend:
-    def __init__(self, use_gpu: bool = True):
+    def __init__(self, use_gpu: bool = True, *, lazy: bool = False):
         self.use_gpu = use_gpu
         self.gpu_processor = None
-        self.backend_info = {}
-        self._initialize_backend()
+        self._initialized = False
+        self._gpu_checked = False
+        self.backend_info = {
+            "use_gpu": use_gpu, "device_name": "Авто (GPU / CPU)" if use_gpu else "CPU",
+            "gpu_available": False, "gpu_device_name": "GPU", "gpu_memory": "N/A",
+            "status": "pending", "available": True,
+        }
+        if not lazy:
+            self.ensure_initialized()
+
+    def ensure_initialized(self):
+        """Initialize on the compute worker, never while constructing the UI."""
+        if not self._initialized:
+            self._initialize_backend()
+            self._initialized = True
 
     def _initialize_backend(self):
         self.backend_info = {
@@ -38,6 +51,7 @@ class ComputeBackend:
             return
 
         if self.use_gpu:
+            self._gpu_checked = True
             try:
                 from compute.wavelets.gpu_processor import GPUWaveletProcessor
                 self.gpu_processor = GPUWaveletProcessor()
@@ -62,6 +76,7 @@ class ComputeBackend:
                 self.use_gpu = False
 
     def morlet_wavelet_batch(self, data: np.ndarray, scales: np.ndarray) -> np.ndarray:
+        self.ensure_initialized()
         if not self.backend_info["available"]:
             raise RuntimeError("No compute backend available")
 
@@ -115,7 +130,7 @@ class ComputeBackend:
                     f"{gpu_info.get('memory_total_mb', 0)} MB"
                 )
             })
-        return self.backend_info.copy()
+        return dict(self.backend_info, gpu_checked=self._gpu_checked)
 
     def is_gpu_available(self) -> bool:
         """Check if GPU is available"""
@@ -124,6 +139,13 @@ class ComputeBackend:
 
     def set_use_gpu(self, enabled: bool) -> bool:
         """Set the requested backend explicitly and return the applied state."""
+        if not self._initialized or (enabled and not self._gpu_checked):
+            self._initialized = False
+            self.use_gpu = bool(enabled)
+            self.backend_info.update(use_gpu=self.use_gpu,
+                                     device_name="Авто (GPU / CPU)" if enabled else "CPU",
+                                     status="pending")
+            return self.use_gpu
         if not enabled:
             self.use_gpu = False
             self.backend_info.update({

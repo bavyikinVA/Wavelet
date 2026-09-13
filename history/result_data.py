@@ -1,6 +1,6 @@
 """Read native numerical artifacts without GUI dependencies."""
 import csv
-from functools import lru_cache
+from history.array_cache import byte_cache
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -19,12 +19,21 @@ def load_result(item, folder):
             candidates.insert(0, path.parent / 'кластеры.csv')
         path = next((p for p in candidates if p.is_file()), path)
     stat = path.stat()
-    source = Path(folder) / 'Изображение.png'
+    source = Path(folder) / 'image.png'
+    if not source.is_file():
+        source = Path(folder) / 'Изображение.png'  # Existing run archives.
     shape = None
     if source.is_file():
         with Image.open(source) as image:
             shape = (image.height, image.width)
-    return _read(str(path), stat.st_mtime_ns, stat.st_size, item['category'], shape)
+    data = dict(_read(str(path), stat.st_mtime_ns, stat.st_size, item['category'], shape))
+    name = path.stem.casefold()
+    data['quantity'] = ('phase' if name.endswith('_phase') else
+                        'magnitude' if name.endswith('_magnitude') else 'coefficient')
+    # A run-local source identity prevents same-size, unrelated layers matching.
+    source_stat = source.stat() if source.is_file() else None
+    data['source_id'] = (str(source.resolve()), source_stat.st_mtime_ns, source_stat.st_size) if source_stat else str(Path(folder).resolve())
+    return data
 
 
 def _map(array, shape=None, spatial=True):
@@ -33,7 +42,7 @@ def _map(array, shape=None, spatial=True):
                 shape=shape or (h, w), spatial=spatial)
 
 
-@lru_cache(maxsize=8)
+@byte_cache()
 def _read(filename, modified, size, category, shape):
     path = Path(filename)
     suffix = path.suffix.lower()

@@ -6,9 +6,14 @@ import os
 
 
 class PipetteApp(ctk.CTkToplevel):
-    def __init__(self, master=None, image_path=None):
+    _deactivate_windows_window_header_manipulation = True
+
+    def __init__(self, master=None, image_path=None, image=None):
         super().__init__(master)
+        from utils.rendering import enable_dark_titlebar
+        self.bind('<Map>', lambda event: enable_dark_titlebar(self) if event.widget is self else None, add='+')
         self.master_app = master
+        self.protocol("WM_DELETE_WINDOW", self.safe_destroy)
         if hasattr(master, 'register_child_window'):
             master.register_child_window(self)
         self.color1 = None
@@ -19,6 +24,7 @@ class PipetteApp(ctk.CTkToplevel):
         self.grab_set()
         self.focus_set()
         self.image_path = image_path
+        self.source_image = image
         self.click_count = 0
         self.colors = []
         self.img_tk = None
@@ -78,8 +84,12 @@ class PipetteApp(ctk.CTkToplevel):
         self.load_image()
 
     def load_image(self):
-        if self.image_path and os.path.exists(self.image_path):
-            self.original_img = Image.open(self.image_path)
+        if self.source_image is not None:
+            self.original_img = Image.fromarray(self.source_image).convert('RGB')
+        elif self.image_path and os.path.exists(self.image_path):
+            with Image.open(self.image_path) as source:
+                self.original_img = source.convert('RGB')
+        if self.original_img is not None:
             self.img_tk = ImageTk.PhotoImage(self.original_img, master=self)
             self.canvas.create_image(0, 0, anchor="nw", image=self.img_tk)
             self.canvas.configure(scrollregion=(0, 0, self.original_img.width, self.original_img.height))
@@ -90,7 +100,7 @@ class PipetteApp(ctk.CTkToplevel):
         self.btn_reset.configure(state="normal")
 
     def get_pixel_rgb(self, event):
-        if not hasattr(self, 'original_img'):
+        if self.original_img is None:
             return
 
         x = self.canvas.canvasx(event.x)
@@ -149,17 +159,18 @@ class PipetteApp(ctk.CTkToplevel):
         return self.color1, self.color2
 
 
-def run_pipette(master=None, image_path=None):
+def run_pipette(master=None, image_path=None, image=None):
+    root = None
     try:
         if master is None:
             root = tk.Tk()
             root.withdraw()
-            pipette_window = PipetteApp(root, image_path)
+            pipette_window = PipetteApp(root, image_path, image)
         else:
-            pipette_window = PipetteApp(master, image_path)
+            pipette_window = PipetteApp(master, image_path, image)
 
         pipette_window.wait_window()
         return pipette_window.get_colors()
-    except Exception as e:
-        print(f"Error in pipette tool: {e}")
-        return None, None
+    finally:
+        if root is not None:
+            root.destroy()

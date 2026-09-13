@@ -12,6 +12,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
+from .errors import ClusteringError
 
 import matplotlib
 
@@ -34,10 +35,6 @@ POINT_TYPE_LABELS = {
     "max_by_column": "Максимумы по столбцам",
     "min_by_column": "Минимумы по столбцам",
 }
-
-
-class ClusteringError(ValueError):
-    """A user-correctable clustering configuration or data error."""
 
 
 @dataclass

@@ -50,6 +50,8 @@ class ProgressManager:
         self._result_callback = None
         self._folder_callback = None
         self._history_callback = None
+        from compute.run_control import RunControl
+        self.run_control = RunControl()
         self.setup_ui()
         self.setup_logging()
         self.parent.bind("<Destroy>", self._on_parent_destroy)
@@ -202,6 +204,8 @@ class ProgressManager:
         self._schedule_timer()
 
     def _apply_begin_run(self, title):
+        if self.run_control.event.is_set():
+            return
         self.completion_actions.pack_forget()
         self.state_badge.configure(text="● ВЫПОЛНЯЕТСЯ", text_color=AppTheme.INFO)
         self.progress_label.configure(text=title, text_color=AppTheme.TEXT_ON_DARK)
@@ -209,6 +213,7 @@ class ProgressManager:
         self._apply_stage_label()
 
     def begin_stage(self, name, index=None):
+        self.run_control.check()
         if name not in self._stages:
             self._stages.append(name)
         self._stage_index = self._stages.index(name) if index is None else int(index)
@@ -218,6 +223,8 @@ class ProgressManager:
         self.log_info(f"Этап {self._stage_index + 1}/{len(self._stages)}: {name}")
 
     def _apply_begin_stage(self, name):
+        if self.run_control.event.is_set():
+            return
         self.progress_label.configure(text=name, text_color=AppTheme.TEXT_ON_DARK)
         self._apply_stage_label()
         self._set_bars(self._overall_value(), 0.0)
@@ -227,6 +234,7 @@ class ProgressManager:
 
     def update_progress(self, value: float, message: str = ""):
         """Update progress inside the active stage, preserving global progress."""
+        self.run_control.check()
         value = max(0.0, min(1.0, float(value)))
         self._stage_progress = value
         self._ui(lambda: self._apply_progress(value, message))
@@ -234,6 +242,8 @@ class ProgressManager:
             self.logger.info(message)
 
     def _apply_progress(self, value, message):
+        if self.run_control.event.is_set():
+            return
         self._set_bars(self._overall_value(), value)
         if message:
             self.progress_label.configure(text=message, text_color=AppTheme.TEXT_ON_DARK)
@@ -281,6 +291,15 @@ class ProgressManager:
 
     def fail_run(self, message):
         self._ui(lambda: self._apply_failed(message))
+
+    def cancel_run(self):
+        def apply():
+            self._cancel_timer()
+            self._started_at = None
+            self.state_badge.configure(text='● ОТМЕНЕНО', text_color=AppTheme.TEXT_SECONDARY)
+            self.progress_label.configure(text='Расчёт отменён. Частичные файлы сохранены.')
+            self.completion_actions.pack_forget()
+        self._ui(apply)
 
     def _apply_failed(self, message):
         self._cancel_timer()

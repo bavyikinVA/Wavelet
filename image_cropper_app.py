@@ -2,11 +2,18 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog
 from PIL import Image, ImageTk, ImageDraw
-import os
 
 class ImageCropperApp(ctk.CTkToplevel):
+    # CTk's Windows titlebar customization calls update() inside __init__.
+    # Do not dispatch application callbacks while this dialog is half-built.
+    _deactivate_windows_window_header_manipulation = True
+
     def __init__(self, master=None):
         super().__init__(master)
+        from utils.rendering import enable_dark_titlebar
+        self.bind('<Map>', lambda event: enable_dark_titlebar(self) if event.widget is self else None, add='+')
+        self.result = None
+        self.protocol("WM_DELETE_WINDOW", self.safe_destroy)
         self.master_app = master  # Сохраняем ссылку на главное приложение
         if hasattr(master, 'register_child_window'):
             master.register_child_window(self)
@@ -47,7 +54,7 @@ class ImageCropperApp(ctk.CTkToplevel):
         self.btn_reset.pack(side="left", padx=5)
         self.btn_reset.configure(state="disabled")
 
-        self.btn_save = ctk.CTkButton(self.button_frame, text="Save & Exit", command=self.save_and_exit)
+        self.btn_save = ctk.CTkButton(self.button_frame, text="Использовать изображение", command=self.save_and_exit)
         self.btn_save.pack(side="right", padx=5)
         self.btn_save.configure(state="disabled")
 
@@ -209,29 +216,16 @@ class ImageCropperApp(ctk.CTkToplevel):
         except Exception as e:
             print(f"Error cropping image: {e}")
 
-    @staticmethod
-    def convert_to_png(image_file_path):
-        png_file_path = os.path.splitext(image_file_path)[0] + '.png'
-        try:
-            img = Image.open(image_file_path)
-            img_converted = img.convert("RGB")
-            img_converted.save(png_file_path, "PNG")
-            print(f"Image saved as {png_file_path}")
-            return png_file_path
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
     def open_image(self):
         file_types = [("Image files", "*.png *.jpg *.jpeg *.bmp")]
-        file_path = filedialog.askopenfilename(filetypes=file_types)
+        file_path = filedialog.askopenfilename(parent=self, filetypes=file_types)
 
         if not file_path:
             return
 
         try:
-            file_path = self.convert_to_png(file_path)
-            self.original_image = Image.open(file_path)
+            with Image.open(file_path) as source:
+                self.original_image = source.convert('RGB')
             self.image = self.original_image.copy()
             self.original_file_path = file_path
             self.update_canvas()
@@ -268,7 +262,7 @@ class ImageCropperApp(ctk.CTkToplevel):
             self.image = self.original_image.copy()
             self.update_canvas()
             self.reset_selection()
-            self.btn_save.configure(state="disabled")
+            self.btn_save.configure(state="normal")
 
     def reset_selection(self):
         if self.rect_id:
@@ -279,6 +273,8 @@ class ImageCropperApp(ctk.CTkToplevel):
     def apply_rectangle_crop(self):
         try:
             x1, y1, x2, y2 = self.rect_coords
+            x1, x2 = sorted((x1, x2))
+            y1, y2 = sorted((y1, y2))
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(self.image.width, x2), min(self.image.height, y2)
 
@@ -287,7 +283,8 @@ class ImageCropperApp(ctk.CTkToplevel):
             self.reset_selection()
             self.btn_save.configure(state="normal")
         except Exception as e:
-            print(f"Error cropping image: {e}")
+            from tkinter import messagebox
+            messagebox.showerror('Обрезка', str(e), parent=self)
 
     def safe_destroy(self):
         """Безопасное уничтожение окна"""
@@ -303,33 +300,14 @@ class ImageCropperApp(ctk.CTkToplevel):
         if not self.image:
             return None
 
-        file_path = self.get_cropped_filename()
-
-        if not file_path:
-            return None
-
-        try:
-            self.image.save(file_path)
-            self.safe_destroy()
-            return file_path
-        except Exception as e:
-            print(f"Error saving image: {e}")
-            return None
-
-    def get_cropped_filename(self):
-        if not hasattr(self, 'original_file_path'):
-            return None
-
-        base_path, ext = os.path.splitext(self.original_file_path)
-        filename = os.path.basename(base_path).lower()
-
-        if "cropped" in filename or "cropped_image" in filename:
-            return self.original_file_path
-        else:
-            return f"{base_path}_cropped{ext}"
+        # Return the effective pixels; only the run writer persists the source.
+        self.result = (self.image.convert('RGB'), self.original_file_path)
+        self.safe_destroy()
+        return self.result
 
 
 def run_cropper(master=None):
+    root = None
     try:
         if master is None:
             root = tk.Tk()
@@ -339,8 +317,7 @@ def run_cropper(master=None):
             cropper_window = ImageCropperApp(master)
 
         cropper_window.wait_window()
-        result = cropper_window.save_and_exit()
-        return result
-    except Exception as e:
-        print(f"Error in image cropper: {e}")
-        return None
+        return cropper_window.result
+    finally:
+        if root is not None:
+            root.destroy()
