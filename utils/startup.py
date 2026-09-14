@@ -1,6 +1,7 @@
 """Small Tk-only startup view; no images or scientific libraries to load."""
 import math
 import tkinter as tk
+import sys
 
 
 class StartupSplash(tk.Toplevel):
@@ -11,8 +12,9 @@ class StartupSplash(tk.Toplevel):
         self.overrideredirect(True)
         self.configure(background="#111923")
         width, height = 560, 300
-        x = (self.winfo_screenwidth() - width) // 2
-        y = (self.winfo_screenheight() - height) // 2
+        self._splash_width = width
+        self._splash_height = height
+        x, y = self._center_coordinates(width, height)
         self.geometry(f"{width}x{height}+{x}+{y}")
         self.protocol("WM_DELETE_WINDOW", on_close)
         self.bind('<Escape>', lambda _event: on_close())
@@ -41,7 +43,78 @@ class StartupSplash(tk.Toplevel):
         self._frame = 0
         self._animation = None
         self.deiconify()
+        self.lift()
+        # После фактического показа Windows может применить DPI/monitor scaling.
+        # Повторно центрируем уже созданное native-окно.
+        self.after(1, self._recenter)
+        self.after(80, self._recenter)
         self._tick()
+
+    def _center_coordinates(self, width, height):
+        """Return coordinates centered on the user's current Windows monitor.
+
+        Tk's winfo_screenwidth() can describe a virtual/logical desktop under
+        mixed-DPI multi-monitor Windows setups. Prefer the foreground monitor
+        when Win32 information is available.
+        """
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                user32 = ctypes.windll.user32
+
+                # Prefer the monitor of the foreground window (IDE/terminal).
+                hwnd = user32.GetForegroundWindow()
+                if hwnd:
+                    MONITOR_DEFAULTTONEAREST = 2
+                    monitor = user32.MonitorFromWindow(
+                        hwnd, MONITOR_DEFAULTTONEAREST
+                    )
+
+                    class MONITORINFO(ctypes.Structure):
+                        _fields_ = [
+                            ("cbSize", wintypes.DWORD),
+                            ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT),
+                            ("dwFlags", wintypes.DWORD),
+                        ]
+
+                    info = MONITORINFO()
+                    info.cbSize = ctypes.sizeof(MONITORINFO)
+                    if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                        left = info.rcWork.left
+                        top = info.rcWork.top
+                        right = info.rcWork.right
+                        bottom = info.rcWork.bottom
+
+                        work_width = right - left
+                        work_height = bottom - top
+
+                        return (
+                            left + max(0, (work_width - width) // 2),
+                            top + max(0, (work_height - height) // 2),
+                        )
+            except Exception:
+                pass
+
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        return (
+            max(0, (screen_width - width) // 2),
+            max(0, (screen_height - height) // 2),
+        )
+
+    def _recenter(self):
+        if not self.winfo_exists():
+            return
+        x, y = self._center_coordinates(
+            self._splash_width,
+            self._splash_height,
+        )
+        self.geometry(
+            f"{self._splash_width}x{self._splash_height}+{x}+{y}"
+        )
 
     def _tick(self):
         self._frame = (self._frame + 1) % 120

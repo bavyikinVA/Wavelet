@@ -1,6 +1,7 @@
 import os
 import sys
 import warnings
+import platform
 from uuid import uuid4
 
 
@@ -56,6 +57,7 @@ import threading
 import time
 import tkinter as tk
 import traceback
+from datetime import datetime
 from multiprocessing import Pool, freeze_support
 from tkinter import messagebox as mb
 
@@ -73,6 +75,7 @@ from compute.processing_task import ProcessingTask
 from image_cropper_app import run_cropper
 from pipette import run_pipette
 from utils.gui import TkinterApp, ScrollableFrame, CollapsibleFrame
+from utils.tooltip import HoverTooltip
 from utils.progress_manager import ProgressManager
 from utils.theme import AppTheme
 from utils.icon_button import IconButton
@@ -1945,14 +1948,8 @@ class ImageProcessor:
                         pipeline_plan=pipeline_plan
                     )
 
-            # Для ML-сценария кластеризация выполняется уровнем приложения
-            # сразу после подготовки KNN-признаков.
             completion = 1.0
-            message = (
-                f"Основной анализ для {task.task_name} завершён; запуск ML..."
-                if pipeline_plan.ml else
-                f"Вычисления для {task.task_name} завершены успешно"
-            )
+            message = f"Вычисления для {task.task_name} завершены успешно"
             self.progress.update_progress(completion, message)
             self.progress.log_info(message)
 
@@ -1982,12 +1979,16 @@ class ImageProcessor:
 class WorkspaceTabs(ctk.CTkFrame):
     """Верхняя навигация по рабочим страницам в стиле desktop-приложений."""
 
-    def __init__(self, master, tab_names, navigation_master=None):
+    def __init__(self, master, tab_names, navigation_master=None, hidden_tabs=()):
         super().__init__(master, fg_color="transparent", corner_radius=0)
         self._pages = {}
         self._buttons = {}
         self._underlines = {}
         self._current_name = None
+        self._hidden_tabs = set(hidden_tabs)
+        self._visible_tab_names = [
+            name for name in tab_names if name not in self._hidden_tabs
+        ]
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -2017,7 +2018,7 @@ class WorkspaceTabs(ctk.CTkFrame):
 
         # Keep all pages accessible when the window is too narrow for the tabs.
         self.compact_navigation = ctk.CTkOptionMenu(
-            self.navigation, values=list(tab_names), command=self.set,
+            self.navigation, values=self._visible_tab_names, command=self.set,
             width=210, height=self._navigation_height - 4,
             fg_color=AppTheme.NAV_BACKGROUND,
             button_color=AppTheme.NAV_HOVER,
@@ -2036,7 +2037,7 @@ class WorkspaceTabs(ctk.CTkFrame):
         self.page_container.grid_propagate(False)
 
         for name in tab_names:
-            self.add(name)
+            self.add(name, show_in_navigation=name not in self._hidden_tabs)
 
     def _fit_navigation(self, event):
         if event.width < self.tabs_strip.winfo_reqwidth() + 8:
@@ -2046,38 +2047,43 @@ class WorkspaceTabs(ctk.CTkFrame):
             self.compact_navigation.pack_forget()
             self.tabs_strip.pack(side="left", fill="y", padx=4)
 
-    def add(self, name):
-        item = ctk.CTkFrame(
-            self.tabs_strip, fg_color="transparent", corner_radius=0
-        )
-        item.pack(side="left", fill="y")
+    def add(self, name, show_in_navigation=True):
+        item = None
+        button = None
+        underline = None
+        if show_in_navigation:
+            item = ctk.CTkFrame(
+                self.tabs_strip, fg_color="transparent", corner_radius=0
+            )
+            item.pack(side="left", fill="y")
 
-        button = ctk.CTkButton(
-            item,
-            text=name,
-            command=lambda tab_name=name: self.set(tab_name),
-            width=max(60, 9 * len(name) + 20),
-            height=self._navigation_height - 4,
-            corner_radius=0,
-            fg_color="transparent",
-            hover_color=AppTheme.NAV_HOVER,
-            text_color=AppTheme.NAV_TEXT_INACTIVE,
-            border_width=0,
-            font=ctk.CTkFont(size=14),
-        )
-        button.pack(fill="both", expand=True)
+            button = ctk.CTkButton(
+                item,
+                text=name,
+                command=lambda tab_name=name: self.set(tab_name),
+                width=max(60, 9 * len(name) + 20),
+                height=self._navigation_height - 4,
+                corner_radius=0,
+                fg_color="transparent",
+                hover_color=AppTheme.NAV_HOVER,
+                text_color=AppTheme.NAV_TEXT_INACTIVE,
+                border_width=0,
+                font=ctk.CTkFont(size=14),
+            )
+            button.pack(fill="both", expand=True)
 
-        underline = ctk.CTkFrame(
-            item,
-            height=3,
-            corner_radius=2,
-            fg_color="transparent"
-        )
+            underline = ctk.CTkFrame(
+                item,
+                height=3,
+                corner_radius=2,
+                fg_color="transparent"
+            )
         page = ctk.CTkFrame(
             self.page_container, fg_color="transparent", corner_radius=0
         )
-        self._buttons[name] = button
-        self._underlines[name] = underline
+        if button is not None:
+            self._buttons[name] = button
+            self._underlines[name] = underline
         self._pages[name] = page
         page.grid(row=0, column=0, sticky="nsew")
         if self._current_name is None:
@@ -2096,7 +2102,8 @@ class WorkspaceTabs(ctk.CTkFrame):
             self.on_select(name)
         self._pages[name].tkraise()
         self._current_name = name
-        self.compact_navigation.set(name)
+        if name in self._visible_tab_names:
+            self.compact_navigation.set(name)
         for tab_name, button in self._buttons.items():
             active = tab_name == name
             button.configure(
@@ -2106,7 +2113,9 @@ class WorkspaceTabs(ctk.CTkFrame):
                     else AppTheme.NAV_TEXT_INACTIVE
                 )
             )
-            underline = self._underlines[tab_name]
+            underline = self._underlines.get(tab_name)
+            if underline is None:
+                continue
             if active:
                 underline.configure(fg_color=AppTheme.NAV_ACTIVE)
                 underline.place(
@@ -2171,7 +2180,17 @@ class App(TkinterApp):
         self.run_history = RunHistoryStore()
         self.title("Wavelets Analysis Studio")
         self.resizable(True, True)
-        self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight() - 40}+0+0")
+        # Открываем главное окно крупным, но не растянутым на весь экран,
+        # и всегда центрируем его относительно текущего монитора.
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        window_width = min(max(1200, int(screen_width * 0.90)), max(800, screen_width - 80))
+        window_height = min(max(700, int(screen_height * 0.88)), max(600, screen_height - 80))
+        window_x = max(0, (screen_width - window_width) // 2)
+        window_y = max(0, (screen_height - window_height) // 2)
+        self.geometry(
+            f"{window_width}x{window_height}+{window_x}+{window_y}"
+        )
 
         # настройка темы
         ctk.set_appearance_mode("dark")
@@ -2179,6 +2198,10 @@ class App(TkinterApp):
 
         # инициализация всех атрибутов UI
         self._initialize_ui_variables()
+
+        # Начальный экран создаётся в том же Tk-окне, что и рабочая область.
+        # Это позволяет не плодить mainloop/Tk и безопасно сохранять состояние.
+        self.welcome_frame = self._create_welcome_page()
 
         self._tasks_visible = True
         self._progress_visible = True
@@ -2191,6 +2214,28 @@ class App(TkinterApp):
         self.progress_toggle = IconButton(self.layout_controls, 'bottom', 'Панель выполнения', self._toggle_progress_panel)
         self.progress_toggle.pack(side='left', padx=3)
         IconButton(self.layout_controls, 'focus', 'Фокус на рабочей области', self._toggle_focus_layout).pack(side='left', padx=3)
+
+        # Глобальная навигация находится отдельно от этапов текущего исследования.
+        self.home_button = ctk.CTkButton(
+            self.layout_controls,
+            text="Начальная",
+            width=105,
+            height=28,
+            fg_color="transparent",
+            hover_color=AppTheme.NAV_HOVER,
+            command=self._show_welcome,
+        )
+        self.home_button.pack(side="right", padx=(4, 3))
+        self.history_button = ctk.CTkButton(
+            self.layout_controls,
+            text="История",
+            width=95,
+            height=28,
+            fg_color="transparent",
+            hover_color=AppTheme.NAV_HOVER,
+            command=self._show_history_page,
+        )
+        self.history_button.pack(side="right", padx=3)
 
         # Постоянная панель задач и единая рабочая область со вкладками.
         self.main_container = ctk.CTkFrame(self)
@@ -2243,7 +2288,6 @@ class App(TkinterApp):
         for variable in (
                 self.row_var, self.col_var, self.max_var, self.min_var,
                 self.wp_var1, self.wp_var2, self.p_ex_var1, self.p_ex_var2,
-                self.wavelet_numpy_var,
                 self.envelope_text_var, self.envelope_image_var,
                 self.knn_bool_text_var, self.knn_bool_image_var,
                 self.calculate_extrema_var, self.calculate_envelopes_var,
@@ -2267,11 +2311,292 @@ class App(TkinterApp):
 
         # Переменная для GPU/CPU переключения
         self.use_gpu_var = tk.BooleanVar(value=True)
+        self.compute_device_var = tk.StringVar(value="cpu")
 
         # Обновляем UI после инициализации image_processor
         yield "Завершение подготовки…"
         self._update_gpu_section()
+        self._detect_compute_devices_async()
         self._update_action_availability()
+        self._show_welcome(force=True)
+
+    def _create_welcome_page(self):
+        """Создать Research Hub: новый эксперимент и последние запуски."""
+        page = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
+
+        outer = ctk.CTkFrame(page, fg_color="transparent")
+        outer.pack(fill="both", expand=True, padx=48, pady=36)
+        outer.grid_columnconfigure(0, weight=0, minsize=360)
+        outer.grid_columnconfigure(1, weight=1, minsize=560)
+        outer.grid_rowconfigure(1, weight=1)
+
+        title_block = ctk.CTkFrame(outer, fg_color="transparent")
+        title_block.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(10, 30))
+        ctk.CTkLabel(
+            title_block,
+            text="Wavelets Analysis Studio",
+            font=ctk.CTkFont(size=30, weight="bold"),
+            anchor="w",
+        ).pack(fill="x")
+        ctk.CTkLabel(
+            title_block,
+            text="Студия исследования изображений и вейвлет-анализа",
+            font=ctk.CTkFont(size=14),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w",
+        ).pack(fill="x", pady=(5, 0))
+
+        new_card = ctk.CTkFrame(
+            outer, border_width=1, border_color=AppTheme.BORDER, corner_radius=10
+        )
+        new_card.grid(row=1, column=0, sticky="nsew", padx=(0, 18))
+        ctk.CTkLabel(
+            new_card,
+            text="Новое исследование",
+            font=ctk.CTkFont(size=21, weight="bold"),
+            anchor="w",
+        ).pack(fill="x", padx=24, pady=(30, 8))
+        ctk.CTkLabel(
+            new_card,
+            text=(
+                "Создайте новую задачу, загрузите изображение и настройте "
+                "вейвлет-преобразование и этапы обработки."
+            ),
+            font=AppTheme.body_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            justify="left",
+            anchor="nw",
+            wraplength=300,
+        ).pack(fill="x", padx=24, pady=(0, 22))
+        ctk.CTkButton(
+            new_card,
+            text="+  Новое исследование",
+            command=self._start_new_research,
+            height=48,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color=AppTheme.PRIMARY,
+            hover_color=AppTheme.PRIMARY_HOVER,
+        ).pack(fill="x", padx=24, pady=(0, 12))
+        ctk.CTkLabel(
+            new_card,
+            text="Текущие задачи в этой сессии сохранятся в рабочей области.",
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.MUTED,
+            justify="left",
+            anchor="w",
+            wraplength=300,
+        ).pack(fill="x", padx=24, pady=(0, 24))
+
+        recent_card = ctk.CTkFrame(
+            outer, border_width=1, border_color=AppTheme.BORDER, corner_radius=10
+        )
+        recent_card.grid(row=1, column=1, sticky="nsew")
+        recent_header = ctk.CTkFrame(recent_card, fg_color="transparent")
+        recent_header.pack(fill="x", padx=22, pady=(24, 10))
+        ctk.CTkLabel(
+            recent_header,
+            text="Последние исследования",
+            font=ctk.CTkFont(size=20, weight="bold"),
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            recent_header,
+            text="Все исследования →",
+            width=155,
+            height=30,
+            fg_color="transparent",
+            hover_color=AppTheme.NAV_HOVER,
+            command=self._show_history_page,
+        ).pack(side="right")
+
+        self.welcome_recent_container = ctk.CTkFrame(
+            recent_card, fg_color="transparent"
+        )
+        self.welcome_recent_container.pack(
+            fill="both", expand=True, padx=18, pady=(2, 18)
+        )
+        return page
+
+    def _refresh_welcome_recent_runs(self):
+        """Обновить пять последних исследований на начальном экране."""
+        container = getattr(self, "welcome_recent_container", None)
+        if container is None:
+            return
+        for child in container.winfo_children():
+            child.destroy()
+
+        try:
+            runs = self.run_history.list_runs(limit=5)
+        except Exception as error:
+            ctk.CTkLabel(
+                container,
+                text=f"Не удалось загрузить историю: {error}",
+                text_color=AppTheme.DANGER,
+                anchor="w",
+            ).pack(fill="x", padx=8, pady=12)
+            return
+
+        if not runs:
+            empty = ctk.CTkFrame(container, fg_color="transparent")
+            empty.pack(fill="both", expand=True, padx=8, pady=16)
+            ctk.CTkLabel(
+                empty,
+                text="История исследований пока пуста",
+                font=AppTheme.section_title_font(),
+                anchor="w",
+            ).pack(fill="x", pady=(8, 4))
+            ctk.CTkLabel(
+                empty,
+                text="Первый завершённый запуск появится здесь автоматически.",
+                font=AppTheme.body_font(),
+                text_color=AppTheme.TEXT_SECONDARY,
+                anchor="w",
+            ).pack(fill="x")
+            return
+
+        for run in runs:
+            self._create_welcome_run_card(container, run)
+
+    def _create_welcome_run_card(self, parent, run):
+        """Компактная карточка запуска для Research Hub."""
+        try:
+            details = self._format_history_snapshot(
+                self.run_history.get_settings(run["id"])
+            )
+        except Exception:
+            details = {
+                "wavelet": run.get("analysis_mode", "—"),
+                "scales": "—",
+            }
+
+        try:
+            created = time.strftime(
+                "%d.%m.%Y  %H:%M",
+                time.localtime(
+                    datetime.fromisoformat(run["created_at"]).timestamp()
+                ),
+            )
+        except Exception:
+            created = str(run.get("created_at", ""))[:16].replace("T", "  ")
+
+        card = ctk.CTkFrame(
+            parent,
+            border_width=1,
+            border_color=AppTheme.BORDER,
+            corner_radius=8,
+            fg_color=AppTheme.NAV_SELECTED_BACKGROUND,
+        )
+        card.pack(fill="x", padx=4, pady=5)
+
+        top = ctk.CTkFrame(card, fg_color="transparent")
+        top.pack(fill="x", padx=14, pady=(11, 2))
+        source = os.path.basename(run.get("image_path") or "") or run.get("task_name", "Исследование")
+        ctk.CTkLabel(
+            top,
+            text=source,
+            font=AppTheme.section_title_font(),
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(
+            top,
+            text=created,
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+        ).pack(side="right", padx=(10, 0))
+
+        status = run.get("status", "")
+        summary = f"{details.get('wavelet', '—')}  ·  масштабы: {details.get('scales', '—')}"
+        if status:
+            summary += f"  ·  {status}"
+        ctk.CTkLabel(
+            card,
+            text=summary,
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w",
+        ).pack(fill="x", padx=14, pady=(1, 8))
+
+        actions = ctk.CTkFrame(card, fg_color="transparent")
+        actions.pack(fill="x", padx=14, pady=(0, 10))
+        ctk.CTkButton(
+            actions,
+            text="Продолжить",
+            width=110,
+            height=29,
+            command=lambda run_id=run["id"]: self._continue_research(run_id),
+        ).pack(side="left")
+        if run.get("output_path"):
+            ctk.CTkButton(
+                actions,
+                text="Результаты",
+                width=105,
+                height=29,
+                fg_color="transparent",
+                hover_color=AppTheme.NAV_HOVER,
+                command=lambda folder=run["output_path"]: self._open_results_from_welcome(folder),
+            ).pack(side="left", padx=(7, 0))
+
+    def _workspace_is_busy(self):
+        return any(
+            thread is not None and thread.is_alive()
+            for thread in (
+                getattr(self, "_compute_thread", None),
+                getattr(self, "_ml_thread", None),
+            )
+        )
+
+    def _show_welcome(self, force=False):
+        """Показать начальный экран, не уничтожая рабочую сессию."""
+        if not force and self._workspace_is_busy():
+            mb.showwarning(
+                "Выполнение",
+                "Нельзя перейти на начальный экран, пока выполняется расчёт.",
+            )
+            return
+
+        for widget_name in ("layout_controls", "main_container"):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.pack_forget()
+        progress_manager = getattr(self, "progress_manager", None)
+        if progress_manager is not None:
+            progress_manager.frame.pack_forget()
+
+        self._refresh_welcome_recent_runs()
+        self.welcome_frame.pack(fill="both", expand=True)
+
+    def _show_workspace(self):
+        """Вернуться к рабочей области с сохранением текущих задач."""
+        if getattr(self, "welcome_frame", None) is not None:
+            self.welcome_frame.pack_forget()
+
+        if not self.layout_controls.winfo_manager():
+            self.layout_controls.pack(fill="x", padx=8, pady=2)
+        if not self.main_container.winfo_manager():
+            self.main_container.pack(
+                fill="both",
+                expand=True,
+                padx=AppTheme.WINDOW_PADDING,
+                pady=(2, AppTheme.SECTION_GAP),
+            )
+        if hasattr(self, "progress_manager") and not self.progress_manager.frame.winfo_manager():
+            self.progress_manager.frame.pack(fill="x", padx=20, pady=(4, 10))
+
+    def _start_new_research(self):
+        self._show_workspace()
+        self.add_new_task()
+
+    def _continue_research(self, run_id):
+        self._show_workspace()
+        self._restore_history_run(run_id)
+
+    def _open_results_from_welcome(self, folder):
+        self._show_workspace()
+        self._show_saved_results(folder)
+
+    def _show_history_page(self):
+        self._show_workspace()
+        self.workspace_tabs.set("Предыдущие запуски")
 
     def _update_gpu_section(self):
         """Обновление секции GPU после инициализации image_processor"""
@@ -2283,16 +2608,56 @@ class App(TkinterApp):
             # Пересоздаем содержимое
             self._setup_compute_settings_section()
 
-    def _maximize_properly(self):
-        """Правильная максимизация после создания всех виджетов"""
-        # Максимизируем
-        if self.tk.call('tk', 'windowingsystem') == 'win32':
-            self.state('zoomed')
-        else:
-            self.attributes('-zoomed', True)
+    def _detect_compute_devices_async(self):
+        """Проверить GPU в фоне и после проверки автоматически выбрать его."""
+        if not hasattr(self, "image_processor") or self.image_processor is None:
+            return
+        if getattr(self, "_device_detection_started", False):
+            return
+        self._device_detection_started = True
 
-        # Let the normal event loop settle geometry; never nest update() here.
+        def worker():
+            try:
+                backend = self.image_processor.backend
+                backend.use_gpu = True
+                backend.ensure_initialized()
+                info = backend.get_backend_info()
+                if info.get("gpu_available"):
+                    backend.set_use_gpu(True)
+                else:
+                    backend.set_use_gpu(False)
+            except Exception as error:
+                try:
+                    self.progress_manager.log_error(f"Проверка GPU: {error}")
+                except Exception:
+                    pass
+            finally:
+                def finish():
+                    info = self.image_processor.get_backend_info()
+                    enabled = bool(info.get("gpu_available") and info.get("use_gpu"))
+                    self.use_gpu_var.set(enabled)
+                    self.compute_device_var.set("gpu" if enabled else "cpu")
+                    self._update_gpu_section()
+                self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True, name="device-detection").start()
+
+    def _maximize_properly(self):
+        """Развернуть главное окно приложения на весь экран."""
+        try:
+            if self.tk.call("tk", "windowingsystem") == "win32":
+                self.state("zoomed")
+            else:
+                self.attributes("-zoomed", True)
+        except tk.TclError:
+            # Fallback: занять доступную область экрана.
+            screen_width = self.winfo_screenwidth()
+            screen_height = self.winfo_screenheight()
+            self.geometry(f"{screen_width}x{screen_height}+0+0")
+
+        # Даём Tk/CustomTkinter завершить перерасчёт размеров интерфейса.
         self.after_safe(200, self._final_adjustment)
+
 
     def _final_adjustment(self):
         """Финальная корректировка размеров"""
@@ -2353,9 +2718,13 @@ class App(TkinterApp):
         self._ml_thread = None
         self._ml_preview_image = None
 
-        # Journal filters are interface state, not analysis parameters.
+        # Journal filters/pagination are interface state, not analysis parameters.
         self.history_search_var = tk.StringVar(value="")
         self.history_status_var = tk.StringVar(value="Все статусы")
+        self.history_page_size_var = tk.StringVar(value="5")
+        self.history_page = 1
+        self.history_total_pages = 1
+        self._history_search_after_id = None
 
         # Widget references
         self.load_button = None
@@ -2373,6 +2742,9 @@ class App(TkinterApp):
         self.task_widgets = []
         self.compute_settings_section = None
         self.gpu_switch = None
+        self.cpu_radio = None
+        self.gpu_radio = None
+        self.pipeline_preset_tooltip = None
         self.analysis_mode_selector = None
         self.analysis_mode_description = None
         self.analysis_source_label = None
@@ -2461,6 +2833,7 @@ class App(TkinterApp):
             self.workspace_frame,
             ("Данные", "Параметры расчёта", "Результаты", "ML", "Предыдущие запуски"),
             navigation_master=self.layout_controls,
+            hidden_tabs=("Предыдущие запуски",),
         )
         self.workspace_tabs.grid(
             row=0, column=0, sticky="nsew"
@@ -2498,51 +2871,168 @@ class App(TkinterApp):
                 self._lock_controls_in(self.history_panel)
 
     def _create_history_tab(self, parent):
-        """Create a researcher-friendly view of persistent previous runs."""
+        """Create a researcher-friendly paginated view of persistent previous runs."""
         panel = ctk.CTkFrame(parent, fg_color="transparent")
         panel.pack(fill="both", expand=True)
+
         header = ctk.CTkFrame(panel, fg_color="transparent")
         header.pack(fill="x", padx=12, pady=(12, 6))
         ctk.CTkLabel(
-            header, text="Предыдущие запуски",
+            header, text="История исследований",
             font=AppTheme.panel_title_font(), anchor="w"
         ).pack(side="left", fill="x", expand=True)
         ctk.CTkButton(
             header, text="Обновить", width=110,
             height=AppTheme.SMALL_BUTTON_HEIGHT,
-            command=self._refresh_history_tab
+            command=lambda: self._refresh_history_tab(force=True)
         ).pack(side="right")
+
         ctk.CTkLabel(
             panel,
             text=("Здесь сохраняются настройки и результаты исследований. "
                   "Любой запуск можно повторить как новую задачу."),
-            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
             anchor="w", justify="left"
         ).pack(fill="x", padx=12, pady=(0, 8))
+
         filters = ctk.CTkFrame(panel, fg_color="transparent")
         filters.pack(fill="x", padx=12, pady=(0, 8))
-        search_entry = ctk.CTkEntry(
-            filters, textvariable=self.history_search_var,
-            placeholder_text="Поиск по изображению, сценарию или задаче",
+
+        self.history_search_entry = ctk.CTkEntry(
+            filters,
+            textvariable=self.history_search_var,
+            placeholder_text="Поиск по № запуска, изображению, сценарию или задаче",
             width=360
         )
-        search_entry.pack(side="left", fill="x", expand=True)
-        search_entry.bind("<Return>", lambda _event: self._refresh_history_tab())
-        ctk.CTkOptionMenu(
-            filters, variable=self.history_status_var,
+        self.history_search_entry.pack(side="left", fill="x", expand=True)
+
+        # История доступна для чтения/поиска даже во время вычислений.
+        self.history_search_entry._read_only_during_compute = True
+
+        # Не полагаемся только на trace StringVar: в CustomTkinter на Windows
+        # после программных обновлений/смены вкладок он может отрабатывать
+        # неудобно. KeyRelease гарантированно запускает реактивный поиск.
+        self.history_search_entry.bind(
+            "<KeyRelease>",
+            self._on_history_search_key_event,
+            add="+",
+        )
+        self.history_search_entry.bind(
+            "<<Paste>>",
+            self._on_history_search_key_event,
+            add="+",
+        )
+        self.history_search_entry.bind(
+            "<<Cut>>",
+            self._on_history_search_key_event,
+            add="+",
+        )
+
+        self.history_status_menu = ctk.CTkOptionMenu(
+            filters,
+            variable=self.history_status_var,
             values=["Все статусы", "Завершённые", "С ошибкой", "Отменённые"],
-            command=lambda _value: self._refresh_history_tab(), width=145
-        ).pack(side="left", padx=(8, 0))
-        ctk.CTkButton(
-            filters, text="Найти", width=80,
-            height=AppTheme.COMPACT_CONTROL_HEIGHT,
-            command=self._refresh_history_tab
-        ).pack(side="left", padx=(8, 0))
+            command=lambda _value: self._on_history_filter_changed(),
+            width=145
+        )
+        self.history_status_menu.pack(side="left", padx=(8, 0))
+        self.history_status_menu._read_only_during_compute = True
+
+        ctk.CTkLabel(
+            filters,
+            text="На странице:",
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY
+        ).pack(side="left", padx=(12, 5))
+
+        self.history_page_size_menu = ctk.CTkOptionMenu(
+            filters,
+            variable=self.history_page_size_var,
+            values=["5", "10", "20", "50"],
+            command=lambda _value: self._on_history_filter_changed(),
+            width=78
+        )
+        self.history_page_size_menu.pack(side="left")
+        self.history_page_size_menu._read_only_during_compute = True
+
         self.history_scrollable = ScrollableFrame(panel)
-        self.history_scrollable.pack(fill="both", expand=True, padx=6, pady=(0, 8))
+        self.history_scrollable.pack(
+            fill="both", expand=True, padx=6, pady=(0, 4)
+        )
         self.history_cards = []
-        self._refresh_history_tab()
+
+        pagination = ctk.CTkFrame(panel, fg_color="transparent")
+        pagination.pack(fill="x", padx=12, pady=(2, 8))
+
+        self.history_prev_button = ctk.CTkButton(
+            pagination,
+            text="← Предыдущая",
+            width=120,
+            height=AppTheme.COMPACT_CONTROL_HEIGHT,
+            command=lambda: self._change_history_page(-1)
+        )
+        self.history_prev_button.pack(side="left")
+        self.history_prev_button._read_only_during_compute = True
+
+        self.history_page_label = ctk.CTkLabel(
+            pagination,
+            text="Страница 1 из 1",
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY
+        )
+        self.history_page_label.pack(side="left", fill="x", expand=True)
+
+        self.history_next_button = ctk.CTkButton(
+            pagination,
+            text="Следующая →",
+            width=120,
+            height=AppTheme.COMPACT_CONTROL_HEIGHT,
+            command=lambda: self._change_history_page(1)
+        )
+        self.history_next_button.pack(side="right")
+        self.history_next_button._read_only_during_compute = True
+
+        self._refresh_history_tab(force=True)
         return panel
+
+    def _on_history_search_key_event(self, _event=None):
+        """Запустить реактивный поиск после ввода/вставки текста."""
+        self.history_page = 1
+
+        callback_id = getattr(self, "_history_search_after_id", None)
+        if callback_id:
+            self.after_cancel_safe(callback_id)
+
+        # Для Paste/Cut значение Entry обновляется после события,
+        # поэтому даём Tk закончить стандартную обработку.
+        self._history_search_after_id = self.after_safe(
+            120, self._apply_reactive_history_search
+        )
+
+    def _apply_reactive_history_search(self):
+        self._history_search_after_id = None
+
+        # Берём текст непосредственно из виджета — это устраняет рассинхронизацию
+        # между CTkEntry и StringVar на некоторых версиях CustomTkinter/Tk.
+        if hasattr(self, "history_search_entry"):
+            current_text = self.history_search_entry.get()
+            if current_text != self.history_search_var.get():
+                self.history_search_var.set(current_text)
+
+        self._refresh_history_tab(force=True)
+
+    def _on_history_filter_changed(self):
+        self.history_page = 1
+        self._refresh_history_tab(force=True)
+
+    def _change_history_page(self, delta):
+        target = self.history_page + int(delta)
+        target = max(1, min(target, max(1, self.history_total_pages)))
+        if target == self.history_page:
+            return
+        self.history_page = target
+        self._refresh_history_tab(force=True)
 
     def _refresh_history_tab(self, force=False):
         if not hasattr(self, "history_scrollable"):
@@ -2555,9 +3045,17 @@ class App(TkinterApp):
         for card in self.history_cards:
             card.destroy()
         self.history_cards.clear()
-        runs = self.run_history.list_runs(limit=200)
-        query = self.history_search_var.get().strip().casefold()
+        # Берём достаточно записей для локальной фильтрации и пагинации.
+        # Store возвращает их от новых к старым.
+        runs = self.run_history.list_runs(limit=1000)
+        query_source = (
+            self.history_search_entry.get()
+            if hasattr(self, "history_search_entry")
+            else self.history_search_var.get()
+        )
+        query = query_source.strip().casefold()
         status_filter = self.history_status_var.get()
+
         filtered_runs = []
         for run in runs:
             if status_filter == "Завершённые" and run["status"] != "completed":
@@ -2566,19 +3064,72 @@ class App(TkinterApp):
                 continue
             if status_filter == "Отменённые" and run["status"] != "cancelled":
                 continue
+
+            # В поиск обязательно включаем номер эксперимента: запрос "11"
+            # должен находить "Эксперимент №11".
             searchable = " ".join((
-                run.get("task_name", ""), run.get("image_path", ""),
-                run.get("pipeline_preset", ""), run.get("ml_algorithm", ""),
-                run.get("researcher_note", "")
+                str(run.get("id", "")),
+                str(run.get("created_at", "")),
+                run.get("task_name", ""),
+                run.get("image_path", ""),
+                run.get("pipeline_preset", ""),
+                run.get("ml_algorithm", ""),
+                run.get("researcher_note", ""),
+                run.get("status", ""),
             )).casefold()
             if query and query not in searchable:
                 continue
             filtered_runs.append(run)
-        runs = filtered_runs
+
+        total_runs = len(filtered_runs)
+        try:
+            page_size = max(1, int(self.history_page_size_var.get()))
+        except (TypeError, ValueError):
+            page_size = 5
+            self.history_page_size_var.set("5")
+
+        self.history_total_pages = max(
+            1, (total_runs + page_size - 1) // page_size
+        )
+        self.history_page = max(
+            1, min(self.history_page, self.history_total_pages)
+        )
+
+        start_index = (self.history_page - 1) * page_size
+        end_index = start_index + page_size
+        runs = filtered_runs[start_index:end_index]
+
+        if hasattr(self, "history_page_label"):
+            if total_runs:
+                first_number = start_index + 1
+                last_number = min(end_index, total_runs)
+                self.history_page_label.configure(
+                    text=(
+                        f"Страница {self.history_page} из "
+                        f"{self.history_total_pages} · "
+                        f"{first_number}–{last_number} из {total_runs}"
+                    )
+                )
+            else:
+                self.history_page_label.configure(text="Нет записей")
+
+        if hasattr(self, "history_prev_button"):
+            self.history_prev_button.configure(
+                state="normal" if self.history_page > 1 else "disabled"
+            )
+        if hasattr(self, "history_next_button"):
+            self.history_next_button.configure(
+                state=(
+                    "normal"
+                    if self.history_page < self.history_total_pages
+                    else "disabled"
+                )
+            )
+
         parent = self.history_scrollable.scrollable_frame
         if not runs:
             empty = ctk.CTkLabel(
-                parent, text="Завершённых запусков пока нет",
+                parent, text="По заданным условиям запусков не найдено",
                 text_color=AppTheme.TEXT_SECONDARY, font=AppTheme.body_font()
             )
             empty.pack(anchor="w", padx=12, pady=16)
@@ -2672,7 +3223,7 @@ class App(TkinterApp):
             view_results._read_only_during_compute = True
             view_results.pack(side="left", padx=(0, 6))
             ctk.CTkButton(
-                actions, text="Повторить с этими настройками", width=220,
+                actions, text="Продолжить исследование", width=190,
                 height=AppTheme.COMPACT_CONTROL_HEIGHT,
                 command=lambda run_id=run["id"]: self._restore_history_run(run_id)
             ).pack(side="left")
@@ -2725,6 +3276,7 @@ class App(TkinterApp):
 
     def _restore_history_run(self, run_id):
         import cv2
+        self._show_workspace()
         try:
             snapshot = self.run_history.get_settings(run_id)
             run_record = self.run_history.get_run(run_id)
@@ -2832,7 +3384,7 @@ class App(TkinterApp):
         return panel
 
     def _create_analysis_tab(self, parent):
-        """Единая страница параметров расчёта и экспорта результатов."""
+        """Единая страница параметров расчёта с двухколоночной компоновкой."""
         panel = ctk.CTkFrame(parent, fg_color="transparent")
         panel.pack(fill="both", expand=True)
         scrollable = ScrollableFrame(panel)
@@ -2843,64 +3395,102 @@ class App(TkinterApp):
         self._add_tab_heading(
             content,
             "Параметры расчёта",
-            "Выберите режим, этапы вычислений и форматы сохранения результатов."
+            "Настройте режим анализа, этапы вычислений и форматы сохранения результатов."
         )
 
-        self._setup_analysis_mode_section(content)
-
-        self.scales_section = CollapsibleFrame(content, title="Масштабы")
-        self.scales_section.pack(fill="x", padx=5, pady=2)
-        self._setup_scales_section()
-
-        self.two_d_section = CollapsibleFrame(content, title="Параметры 2D Morlet")
-        self._setup_2d_section()
-
-        self.extremes_section = CollapsibleFrame(
-            content, title="Параметры 1D-преобразования и экстремумов"
-        )
-        self.extremes_section.pack(fill="x", padx=5, pady=2)
-        self._setup_extremes_section()
+        # Строка 1: вычислительное устройство + режим вейвлет-анализа.
+        top_row = ctk.CTkFrame(content, fg_color="transparent")
+        top_row.pack(fill="x", padx=5, pady=(0, 4))
+        top_row.grid_columnconfigure((0, 1), weight=1, uniform="analysis_top")
 
         self.compute_settings_section = CollapsibleFrame(
-            content, title="Вычислительное устройство"
+            top_row,
+            title="Вычислительное устройство",
+            fg_color=AppTheme.NAV_HOVER,
+            corner_radius=10,
         )
-        self.compute_settings_section.pack(fill="x", padx=5, pady=2)
-        temp_label = ctk.CTkLabel(
+        self.compute_settings_section.grid(
+            row=0, column=0, sticky="nsew", padx=(0, 4)
+        )
+        ctk.CTkLabel(
             self.compute_settings_section.content,
-            text="Загрузка настроек...",
+            text="Определение устройств...",
             font=AppTheme.body_font(),
             text_color=AppTheme.MUTED
-        )
-        temp_label.pack(pady=10)
+        ).pack(pady=10)
 
+        self.analysis_mode_section = CollapsibleFrame(
+            top_row,
+            title="Режим вейвлет-анализа",
+            fg_color=AppTheme.NAV_HOVER,
+            corner_radius=10,
+        )
+        self.analysis_mode_section.grid(
+            row=0, column=1, sticky="nsew", padx=(4, 0)
+        )
+        self._populate_analysis_mode_section(self.analysis_mode_section.content)
+
+        # Строка 2: масштабы + настройки выбранного вейвлет-преобразования.
+        transform_row = ctk.CTkFrame(content, fg_color="transparent")
+        transform_row.pack(fill="x", padx=5, pady=4)
+        transform_row.grid_columnconfigure((0, 1), weight=1, uniform="analysis_transform")
+
+        self.scales_section = CollapsibleFrame(
+            transform_row,
+            title="Масштабы",
+            fg_color=AppTheme.NAV_HOVER,
+            corner_radius=10,
+        )
+        self.scales_section.grid(
+            row=0, column=0, sticky="nsew", padx=(0, 4)
+        )
+        self._setup_scales_section()
+
+        self.transform_slot = ctk.CTkFrame(transform_row, fg_color="transparent")
+        self.transform_slot.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        self.transform_slot.grid_columnconfigure(0, weight=1)
+
+        self.extremes_section = CollapsibleFrame(
+            self.transform_slot,
+            title="Настройки 1-D преобразования",
+            fg_color=AppTheme.NAV_HOVER,
+            corner_radius=10,
+        )
+        self.extremes_section.grid(row=0, column=0, sticky="nsew")
+        self._setup_extremes_section()
+
+        self.two_d_section = CollapsibleFrame(
+            self.transform_slot,
+            title="Настройки 2D Morlet",
+            fg_color=AppTheme.NAV_HOVER,
+            corner_radius=10,
+        )
+        self.two_d_section.grid(row=0, column=0, sticky="nsew")
+        self._setup_2d_section()
+        self.two_d_section.grid_remove()
+
+        # Строка 3: сценарий анализа.
         self.pipeline_section = CollapsibleFrame(content, title="Сценарий анализа")
-        self.pipeline_section.pack(fill="x", padx=5, pady=2)
+        self.pipeline_section.pack(fill="x", padx=5, pady=4)
         self._setup_pipeline_section()
 
-        self.wavelet_section = CollapsibleFrame(content, title="Экспорт: вейвлеты")
-        self.wavelet_section.pack(fill="x", padx=5, pady=2)
-        self._setup_wavelet_section()
-
-        self.output_extremes_section = CollapsibleFrame(
-            content, title="Экспорт: экстремумы и огибающие"
+        # Строка 4: параметры выбранных этапов.
+        self.stage_settings_section = CollapsibleFrame(
+            content, title="Настройки выбранных этапов"
         )
-        self.output_extremes_section.pack(fill="x", padx=5, pady=2)
-        self._setup_output_extremes_section()
+        self.stage_settings_section.pack(fill="x", padx=5, pady=4)
+        self._setup_stage_settings_section()
 
-        self.knn_section = CollapsibleFrame(content, title="KNN и углы")
-        self.knn_section.pack(fill="x", padx=5, pady=2)
-        self._setup_knn_section()
+        # Строка 5: экспорт результатов.
+        self.export_section = CollapsibleFrame(content, title="Экспорт результатов")
+        self.export_section.pack(fill="x", padx=5, pady=4)
+        self._setup_export_results_section()
 
-        self.statistics_section = CollapsibleFrame(
-            content, title="Статистики и синхронизации"
-        )
-        self.statistics_section.pack(fill="x", padx=5, pady=2)
-        self._setup_statistics_section()
-
+        # Строка 6: дополнительные файлы.
         self.intermediate_section = CollapsibleFrame(
-            content, title="Дополнительный экспорт"
+            content, title="Дополнительные файлы"
         )
-        self.intermediate_section.pack(fill="x", padx=5, pady=2)
+        self.intermediate_section.pack(fill="x", padx=5, pady=4)
         self._setup_intermediate_section()
 
         self.compute_section = ctk.CTkFrame(content, fg_color="transparent")
@@ -3420,48 +4010,46 @@ class App(TkinterApp):
             wraplength=420
         ).pack(fill="x", pady=(8, 0))
 
-    def _setup_analysis_mode_section(self, parent):
-        """Создать верхнеуровневый переключатель режима активной задачи."""
-        mode_frame = ctk.CTkFrame(parent, corner_radius=8)
-        mode_frame.pack(fill="x", padx=5, pady=(0, 8))
+    def _setup_analysis_mode_section(self, parent, manage_geometry=True):
+        """Создать отдельный блок выбора режима анализа."""
+        mode_frame = CollapsibleFrame(parent, title="Режим вейвлет-анализа")
+        if manage_geometry:
+            mode_frame.pack(fill="x", padx=5, pady=(0, 8))
+        self._populate_analysis_mode_section(mode_frame.content)
+        return mode_frame
 
-        ctk.CTkLabel(
-            mode_frame,
-            text="Режим вейвлет-анализа",
-            font=AppTheme.section_title_font(),
-            anchor="w"
-        ).pack(fill="x", padx=12, pady=(10, 6))
-
+    def _populate_analysis_mode_section(self, parent):
+        """Заполнить содержимое блока выбора режима активной задачи."""
         self.analysis_source_label = ctk.CTkLabel(
-            mode_frame,
+            parent,
             text="Источник: сначала загрузите изображение",
             font=AppTheme.body_font(),
             text_color=AppTheme.TEXT_SECONDARY,
             anchor="w"
         )
-        self.analysis_source_label.pack(fill="x", padx=12, pady=(0, 6))
+        self.analysis_source_label.pack(fill="x", padx=2, pady=(0, 6))
 
         self.analysis_mode_selector = ctk.CTkSegmentedButton(
-            mode_frame,
+            parent,
             values=list(self.ANALYSIS_MODE_LABELS.keys()),
             variable=self.analysis_mode_var,
             command=self.on_analysis_mode_changed,
             height=AppTheme.BUTTON_HEIGHT,
             state="disabled"
         )
-        self.analysis_mode_selector.pack(fill="x", padx=12, pady=(0, 8))
+        self.analysis_mode_selector.pack(fill="x", padx=2, pady=(0, 8))
         self.analysis_mode_selector.set("1D-анализ")
 
         self.analysis_mode_description = ctk.CTkLabel(
-            mode_frame,
+            parent,
             text="Создайте или активируйте задачу, чтобы выбрать режим.",
             font=AppTheme.caption_font(),
             text_color=AppTheme.MUTED,
             anchor="w",
             justify="left",
-            wraplength=430
+            wraplength=520
         )
-        self.analysis_mode_description.pack(fill="x", padx=12, pady=(0, 10))
+        self.analysis_mode_description.pack(fill="x", padx=2, pady=(0, 2))
 
     def on_analysis_mode_changed(self, selected_label):
         """Сохранить выбранный режим в активной задаче и обновить интерфейс."""
@@ -3505,6 +4093,10 @@ class App(TkinterApp):
                 text="Источник: сначала загрузите изображение",
                 text_color=AppTheme.TEXT_SECONDARY
             )
+            if hasattr(self, "two_d_section"):
+                self.two_d_section.grid_remove()
+            if hasattr(self, "extremes_section"):
+                self.extremes_section.grid()
             return
 
         mode = task.analysis_mode
@@ -3527,24 +4119,31 @@ class App(TkinterApp):
                 text="Одномерное преобразование Морле по строкам и/или столбцам изображения.",
                 text_color=AppTheme.TEXT_SECONDARY
             )
-            self.two_d_section.pack_forget()
-            for section in (self.extremes_section, self.pipeline_section,
-                            self.output_extremes_section, self.knn_section,
-                            self.statistics_section):
+            self.two_d_section.grid_remove()
+            self.extremes_section.grid()
+            for section in (
+                self.pipeline_section,
+                self.stage_settings_section,
+                self.export_section,
+            ):
                 if not section.winfo_manager():
-                    section.pack(fill="x", padx=5, pady=2, before=self.intermediate_section)
+                    section.pack(fill="x", padx=5, pady=4, before=self.intermediate_section)
         else:
             self.analysis_mode_description.configure(
                 text=("Двумерное комплексное преобразование Морле по масштабам "
                       "и ориентациям. Результат содержит модуль и фазу."),
                 text_color=AppTheme.TEXT_SECONDARY
             )
-            for section in (self.extremes_section, self.pipeline_section,
-                            self.output_extremes_section, self.knn_section,
-                            self.statistics_section):
+            self.extremes_section.grid_remove()
+            self.two_d_section.grid()
+            for section in (
+                self.pipeline_section,
+                self.stage_settings_section,
+            ):
                 section.pack_forget()
-            if not self.two_d_section.winfo_manager():
-                self.two_d_section.pack(fill="x", padx=5, pady=2, before=self.compute_settings_section)
+            # Экспорт оставляем: для 2D доступны вейвлетные результаты.
+            if not self.export_section.winfo_manager():
+                self.export_section.pack(fill="x", padx=5, pady=4, before=self.intermediate_section)
 
         self._update_pipeline_controls_state()
 
@@ -3624,75 +4223,110 @@ class App(TkinterApp):
         return panel
 
     def _setup_compute_settings_section(self):
-        """Настройка секции параметров вычислений"""
-        # Очищаем секцию
+        """Показать CPU/GPU и выбрать GPU по умолчанию, когда он доступен."""
         for widget in self.compute_settings_section.content.winfo_children():
             widget.destroy()
 
-        # Проверяем, что image_processor инициализирован
-        if not hasattr(self, 'image_processor') or self.image_processor is None:
-            error_label = ctk.CTkLabel(
+        if not hasattr(self, "image_processor") or self.image_processor is None:
+            ctk.CTkLabel(
                 self.compute_settings_section.content,
-                text="Ошибка инициализации процессора",
-                font=AppTheme.body_font(),
-                text_color=AppTheme.DANGER
-            )
-            error_label.pack(pady=10)
+                text="Определение устройств...",
+                font=AppTheme.body_font(), text_color=AppTheme.MUTED
+            ).pack(anchor="w", pady=8)
             return
 
-        # Информация о доступном и активном вычислительном устройстве.
-        backend_info = self.image_processor.get_backend_info()
-        gpu_available = backend_info['gpu_available']
-        pending = backend_info.get('status') == 'pending' or not backend_info.get('gpu_checked', True)
+        info = self.image_processor.get_backend_info()
+        pending = info.get("status") == "pending" or not info.get("gpu_checked", False)
+        gpu_available = bool(info.get("gpu_available", False))
 
-        status_label = ctk.CTkLabel(
-            self.compute_settings_section.content,
-            text=("Устройство будет определено при запуске расчёта" if pending else
-                  "GPU доступен" if gpu_available else "GPU не обнаружен"),
-            font=AppTheme.body_font(),
-            text_color=AppTheme.GPU_AVAILABLE if gpu_available else AppTheme.WARNING,
-            anchor="w"
+        cpu_name, cpu_details = self._get_cpu_display_info()
+        self.compute_device_var.set("gpu" if info.get("use_gpu") and gpu_available else "cpu")
+
+        cpu_row = ctk.CTkFrame(self.compute_settings_section.content, fg_color="transparent")
+        cpu_row.pack(fill="x", pady=(0, 8))
+        self.cpu_radio = ctk.CTkRadioButton(
+            cpu_row, text="CPU", variable=self.compute_device_var, value="cpu",
+            command=self._on_compute_device_changed
         )
-        status_label.pack(fill="x", pady=(0, 4))
+        self.cpu_radio.pack(anchor="w")
+        ctk.CTkLabel(
+            cpu_row, text=f"{cpu_name} | {cpu_details}",
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w", justify="left"
+        ).pack(fill="x", padx=(28, 0), pady=(2, 0))
+
+        gpu_row = ctk.CTkFrame(self.compute_settings_section.content, fg_color="transparent")
+        gpu_row.pack(fill="x")
+        self.gpu_radio = ctk.CTkRadioButton(
+            gpu_row, text="GPU (CUDA)", variable=self.compute_device_var, value="gpu",
+            command=self._on_compute_device_changed,
+            state="disabled" if pending or not gpu_available else "normal"
+        )
+        self.gpu_radio.pack(anchor="w")
 
         if pending:
-            gpu_details = "GPU при наличии; иначе CPU" if self.image_processor.backend.use_gpu else "Выбран CPU"
+            gpu_text = "Проверка доступности GPU..."
+            gpu_color = AppTheme.MUTED
         elif gpu_available:
-            gpu_details = backend_info['gpu_device_name']
-            if backend_info['gpu_memory'] != "N/A":
-                gpu_details += f" | Память: {backend_info['gpu_memory']}"
+            gpu_text = info.get("gpu_device_name", "GPU")
+            memory = info.get("gpu_memory", "N/A")
+            if memory != "N/A":
+                gpu_text += f" | Память: {memory}"
+            gpu_color = AppTheme.GPU_AVAILABLE
         else:
-            gpu_details = "Вычисления будут выполняться на CPU"
+            gpu_text = "Совместимый GPU не обнаружен"
+            gpu_color = AppTheme.WARNING
 
-        details_label = ctk.CTkLabel(
-            self.compute_settings_section.content,
-            text=gpu_details,
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w"
-        )
-        details_label.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(
+            gpu_row, text=gpu_text,
+            font=AppTheme.caption_font(), text_color=gpu_color,
+            anchor="w", justify="left"
+        ).pack(fill="x", padx=(28, 0), pady=(2, 0))
 
-        self.gpu_switch = ctk.CTkSwitch(
-            self.compute_settings_section.content,
-            text="Использовать GPU",
-            variable=self.use_gpu_var,
-            command=self.toggle_gpu_backend,
-            state="normal" if gpu_available or pending else "disabled"
+    @staticmethod
+    def _get_cpu_display_info():
+        """Короткое человекочитаемое описание CPU без обязательных зависимостей."""
+        name = platform.processor().strip()
+        if not name and sys.platform.startswith("win"):
+            try:
+                import winreg
+                with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
+                ) as key:
+                    name = str(winreg.QueryValueEx(key, "ProcessorNameString")[0]).strip()
+            except Exception:
+                name = ""
+        if not name:
+            name = platform.machine() or "CPU"
+        logical = os.cpu_count() or 1
+        physical = None
+        try:
+            import psutil
+            physical = psutil.cpu_count(logical=False)
+        except Exception:
+            pass
+        if physical:
+            details = f"{physical} ядер, {logical} потоков"
+        else:
+            details = f"{logical} логических потоков"
+        return name, details
+
+    def _on_compute_device_changed(self):
+        requested_gpu = self.compute_device_var.get() == "gpu"
+        enabled, _ = self.image_processor.set_gpu_enabled(requested_gpu)
+        self.use_gpu_var.set(enabled)
+        self.compute_device_var.set("gpu" if enabled else "cpu")
+        self.progress_manager.log_info(
+            f"Для вычислений выбран {'GPU' if enabled else 'CPU'}"
         )
-        self.use_gpu_var.set(self.image_processor.backend.use_gpu)
-        self.gpu_switch.pack(fill="x", pady=(2, 8))
+        self._update_compute_settings_display()
+        self._update_gpu_section()
 
     def toggle_gpu_backend(self):
-        """Применить состояние переключателя CPU/GPU."""
-        requested_state = self.use_gpu_var.get()
-        enabled, backend_info = self.image_processor.set_gpu_enabled(requested_state)
-        self.use_gpu_var.set(enabled)
-        active_device = "GPU" if enabled else "CPU"
-        self.progress_manager.log_info(f"Для вычислений выбран {active_device}")
-        self._update_compute_settings_display()
-        self.after(0, self._update_gpu_section)
-
+        """Обратная совместимость со старым переключателем GPU."""
+        self.compute_device_var.set("gpu" if self.use_gpu_var.get() else "cpu")
+        self._on_compute_device_changed()
 
     def _update_compute_settings_display(self):
         """Обновление отображения настроек вычислений"""
@@ -3847,56 +4481,53 @@ class App(TkinterApp):
         self.scales_section.add_widget(self.label_custom_scale, pady=(5, 0))
 
     def _setup_extremes_section(self):
-        """Параметры 1D-направлений и типов экстремумов."""
-        direction_frame = ctk.CTkFrame(
-            self.extremes_section.content, fg_color="transparent"
-        )
-        self.extremes_section.add_widget(direction_frame, pady=2)
+        """Параметры 1D-направлений и типов экстремумов в две колонки."""
+        grid = ctk.CTkFrame(self.extremes_section.content, fg_color="transparent")
+        self.extremes_section.add_widget(grid, pady=2)
+        grid.grid_columnconfigure((0, 1), weight=1, uniform="transform_options")
+
+        direction_frame = ctk.CTkFrame(grid, fg_color="transparent")
+        direction_frame.grid(row=0, column=0, sticky="nw", padx=(0, 10))
         ctk.CTkLabel(
-            direction_frame, text="Направления 1D-преобразования:",
+            direction_frame, text="Направления:",
             font=AppTheme.body_font(), anchor="w"
-        ).pack(fill="x")
-        directions_subframe = ctk.CTkFrame(direction_frame, fg_color="transparent")
-        directions_subframe.pack(fill="x", pady=5)
+        ).pack(fill="x", pady=(0, 5))
         self.row_checkbox = ctk.CTkCheckBox(
-            directions_subframe, text="По строкам", variable=self.row_var,
+            direction_frame, text="По строкам", variable=self.row_var,
             command=self._on_direction_changed
         )
-        self.row_checkbox.pack(side="left", padx=(0, 10))
+        self.row_checkbox.pack(anchor="w", pady=3)
         self.col_checkbox = ctk.CTkCheckBox(
-            directions_subframe, text="По столбцам", variable=self.col_var,
+            direction_frame, text="По столбцам", variable=self.col_var,
             command=self._on_direction_changed
         )
-        self.col_checkbox.pack(side="left")
+        self.col_checkbox.pack(anchor="w", pady=3)
+
+        type_frame = ctk.CTkFrame(grid, fg_color="transparent")
+        type_frame.grid(row=0, column=1, sticky="nw", padx=(10, 0))
+        ctk.CTkLabel(
+            type_frame, text="Тип экстремумов:",
+            font=AppTheme.body_font(), anchor="w"
+        ).pack(fill="x", pady=(0, 5))
+        self.max_checkbox = ctk.CTkCheckBox(
+            type_frame, text="Максимумы", variable=self.max_var,
+            command=self._store_settings_for_current_task
+        )
+        self.max_checkbox.pack(anchor="w", pady=3)
+        self.min_checkbox = ctk.CTkCheckBox(
+            type_frame, text="Минимумы", variable=self.min_var,
+            command=self._store_settings_for_current_task
+        )
+        self.min_checkbox.pack(anchor="w", pady=3)
 
         self.extremes_hint_label = ctk.CTkLabel(
-            direction_frame,
-            text="Экстремумы и последующие этапы доступны для построчного результата.",
-            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w", justify="left", wraplength=500
+            self.extremes_section.content,
+            text="",
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w"
         )
-        self.extremes_hint_label.pack(fill="x", pady=(2, 6))
-
-        type_frame = ctk.CTkFrame(
-            self.extremes_section.content, fg_color="transparent"
-        )
-        self.extremes_section.add_widget(type_frame, pady=2)
-        ctk.CTkLabel(
-            type_frame, text="Типы экстремумов:",
-            font=AppTheme.body_font(), anchor="w"
-        ).pack(fill="x")
-        types_subframe = ctk.CTkFrame(type_frame, fg_color="transparent")
-        types_subframe.pack(fill="x", pady=5)
-        self.max_checkbox = ctk.CTkCheckBox(
-            types_subframe, text="Максимумы", variable=self.max_var,
-            command=self._store_settings_for_current_task
-        )
-        self.max_checkbox.pack(side="left", padx=(0, 10))
-        self.min_checkbox = ctk.CTkCheckBox(
-            types_subframe, text="Минимумы", variable=self.min_var,
-            command=self._store_settings_for_current_task
-        )
-        self.min_checkbox.pack(side="left")
+        # Подсказку намеренно не размещаем: состояние отражается доступностью элементов.
 
     def _on_direction_changed(self):
         """Сразу синхронизировать направления и доступность зависимых этапов."""
@@ -4199,8 +4830,6 @@ class App(TkinterApp):
                 enabled_stages.append("статистики")
             if plan.synchronization:
                 enabled_stages.append("синхронизации")
-            if plan.ml:
-                enabled_stages.append("ML-кластеризация")
             lines.append("Этапы: " + ", ".join(enabled_stages))
             lines.append(
                 f"KNN: {task.k_neighbors} соседей"
@@ -4249,9 +4878,7 @@ class App(TkinterApp):
             self.calculate_knn_var.set(self.current_task.calculate_knn)
             self.wp_var1.set(self.current_task.output_wavelet_image)
             self.wp_var2.set(self.current_task.output_wavelet_text)
-            self.wavelet_numpy_var.set(
-                self.current_task.output_wavelet_numpy
-            )
+            self.wavelet_numpy_var.set(False)
             self.p_ex_var1.set(self.current_task.output_extremes_text)
             self.p_ex_var2.set(self.current_task.output_extremes_image)
             self.envelope_text_var.set(
@@ -4725,7 +5352,7 @@ class App(TkinterApp):
         task.calculate_knn = bool(self.calculate_knn_var.get())
         task.output_wavelet_image = bool(self.wp_var1.get())
         task.output_wavelet_text = bool(self.wp_var2.get())
-        task.output_wavelet_numpy = bool(self.wavelet_numpy_var.get())
+        task.output_wavelet_numpy = False
         task.output_extremes_text = bool(self.p_ex_var1.get())
         task.output_extremes_image = bool(self.p_ex_var2.get())
         task.output_envelopes_text = bool(self.envelope_text_var.get())
@@ -4804,97 +5431,88 @@ class App(TkinterApp):
             self.after_idle(self._update_action_availability)
 
     def _setup_pipeline_section(self):
-        """Единая точка управления этапами вычислительного конвейера."""
+        """Управление готовым сценарием и ручными флажками этапов."""
+        top = ctk.CTkFrame(self.pipeline_section.content, fg_color="transparent")
+        self.pipeline_section.add_widget(top, pady=(0, 8))
         ctk.CTkLabel(
-            self.pipeline_section.content,
-            text="Готовый сценарий",
-            font=AppTheme.body_font(),
-            anchor="w"
-        ).pack(fill="x", padx=5, pady=(0, 4))
+            top, text="Готовый сценарий:",
+            font=AppTheme.body_font(), anchor="w"
+        ).pack(side="left", padx=(0, 12))
 
-        preset_values = [
-            "Пользовательский",
-            *self.current_pipeline_preset_names(),
-        ]
+        preset_values = ["Пользовательский", *self.current_pipeline_preset_names()]
         self.pipeline_preset_selector = ctk.CTkOptionMenu(
-            self.pipeline_section.content,
+            top,
             values=preset_values,
             variable=self.pipeline_preset_var,
             command=self.on_pipeline_preset_changed,
-            width=AppTheme.DROPDOWN_WIDTH
+            width=260
         )
-        self.pipeline_preset_selector.pack(
-            anchor="w", padx=5, pady=(0, 10)
+        self.pipeline_preset_selector.pack(side="left")
+        self.pipeline_preset_tooltip = HoverTooltip(
+            self.pipeline_preset_selector,
+            text_provider=self._current_pipeline_tooltip_text,
+            delay_ms=450,
+            wraplength=390,
         )
 
-        self.calculate_extrema_switch = ctk.CTkSwitch(
-            self.pipeline_section.content,
-            text="Искать экстремумы",
+        stages = ctk.CTkFrame(self.pipeline_section.content, fg_color="transparent")
+        self.pipeline_section.add_widget(stages, pady=(4, 2))
+        stages.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
+
+        self.wavelet_required_var = tk.BooleanVar(value=True)
+        self.wavelet_required_checkbox = ctk.CTkCheckBox(
+            stages, text="Вейвлеты", variable=self.wavelet_required_var,
+            state="disabled"
+        )
+        self.wavelet_required_checkbox.grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+        self.calculate_extrema_switch = ctk.CTkCheckBox(
+            stages,
+            text="Экстремумы",
             variable=self.calculate_extrema_var,
-            command=self._on_pipeline_controls_changed
+            command=lambda: self._on_pipeline_controls_changed("extrema")
         )
-        self.calculate_extrema_switch.pack(fill="x", padx=5, pady=4)
+        self.calculate_extrema_switch.grid(row=0, column=1, sticky="w", padx=10)
 
-        self.calculate_envelopes_switch = ctk.CTkSwitch(
-            self.pipeline_section.content,
-            text="Строить огибающие",
+        self.calculate_envelopes_switch = ctk.CTkCheckBox(
+            stages,
+            text="Огибающие",
             variable=self.calculate_envelopes_var,
-            command=self._on_pipeline_controls_changed
+            command=lambda: self._on_pipeline_controls_changed("envelopes")
         )
-        self.calculate_envelopes_switch.pack(fill="x", padx=5, pady=4)
+        self.calculate_envelopes_switch.grid(row=0, column=2, sticky="w", padx=10)
 
-        self.calculate_knn_switch = ctk.CTkSwitch(
-            self.pipeline_section.content,
-            text="Выполнять KNN и расчёт углов",
+        self.calculate_knn_switch = ctk.CTkCheckBox(
+            stages,
+            text="KNN и углы",
             variable=self.calculate_knn_var,
-            command=self._on_pipeline_controls_changed
+            command=lambda: self._on_pipeline_controls_changed("knn")
         )
-        self.calculate_knn_switch.pack(fill="x", padx=5, pady=4)
+        self.calculate_knn_switch.grid(row=0, column=3, sticky="w", padx=10)
 
-        self.calculate_statistics_switch = ctk.CTkSwitch(
-            self.pipeline_section.content,
-            text="Считать статистики экстремумов",
+        self.calculate_statistics_switch = ctk.CTkCheckBox(
+            stages,
+            text="Статистики",
             variable=self.calculate_statistics_var,
-            command=self._on_statistics_stage_changed
+            command=lambda: self._on_pipeline_controls_changed("statistics")
         )
-        self.calculate_statistics_switch.pack(fill="x", padx=5, pady=4)
+        self.calculate_statistics_switch.grid(row=0, column=4, sticky="w", padx=(10, 0))
 
-        self.calculate_sync_switch = ctk.CTkSwitch(
-            self.pipeline_section.content,
-            text="Считать межстрочные синхронизации",
-            variable=self.calculate_sync_var,
-            command=self._on_statistics_stage_changed
-        )
-        self.calculate_sync_switch.pack(fill="x", padx=5, pady=4)
-
-        ctk.CTkLabel(
-            self.pipeline_section.content,
-            text="Фактическая цепочка",
-            font=AppTheme.section_title_font(), anchor="w"
-        ).pack(fill="x", padx=5, pady=(12, 3))
-        self.pipeline_chain_label = ctk.CTkLabel(
-            self.pipeline_section.content,
-            text="Вейвлеты",
-            font=AppTheme.body_font(),
-            text_color=AppTheme.INFO,
-            anchor="w", justify="left", wraplength=400
-        )
-        self.pipeline_chain_label.pack(fill="x", padx=5, pady=(0, 3))
-
-        self.pipeline_dependency_label = ctk.CTkLabel(
-            self.pipeline_section.content,
-            text="Вейвлет-преобразование выполняется всегда.",
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w",
-            justify="left",
-            wraplength=400
-        )
-        self.pipeline_dependency_label.pack(fill="x", padx=5, pady=(8, 0))
+        # Синхронизация пока остаётся частью вычислительной модели, но не входит
+        # в набор пользовательских сценариев этой страницы.
+        self.calculate_sync_switch = None
+        self.pipeline_chain_label = None
+        self.pipeline_dependency_label = None
         self.after_idle(self._update_pipeline_controls_state)
 
-    @staticmethod
-    def current_pipeline_preset_names():
+    def _current_pipeline_tooltip_text(self):
+        preset = self.pipeline_preset_var.get() or "Пользовательский"
+        return ProcessingTask.PIPELINE_DESCRIPTIONS.get(
+            preset,
+            ProcessingTask.PIPELINE_DESCRIPTIONS["Пользовательский"]
+        )
+
+    def current_pipeline_preset_names(self):
         return list(ProcessingTask.PIPELINE_PRESETS.keys())
 
     def on_pipeline_preset_changed(self, preset_name):
@@ -4905,92 +5523,169 @@ class App(TkinterApp):
         self.current_task.apply_pipeline_preset(preset_name)
         self._update_ui_for_current_task()
 
-    def _on_pipeline_controls_changed(self):
-        """Перевести сценарий в пользовательский после ручного изменения."""
-        if self.current_task is not None and not self._loading_task_settings:
-            self.current_task.pipeline_preset = "Пользовательский"
-            self.pipeline_preset_var.set("Пользовательский")
+    def _on_pipeline_controls_changed(self, changed_stage=None):
+        """Обработать ручное изменение этапов с учётом зависимостей.
+
+        Граф зависимостей 1-D pipeline:
+
+            Вейвлеты (всегда)
+                ↓
+            Экстремумы
+                ↓
+            Огибающие
+             ↙       ↘
+           KNN     Статистики
+
+        Правила:
+        - включение нижележащего этапа автоматически включает prerequisites;
+        - выключение prerequisite каскадно выключает зависимые этапы;
+        - после нормализации комбинации автоматически подбирается готовый
+          сценарий, либо «Пользовательский».
+        """
+        if self._loading_task_settings:
+            return
+
+        task = getattr(self, "current_task", None)
+        if task is None:
+            return
+
+        extrema = bool(self.calculate_extrema_var.get())
+        envelopes = bool(self.calculate_envelopes_var.get())
+        knn = bool(self.calculate_knn_var.get())
+        statistics = bool(self.calculate_statistics_var.get())
+
+        status_message = None
+
+        # -------------------------------------------------------------
+        # Включение этапа: автоматически включаем все необходимые этапы
+        # перед ним. Невалидная цепочка в интерфейсе не допускается.
+        # -------------------------------------------------------------
+        if changed_stage == "envelopes" and envelopes:
+            if not extrema:
+                extrema = True
+                status_message = "Для огибающих автоматически включены экстремумы."
+
+        elif changed_stage == "knn" and knn:
+            added = []
+            if not extrema:
+                extrema = True
+                added.append("экстремумы")
+            if not envelopes:
+                envelopes = True
+                added.append("огибающие")
+            if added:
+                status_message = (
+                    "Для KNN автоматически включены: " + ", ".join(added) + "."
+                )
+
+        elif changed_stage == "statistics" and statistics:
+            added = []
+            if not extrema:
+                extrema = True
+                added.append("экстремумы")
+            if not envelopes:
+                envelopes = True
+                added.append("огибающие")
+            if added:
+                status_message = (
+                    "Для статистик автоматически включены: "
+                    + ", ".join(added)
+                    + "."
+                )
+
+        # -------------------------------------------------------------
+        # Выключение prerequisite: зависимые этапы выключаются каскадно.
+        # Это безопаснее, чем оставлять KNN/статистики на данных другого
+        # смысла или незаметно возвращать снятый пользователем флажок.
+        # -------------------------------------------------------------
+        if changed_stage == "extrema" and not extrema:
+            disabled = []
+            if envelopes:
+                envelopes = False
+                disabled.append("огибающие")
+            if knn:
+                knn = False
+                disabled.append("KNN")
+            if statistics:
+                statistics = False
+                disabled.append("статистики")
+            if disabled:
+                status_message = (
+                    "Экстремумы отключены → также отключены: "
+                    + ", ".join(disabled)
+                    + "."
+                )
+
+        elif changed_stage == "envelopes" and not envelopes:
+            disabled = []
+            if knn:
+                knn = False
+                disabled.append("KNN")
+            if statistics:
+                statistics = False
+                disabled.append("статистики")
+            if disabled:
+                status_message = (
+                    "Огибающие отключены → также отключены: "
+                    + ", ".join(disabled)
+                    + "."
+                )
+
+        # Финальная страховка: комбинация всегда должна удовлетворять DAG.
+        if knn or statistics:
+            envelopes = True
+            extrema = True
+        elif envelopes:
+            extrema = True
+
+        self.calculate_extrema_var.set(extrema)
+        self.calculate_envelopes_var.set(envelopes)
+        self.calculate_knn_var.set(knn)
+        self.calculate_statistics_var.set(statistics)
+
+        # На этой странице синхронизация пока не является этапом сценария.
+        self.calculate_sync_var.set(False)
+
         self._store_settings_for_current_task()
+        task.calculate_synchronization = False
+
+        matched = task.match_pipeline_preset()
+        task.pipeline_preset = matched
+        self.pipeline_preset_var.set(matched)
+
+        if status_message:
+            self._set_workflow_status(status_message, AppTheme.TEXT_ON_DARK)
+
         self._update_pipeline_controls_state()
 
     def _update_pipeline_controls_state(self):
-        """Отобразить фактический план и состояния зависимых форматов."""
+        """Синхронизировать доступность этапов, настроек и экспортов."""
         task = getattr(self, "current_task", None)
+        stage_widgets = (
+            self.calculate_extrema_switch,
+            self.calculate_envelopes_switch,
+            self.calculate_knn_switch,
+            self.calculate_statistics_switch,
+        )
         if task is None:
-            for widget in (
-                    self.pipeline_preset_selector,
-                    self.calculate_extrema_switch,
-                    self.calculate_envelopes_switch,
-                    self.calculate_knn_switch,
-                    self.calculate_statistics_switch,
-                    self.calculate_sync_switch):
+            if self.pipeline_preset_selector is not None:
+                self.pipeline_preset_selector.configure(state="disabled")
+            for widget in stage_widgets:
                 if widget is not None:
                     widget.configure(state="disabled")
-            if self.pipeline_dependency_label is not None:
-                self.pipeline_dependency_label.configure(
-                    text="Создайте или активируйте задачу."
-                )
-            if self.pipeline_chain_label is not None:
-                self.pipeline_chain_label.configure(text="Нет активной задачи")
             return
 
         is_1d = task.analysis_mode == "1d"
         if self.pipeline_preset_selector is not None:
-            self.pipeline_preset_selector.configure(
-                state="normal" if is_1d else "disabled"
-            )
+            self.pipeline_preset_selector.configure(state="normal" if is_1d else "disabled")
+
         row_available = is_1d and task.process_rows
         stage_state = "normal" if row_available else "disabled"
-        for widget in (
-                self.calculate_extrema_switch,
-                self.calculate_envelopes_switch,
-                self.calculate_knn_switch,
-                self.calculate_statistics_switch,
-                self.calculate_sync_switch):
+        for widget in stage_widgets:
             if widget is not None:
                 widget.configure(state=stage_state)
 
         plan = task.resolve_pipeline()
-        if self.pipeline_chain_label is not None:
-            self.pipeline_chain_label.configure(
-                text=task.executed_stage_summary()
-            )
-        reasons = plan.automatic_reasons()
-        if not is_1d:
-            dependency_text = (
-                "Для 2D сейчас выполняется отдельный базовый этап Morlet. "
-                "Последующие 2D-этапы будут добавлены отдельно."
-            )
-        elif not task.process_rows:
-            dependency_text = (
-                "Экстремумы и последующие этапы требуют включённого "
-                "построчного 1D-преобразования."
-            )
-        elif reasons or (plan.maxima_required and not task.find_maxima):
-            stage_names = {
-                "extrema": "экстремумы",
-                "envelopes": "огибающие",
-            }
-            reason_items = [
-                f"{stage_names.get(name, name)} — {reason}"
-                for name, reason in reasons.items()
-            ]
-            if plan.maxima_required and not task.find_maxima:
-                reason_items.append(
-                    "максимумы — требуются выбранными этапами анализа"
-                )
-            dependency_text = "Автоматически: " + "; ".join(reason_items)
-            if plan.ml:
-                dependency_text += ". Затем автоматически выполняется ML-кластеризация."
-        elif plan.ml:
-            dependency_text = (
-                "После KNN автоматически выполняется выбранная ML-кластеризация."
-            )
-        else:
-            dependency_text = "Вейвлет-преобразование выполняется всегда."
-        if self.pipeline_dependency_label is not None:
-            self.pipeline_dependency_label.configure(text=dependency_text)
-
         for widget in self.extremes_output_widgets:
             widget.configure(state="normal" if plan.extrema else "disabled")
         for widget in self.envelopes_output_widgets:
@@ -5002,21 +5697,157 @@ class App(TkinterApp):
         for widget in (self.max_checkbox, self.min_checkbox):
             if widget is not None:
                 widget.configure(state=point_state)
+
         if self.entry_near_point is not None:
-            self.entry_near_point.configure(
-                state="normal" if task.analysis_mode == '1d' else "disabled"
-            )
-        if self.extremes_hint_label is not None and row_available:
-            self.extremes_hint_label.configure(
-                text=(
-                    "Выберите типы экстремумов для активного конвейера."
-                    if plan.extrema else
-                    "Включите экстремумы или один из зависимых этапов."
-                ),
-                text_color=AppTheme.TEXT_SECONDARY
-            )
+            self.entry_near_point.configure(state="normal" if plan.knn else "disabled")
 
         self._update_statistics_controls_state()
+        self._update_export_rows_visibility()
+
+    def _setup_stage_settings_section(self):
+        """Карточки параметров этапов, которые требуют дополнительных настроек."""
+        holder = ctk.CTkFrame(self.stage_settings_section.content, fg_color="transparent")
+        self.stage_settings_section.add_widget(holder, pady=0)
+        holder.grid_columnconfigure((0, 1), weight=1, uniform="stage_settings")
+
+        self.knn_settings_card = ctk.CTkFrame(holder)
+        self.knn_settings_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        ctk.CTkLabel(
+            self.knn_settings_card, text="KNN и углы",
+            font=AppTheme.section_title_font(), anchor="w"
+        ).pack(fill="x", padx=12, pady=(10, 6))
+        row = ctk.CTkFrame(self.knn_settings_card, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=(0, 12))
+        ctk.CTkLabel(row, text="Количество ближайших точек:", anchor="w").pack(side="left")
+        self.entry_near_point = ctk.CTkEntry(
+            row, textvariable=self.knn_text_var, placeholder_text="5", width=130
+        )
+        self.entry_near_point.pack(side="right")
+        self.entry_near_point.bind("<Button-1>", self.on_entry_click)
+        self.entry_near_point.bind("<KeyPress>", self.on_entry_click)
+        self.entry_near_point.bind("<<Paste>>", self.on_entry_click)
+
+        self.statistics_settings_card = ctk.CTkFrame(holder)
+        self.statistics_settings_card.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        ctk.CTkLabel(
+            self.statistics_settings_card, text="Статистики",
+            font=AppTheme.section_title_font(), anchor="w"
+        ).pack(fill="x", padx=12, pady=(10, 4))
+        ctk.CTkLabel(
+            self.statistics_settings_card,
+            text="Интеграция и детальная настройка статистик будет расширена позже.",
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w", justify="left", wraplength=430
+        ).pack(fill="x", padx=12, pady=(0, 6))
+        stats_row = ctk.CTkFrame(self.statistics_settings_card, fg_color="transparent")
+        stats_row.pack(fill="x", padx=12, pady=(0, 12))
+        ctk.CTkLabel(stats_row, text="Размер блока масштабов:", anchor="w").pack(side="left")
+        self.scale_block_sizes_entry = ctk.CTkEntry(
+            stats_row, textvariable=self.scale_block_sizes_var,
+            placeholder_text="5", width=130
+        )
+        self.scale_block_sizes_entry.pack(side="right")
+        self.statistics_parameter_widgets = [self.scale_block_sizes_entry]
+        self.synchronization_parameter_widgets = []
+        self.synchronization_output_widgets = []
+
+    def _setup_export_results_section(self):
+        """Единая таблица экспорта: текстовый файл и PNG."""
+        table = ctk.CTkFrame(self.export_section.content, fg_color="transparent")
+        self.export_section.add_widget(table, pady=0)
+        table.grid_columnconfigure(0, weight=2)
+        table.grid_columnconfigure((1, 2), weight=1, uniform="export_formats")
+
+        headers = ("Результат", "Текстовый файл", "PNG")
+        for column, title in enumerate(headers):
+            ctk.CTkLabel(
+                table, text=title, font=AppTheme.section_title_font(),
+                anchor="w" if column == 0 else "center"
+            ).grid(row=0, column=column, sticky="ew", padx=8, pady=(4, 7))
+
+        rows = [
+            ("Вейвлеты", self.wp_var2, self.wp_var1, "wavelet"),
+            ("Экстремумы", self.p_ex_var1, self.p_ex_var2, "extrema"),
+            ("Огибающие", self.envelope_text_var, self.envelope_image_var, "envelopes"),
+            ("KNN и углы", self.knn_bool_text_var, self.knn_bool_image_var, "knn"),
+            ("Статистики", self.statistics_csv_var, self.statistics_image_var, "statistics"),
+        ]
+        self.extremes_output_widgets = []
+        self.envelopes_output_widgets = []
+        self.knn_output_widgets = []
+        self.statistics_output_widgets = []
+        self.export_result_rows = {}
+
+        for row_index, (label, text_var, png_var, kind) in enumerate(rows, start=1):
+            label_widget = ctk.CTkLabel(table, text=label, anchor="w")
+            label_widget.grid(
+                row=row_index, column=0, sticky="ew", padx=8, pady=3
+            )
+
+            text_cb = ctk.CTkCheckBox(
+                table, text="", variable=text_var, width=24
+            )
+            text_cb.grid(row=row_index, column=1, pady=3)
+
+            png_cb = ctk.CTkCheckBox(
+                table, text="", variable=png_var, width=24
+            )
+            png_cb.grid(row=row_index, column=2, pady=3)
+
+            self.export_result_rows[kind] = (
+                label_widget,
+                text_cb,
+                png_cb,
+            )
+
+            if kind == "extrema":
+                self.extremes_output_widgets.extend([text_cb, png_cb])
+            elif kind == "envelopes":
+                self.envelopes_output_widgets.extend([text_cb, png_cb])
+            elif kind == "knn":
+                self.knn_output_widgets.extend([text_cb, png_cb])
+            elif kind == "statistics":
+                self.statistics_output_widgets.extend([text_cb, png_cb])
+
+        # Вейвлеты рассчитываются всегда, поэтому их строка всегда видима.
+        # Остальные строки покажет _update_export_rows_visibility().
+        self._update_export_rows_visibility()
+
+        # NPY больше не является пользовательским форматом экспорта.
+        self.wavelet_numpy_var.set(False)
+
+    def _update_export_rows_visibility(self):
+        """Показывать в таблице экспорта только реально вычисляемые этапы."""
+        rows = getattr(self, "export_result_rows", None)
+        if not rows:
+            return
+
+        task = getattr(self, "current_task", None)
+
+        visibility = {
+            "wavelet": True,
+            "extrema": False,
+            "envelopes": False,
+            "knn": False,
+            "statistics": False,
+        }
+
+        if task is not None:
+            plan = task.resolve_pipeline()
+            visibility.update({
+                "extrema": bool(plan.extrema),
+                "envelopes": bool(plan.envelopes),
+                "knn": bool(plan.knn),
+                "statistics": bool(plan.statistics),
+            })
+
+        for kind, widgets in rows.items():
+            visible = visibility.get(kind, False)
+            for widget in widgets:
+                if visible:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
 
     def _setup_wavelet_section(self):
         """Настройка секции вейвлет-преобразования"""
@@ -5209,45 +6040,21 @@ class App(TkinterApp):
         self._update_statistics_controls_state()
 
     def _on_statistics_stage_changed(self):
-        if self.current_task is not None and not self._loading_task_settings:
-            self.current_task.pipeline_preset = "Пользовательский"
-            self.pipeline_preset_var.set("Пользовательский")
-        self._store_settings_for_current_task()
-        self._update_pipeline_controls_state()
+        self._on_pipeline_controls_changed()
 
     def _update_statistics_controls_state(self):
-        """Блокировать форматы вывода, когда соответствующий расчёт отключён."""
+        """Блокировать настройки/экспорт статистик, пока этап не выбран."""
         task = getattr(self, "current_task", None)
         row_analysis_available = bool(
-            task is not None
-            and task.analysis_mode == "1d"
-            and task.process_rows
+            task is not None and task.analysis_mode == "1d" and task.process_rows
         )
-        switch_state = "normal" if row_analysis_available else "disabled"
-        if self.calculate_statistics_switch is not None:
-            self.calculate_statistics_switch.configure(state=switch_state)
-        if self.calculate_sync_switch is not None:
-            self.calculate_sync_switch.configure(state=switch_state)
-
         plan = task.resolve_pipeline() if task is not None else None
-        statistics_state = "normal" if (
-            row_analysis_available and plan.statistics
-        ) else "disabled"
-        sync_state = "normal" if (
-            row_analysis_available and plan.synchronization
-        ) else "disabled"
-        block_state = "normal" if (
-            row_analysis_available
-            and (plan.statistics or plan.synchronization)
-        ) else "disabled"
+        statistics_enabled = bool(row_analysis_available and plan and plan.statistics)
+        state = "normal" if statistics_enabled else "disabled"
         for widget in self.statistics_output_widgets:
-            widget.configure(state=statistics_state)
+            widget.configure(state=state)
         for widget in self.statistics_parameter_widgets:
-            widget.configure(state=block_state)
-        for widget in self.synchronization_output_widgets:
-            widget.configure(state=sync_state)
-        for widget in self.synchronization_parameter_widgets:
-            widget.configure(state=sync_state)
+            widget.configure(state=state)
 
     def _setup_knn_section(self):
         """Параметры KNN и форматы экспорта."""
@@ -5422,16 +6229,43 @@ class App(TkinterApp):
         state = "disabled" if disable else "normal"
 
         widgets_to_disable = [
-            self.load_button, self.pipette_button, self.gram_shmidt_button,
-            self.button_save_scales, self.button_load_scales_file,
-            self.app_start_button, self.add_task_btn, self.analysis_mode_selector,
-            self.gpu_switch]
+            self.load_button,
+            self.pipette_button,
+            self.gram_shmidt_button,
+            self.button_save_scales,
+            self.button_load_scales_file,
+            self.app_start_button,
+            self.add_task_btn,
+            self.analysis_mode_selector,
+            getattr(self, "cpu_radio", None),
+            getattr(self, "gpu_radio", None),
+        ]
 
         for widget in widgets_to_disable:
+            if widget is None:
+                continue
             try:
-                widget.configure(state=state)
+                # GPU может быть принципиально недоступен. После расчёта
+                # не делаем его активным только ради общего unlock.
+                if (
+                    not disable
+                    and widget is getattr(self, "gpu_radio", None)
+                    and hasattr(self, "image_processor")
+                ):
+                    info = self.image_processor.get_backend_info()
+                    gpu_enabled = bool(
+                        info.get("gpu_available", False)
+                        and info.get("gpu_checked", False)
+                    )
+                    widget.configure(
+                        state="normal" if gpu_enabled else "disabled"
+                    )
+                else:
+                    widget.configure(state=state)
             except Exception as e:
-                self.progress_manager.log_error(str(e))
+                self.progress_manager.log_error(
+                    f"Не удалось изменить состояние элемента интерфейса: {e}"
+                )
 
         self.workspace_tabs.set_enabled(True)
 
@@ -5466,37 +6300,8 @@ class App(TkinterApp):
                 widget.configure(state='disabled')
 
     def _run_integrated_ml(self, task):
-        """Run configured clustering as the final stage of an ML preset."""
-        plan = task.resolve_pipeline()
-        if not plan.ml:
-            return None
-        if not task.knn_results:
-            raise ClusteringError(
-                "ML-этап не получил KNN-признаки. Проверьте направления анализа "
-                "и параметры экстремумов."
-            )
-        from ml.clustering import run_clustering
-        self.progress_manager.begin_stage(f"{task.task_name} · ML-кластеризация")
-        self.progress_manager.update_progress(0.0, "ML: подготовка признаков...")
-        result = run_clustering(
-            knn_results=task.knn_results,
-            algorithm=task.ml_algorithm,
-            output_root=task.task_folder_path,
-            image=task.original_image,
-            point_filter=task.ml_point_filter,
-            feature_set=task.ml_feature_set,
-            standardize=task.ml_standardize,
-            n_clusters=task.ml_n_clusters,
-            random_state=task.ml_random_state,
-            eps=task.ml_eps,
-            min_samples=task.ml_min_samples,
-        )
-        task.ml_result = result
-        self.progress_manager.log_info(
-            f"ML-кластеризация встроенного конвейера завершена: {result['output_dir']}"
-        )
-        self.progress_manager.update_progress(1.0, "ML-кластеризация завершена")
-        return result
+        """Устаревшая точка входа: ML больше не является этапом анализа."""
+        return None
 
     def _history_ml_summary(self, task):
         result = task.ml_result
@@ -5570,10 +6375,9 @@ class App(TkinterApp):
                     self.image_processor.create_task_folder(task)
                     save_run_image(task)
                     snapshot = task.settings_snapshot()
-                    # Основной анализ и, для ML-сценария, кластеризация образуют
-                    # один воспроизводимый исследовательский запуск.
+                    # На странице параметров расчёта выполняется только подготовка
+                    # признаков. ML-алгоритмы запускаются исключительно на вкладке «ML».
                     self.image_processor.compute_for_task(task)
-                    self._run_integrated_ml(task)
                     self.progress_manager.begin_stage(
                         f"{task.task_name} · Сохранение результатов"
                     )
@@ -5665,6 +6469,7 @@ class App(TkinterApp):
         self._show_saved_results(task.task_folder_path if task else '')
 
     def _show_saved_results(self, folder):
+        self._show_workspace()
         self._ensure_workspace_tab("Результаты")
         self.results_panel.category.set('Все результаты')
         self.results_panel.load_folder(folder, force=True)
@@ -5681,9 +6486,7 @@ class App(TkinterApp):
             folder_callback=lambda: self._open_result_path(
                 self.image_processor.root_folder_path
             ),
-            history_callback=lambda: self.workspace_tabs.set(
-                "Предыдущие запуски"
-            ),
+            history_callback=self._show_history_page,
         )
 
 def format_time(seconds):

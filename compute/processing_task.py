@@ -68,19 +68,19 @@ class ProcessingTask:
             "calculate_statistics": False,
             "calculate_synchronization": False,
         },
+        "Вейвлет, экстремумы и огибающие": {
+            "calculate_extrema": True,
+            "calculate_envelopes": True,
+            "calculate_knn": False,
+            "calculate_statistics": False,
+            "calculate_synchronization": False,
+        },
         "Огибающие и статистики": {
             "calculate_extrema": True,
             "calculate_envelopes": True,
             "calculate_knn": False,
             "calculate_statistics": True,
             "calculate_synchronization": False,
-        },
-        "Синхронизация": {
-            "calculate_extrema": True,
-            "calculate_envelopes": True,
-            "calculate_knn": False,
-            "calculate_statistics": False,
-            "calculate_synchronization": True,
         },
         "Подготовка данных для ML": {
             "calculate_extrema": True,
@@ -94,8 +94,35 @@ class ProcessingTask:
             "calculate_envelopes": True,
             "calculate_knn": True,
             "calculate_statistics": True,
-            "calculate_synchronization": True,
+            "calculate_synchronization": False,
         },
+    }
+
+    PIPELINE_DESCRIPTIONS = {
+        "Только вейвлет": (
+            "Выполняется только вейвлет-преобразование. "
+            "Вейвлеты рассчитываются всегда."
+        ),
+        "Вейвлет и экстремумы": (
+            "Вейвлет-преобразование и поиск локальных экстремумов."
+        ),
+        "Вейвлет, экстремумы и огибающие": (
+            "Вейвлеты → экстремумы → построение огибающих."
+        ),
+        "Огибающие и статистики": (
+            "Вейвлеты → экстремумы → огибающие плюс статистики."
+        ),
+        "Подготовка данных для ML": (
+            "Цикл вычислений от вейвлетов до KNN включительно. "
+            "Полученные KNN-признаки затем используются на отдельной странице ML."
+        ),
+        "Полный 1D-анализ": (
+            "Цикл от вейвлетов до KNN включительно плюс статистики. "
+            "Настройка и интеграция статистик будет расширена позже."
+        ),
+        "Пользовательский": (
+            "Набор этапов не совпадает ни с одним готовым сценарием."
+        ),
     }
 
     def __init__(self):
@@ -133,7 +160,7 @@ class ProcessingTask:
         self.calculate_knn = False
         self.output_wavelet_image = False
         self.output_wavelet_text = True
-        self.output_wavelet_numpy = False
+        self.output_wavelet_numpy = False  # устаревший формат; в новом UI не используется
         self.output_extremes_text = True
         self.output_extremes_image = False
         self.output_envelopes_text = True
@@ -232,6 +259,20 @@ class ProcessingTask:
             setattr(self, field_name, bool(value))
         self.pipeline_preset = preset_name
 
+    def match_pipeline_preset(self):
+        """Вернуть готовый сценарий, точно соответствующий ручному набору этапов."""
+        current = {
+            "calculate_extrema": bool(self.calculate_extrema),
+            "calculate_envelopes": bool(self.calculate_envelopes),
+            "calculate_knn": bool(self.calculate_knn),
+            "calculate_statistics": bool(self.calculate_statistics),
+            "calculate_synchronization": bool(self.calculate_synchronization),
+        }
+        for preset_name, settings in self.PIPELINE_PRESETS.items():
+            if all(current.get(key) == bool(value) for key, value in settings.items()):
+                return preset_name
+        return "Пользовательский"
+
     def resolve_pipeline(self):
         """Построить непротиворечивый план без изменения выбора пользователя."""
         if self.analysis_mode == "2d":
@@ -258,7 +299,7 @@ class ProcessingTask:
         synchronization = bool(
             self.calculate_synchronization and self.process_rows
         )
-        ml_requested = self.pipeline_preset == "Подготовка данных для ML"
+        ml_requested = False
         envelopes = bool(row_pipeline_available and (
             self.calculate_envelopes or knn or statistics or synchronization
         ))
@@ -278,7 +319,7 @@ class ProcessingTask:
             knn=knn,
             statistics=statistics,
             synchronization=synchronization,
-            ml=bool(ml_requested and knn),
+            ml=False,
             maxima_required=bool(
                 statistics
                 or synchronization
@@ -329,8 +370,6 @@ class ProcessingTask:
             # These operations are currently calculated in one scale/channel
             # traversal, therefore they form one honest progress stage.
             stages.append("Анализ точек: " + ", ".join(selected))
-        if plan.ml:
-            stages.append("ML-кластеризация")
         stages.append("Сохранение результатов")
         return stages
 
@@ -358,8 +397,6 @@ class ProcessingTask:
             stages.append("статистики")
         if plan.synchronization:
             stages.append("синхронизации")
-        if plan.ml:
-            stages.append("ML")
         return " → ".join(stages)
 
     def nuances_summary(self):
@@ -384,8 +421,6 @@ class ProcessingTask:
             details.append("блоки масштабов: " + ", ".join(map(str, self.scale_block_sizes)))
         if self.resolve_pipeline().synchronization:
             details.append("метрика: " + ", ".join(self.row_sync_metrics))
-        if self.resolve_pipeline().ml:
-            details.append("ML: " + self.ml_algorithm.upper())
         if self.gram_schmidt_applied:
             details.append("Грамм–Шмидт")
         return " · ".join(details)

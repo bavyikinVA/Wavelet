@@ -69,22 +69,31 @@ class TkinterApp(ctk.CTk):
             pass
 
     def after_safe(self, ms: int, func: Callable, *args) -> Optional[str]:
-        """Безопасный вызов after с отслеживанием callback'ов"""
+        """Безопасный вызов after с отслеживанием callback'ов.
+
+        Идентификатор хранится в mutable-контейнере: callback с задержкой 0
+        теоретически может быть обработан очень быстро, поэтому замыкание не
+        должно обращаться к локальной переменной до её присваивания.
+        """
         if self._is_destroyed:
             return None
 
-        try:
-            def safe_func():
-                if not self._is_destroyed:
-                    try:
-                        func(*args)
-                    except Exception as e:
-                        print(f"Callback error: {e}")
-                # Удаляем callback из отслеживаемых после выполнения
-                if callback_id in self._pending_callbacks:
-                    del self._pending_callbacks[callback_id]
+        holder = {"id": None}
 
+        def safe_func():
+            try:
+                if not self._is_destroyed:
+                    func(*args)
+            except Exception as e:
+                print(f"Callback error: {e}")
+            finally:
+                callback_id = holder["id"]
+                if callback_id is not None:
+                    self._pending_callbacks.pop(callback_id, None)
+
+        try:
             callback_id = self.after(ms, safe_func)
+            holder["id"] = callback_id
             self._pending_callbacks[callback_id] = True
             return callback_id
         except tk.TclError:
