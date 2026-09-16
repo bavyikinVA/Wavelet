@@ -110,7 +110,7 @@ def plot_clusters_2d(X, labels, kmeans, features_names=None):
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
-    plt.savefig("Кластеры в пространстве признаков.png")
+    plt.savefig("clusters_feature_space.png")
     return plt.gcf()
 
 
@@ -154,7 +154,7 @@ def plot_clusters_3d(X, labels, kmeans, features_names=None):
     ax.legend()
     plt.tight_layout()
     plt.show()
-    plt.savefig("Кластеры в 3D.png")
+    plt.savefig("clusters_3d.png")
     return fig
 
 
@@ -218,7 +218,7 @@ def plot_clusters_on_image(points_df, image_path=None, figsize=(12, 10)):
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
-    plt.savefig('Кластеры на изображении.png')
+    plt.savefig('clusters_on_image.png')
 
     return plt.gcf()
 
@@ -246,7 +246,7 @@ def plot_cluster_distribution(features_df, labels):
 
     plt.tight_layout()
     plt.show()
-    plt.savefig("Распределение кластеров по признакам.png")
+    plt.savefig("cluster_feature_distribution.png")
     return fig
 
 # Или просто визуализация точек без фонового изображения

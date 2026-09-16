@@ -32,6 +32,8 @@ from typing import Iterator, Sequence
 import cv2
 import matplotlib
 import numpy as np
+
+from result_naming import dated_folder_name
 from scipy.signal import fftconvolve
 
 matplotlib.use("Agg")
@@ -654,7 +656,7 @@ def save_scale_summary(
 def create_run_directory(config: AnalysisConfig) -> Path:
     """Создаёт уникальную папку запуска в Загрузках."""
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp = dated_folder_name(datetime.now())
     image_name = config.image_path.stem
     run_directory = config.output_root / f"{image_name}_{timestamp}"
     run_directory.mkdir(parents=True, exist_ok=False)

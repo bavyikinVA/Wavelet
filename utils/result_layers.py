@@ -33,6 +33,7 @@ class LayerControls(ctk.CTkFrame):
         filter_row.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(3, 0))
         ctk.CTkLabel(filter_row, text='ML:', width=26, anchor='w').pack(side='left')
         self.ml_filters = {}
+        self._ml_filter_values = {}
         for key, width in [('algorithm', 105), ('channel', 95), ('point_type', 145), ('direction', 105)]:
             menu = ScrollableComboBox(filter_row, values=['Все'], state='readonly', width=width,
                                       command=lambda _value, k=key: self._apply_filters())
@@ -47,26 +48,55 @@ class LayerControls(ctk.CTkFrame):
     @staticmethod
     def _display_label(item):
         if item.get('category') != 'ML-кластеры':
-            return item['label'][-90:]
+            return (item.get('display_label') or item['label'])[-120:]
         algorithm = item.get('algorithm') or ('DBSCAN' if 'dbscan' in item['label'].casefold() else 'ML')
         channel = item.get('channel') or 'канал —'
         scale = item.get('scale') or '—'
         point_type = item.get('point_type') or 'точки'
-        direction = item.get('direction') or 'направление —'
-        return f'[{algorithm}] {channel} · a={scale} · {point_type} · {direction}'
+        direction = {
+            'row': 'CWT по строкам', 'rows': 'CWT по строкам',
+            'col': 'CWT по столбцам', 'columns': 'CWT по столбцам',
+        }.get(item.get('direction'), item.get('direction') or 'направление —')
+        point_type = {
+            'max_by_row': 'максимумы по строкам',
+            'min_by_row': 'минимумы по строкам',
+            'max_by_column': 'максимумы по столбцам',
+            'min_by_column': 'минимумы по столбцам',
+        }.get(point_type, point_type)
+        return f'[{algorithm}] {channel} · масштаб {scale} · {point_type} · {direction}'
 
     def set_items(self, items):
         self._source_items = [item for item in items if item['category'] in self.CATEGORIES]
         ml_items = [item for item in self._source_items if item['category'] == 'ML-кластеры']
         for key, menu in self.ml_filters.items():
-            values = sorted({str(item.get(key)) for item in ml_items if item.get(key) not in (None, '')})
+            raw_values = sorted({
+                str(item.get(key)) for item in ml_items
+                if item.get(key) not in (None, '')
+            })
+            translations = {
+                'row': 'Построчный CWT', 'rows': 'Построчный CWT',
+                'col': 'Столбцовый CWT', 'columns': 'Столбцовый CWT',
+                'max_by_row': 'Максимумы по строкам',
+                'min_by_row': 'Минимумы по строкам',
+                'max_by_column': 'Максимумы по столбцам',
+                'min_by_column': 'Минимумы по столбцам',
+            }
+            display_to_raw = {
+                translations.get(value, value): value for value in raw_values
+            }
+            self._ml_filter_values[key] = display_to_raw
+            values = sorted(display_to_raw)
             current = menu.get()
             menu.configure(values=['Все'] + values, state='readonly' if values else 'disabled')
             menu.set(current if current in values else 'Все')
         self._apply_filters()
 
     def _apply_filters(self):
-        active = {key: menu.get() for key, menu in self.ml_filters.items() if menu.get() != 'Все'}
+        active = {
+            key: self._ml_filter_values.get(key, {}).get(menu.get(), menu.get())
+            for key, menu in self.ml_filters.items()
+            if menu.get() != 'Все'
+        }
         filtered = []
         for item in self._source_items:
             if item['category'] != 'ML-кластеры':
@@ -189,7 +219,7 @@ class LayerControls(ctk.CTkFrame):
                 artist.set_alpha(layer['alpha'])
             if visible:
                 item = layer['item']
-                name = item['label'].casefold()
+                name = (item.get('display_label') or item['label']).casefold()
                 details = [word for word in ('верхняя', 'нижняя', 'максимумы', 'минимумы') if word in name]
                 category = 'Точки огибающей' if item['category'] == 'Огибающие' else item['category']
                 label = f'{index+1}. {category} {" ".join(details)} · a={item.get("scale") or "—"} · {item.get("channel") or ""}'

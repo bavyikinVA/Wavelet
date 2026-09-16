@@ -55,6 +55,9 @@ logs/
 .coverage
 coverage.xml
 htmlcov/
+tests/
+benchmarks/
+Tests/
 
 # =========================
 # Build / package artifacts
@@ -63,7 +66,7 @@ build/
 dist/
 *.egg-info/
 .eggs/
-
+*ico
 # =========================
 # OS files
 # =========================

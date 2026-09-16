@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
+from result_naming import knn_stem, point_type_parts
 
 logger = logging.getLogger("WaveletApp")
 
@@ -141,6 +142,7 @@ def find_k_nearest_neighbors(points, k, progress_callback=None, log_callback=Non
 
 def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image,
                               print_text_var, print_image_var, use_gpu=True,
+                              source_direction=None,
                               progress_callback=None, log_callback=None):
     processor = get_knn_processor(use_gpu)
 
@@ -148,12 +150,14 @@ def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image
         device = "GPU" if processor.is_gpu_available() and use_gpu else "CPU"
         log_callback(f"Начало обработки KNN на {device} для масштаба {extreme_dict['scale']}")
 
-    color_names = ['Red', 'Green', 'Blue']
-    type_names = {0: 'Str', 1: 'Tr'}
-
     type_data = extreme_dict['type_data']
     channel = extreme_dict['channel']
     scale = extreme_dict['scale']
+    source_direction = (
+        source_direction
+        or extreme_dict.get("cwt_axis")
+        or ("row" if type_data == 0 else "col")
+    )
 
     extreme_types = ['max_by_row', 'max_by_column', 'min_by_row', 'min_by_column']
     total_extreme_types = len(extreme_types)
@@ -191,8 +195,12 @@ def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image
             "neighbors": neighbors_with_angles,
         }
 
-        graph_filename = f"KNN_{type_names[type_data]}_Graph_Scale_{scale}_Channel_{color_names[channel]}_{extreme_type}.png"
-        info_filename = f"KNN_{type_names[type_data]}_Info_Scale_{scale}_Channel_{color_names[channel]}_{extreme_type}.txt"
+        feature_axis, point_kind = point_type_parts(extreme_type)
+        file_stem = knn_stem(
+            source_direction, feature_axis, channel, scale, point_kind, k
+        )
+        graph_filename = file_stem + ".png"
+        info_filename = file_stem + ".txt"
 
         if print_image_var:
             draw_knn_graph(

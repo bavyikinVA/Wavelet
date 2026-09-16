@@ -45,7 +45,7 @@
     python wavelet_sync_pipeline.py "C:\\Users\\...\\Задача 1" --window-size 100 --step 25 --lag 5 --peak-percentile 95
 
 Результаты появятся в папке:
-    WaveletSyncResults
+    wavelet_sync_results
 """
 
 from __future__ import annotations
@@ -72,6 +72,12 @@ WAVELET_RE = re.compile(
     re.IGNORECASE,
 )
 
+WAVELET_ASCII_RE = re.compile(
+    r"^cwt1d_(?P<direction>row|col)_(?P<channel>r|g|b)_"
+    r"s(?P<scale>m?\d+(?:p\d+)?(?:em?\d+|e\d+)?)\.txt$",
+    re.IGNORECASE,
+)
+
 CHANNEL_NORMALIZE = {
     "Красный": "Red",
     "Зелёный": "Green",
@@ -88,12 +94,6 @@ DIRECTION_NORMALIZE = {
     "построчно": "rows",
     "по_столбцам": "cols",
 }
-
-DIRECTION_RU = {
-    "rows": "построчно",
-    "cols": "по_столбцам",
-}
-
 
 @dataclass(frozen=True)
 class WaveletFile:
@@ -125,7 +125,26 @@ class PipelineData:
 def parse_wavelet_file(path: Path) -> Optional[WaveletFile]:
     match = WAVELET_RE.match(path.name)
     if not match:
-        return None
+        match = WAVELET_ASCII_RE.match(path.name)
+        if not match:
+            return None
+        scale_token = match.group("scale").lower()
+        negative = scale_token.startswith("m")
+        if negative:
+            scale_token = scale_token[1:]
+        scale_label = (("-" if negative else "")
+                       + scale_token.replace("p", ".").replace("em", "e-"))
+        return WaveletFile(
+            path=path,
+            direction={"row": "rows", "col": "cols"}[
+                match.group("direction").lower()
+            ],
+            scale_label=scale_label,
+            scale_value=float(scale_label),
+            channel={"r": "Red", "g": "Green", "b": "Blue"}[
+                match.group("channel").lower()
+            ],
+        )
 
     direction_raw = match.group("direction")
     scale_label = match.group("scale")
@@ -199,7 +218,7 @@ def compute_power_spectra(files: Sequence[WaveletFile], output_root: Path) -> Di
         powers[key] = P
 
         out_name = safe_name(
-            f"Мощность_вейвлетов_{DIRECTION_RU[wf.direction]}_Масштаб_{wf.scale_label}_{wf.channel}.txt"
+            f"wavelet_power_{wf.direction}_{wf.channel}_s{wf.scale_label}.txt"
         )
         save_matrix(power_dir / wf.direction / f"Scale_{wf.scale_label}" / out_name, P)
 
@@ -853,8 +872,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Постобработка: мощности, кросс-спектры, модели синхронизации, статистика."
     )
-    parser.add_argument("task_folder", help="Папка задачи, внутри которой лежат Scale_* с txt коэффициентами")
-    parser.add_argument("--output", default="WaveletSyncResults", help="Имя папки результатов")
+    parser.add_argument("task_folder", help="Папка задачи с TXT-коэффициентами 1D CWT")
+    parser.add_argument("--output", default="wavelet_sync_results", help="Имя папки результатов")
     parser.add_argument("--window-size", type=int, default=100, help="Размер скользящего окна")
     parser.add_argument("--step", type=int, default=25, help="Шаг скользящего окна")
     parser.add_argument("--lag", type=int, default=5, help="Сдвиг для моделей В и Г")
@@ -874,7 +893,7 @@ def main() -> None:
     print("Этап 0. Поиск файлов коэффициентов...")
     files = find_wavelet_files(task_folder)
     if not files:
-        print("Не найдено файлов вида Расчет_вейвлетов_*.txt")
+        print("Не найдены файлы cwt1d_*.txt или старые Расчет_вейвлетов_*.txt")
         return
 
     directions = sorted({f.direction for f in files})

@@ -70,6 +70,19 @@ from PIL import Image
 from Gram_Shmidt import change_channels
 from history.source_image import save_run_image
 from history.result_catalog import save_coefficient_preview
+from result_naming import (
+    CHANNEL_CODES,
+    centering_mean_name,
+    cwt1d_stem,
+    cwt2d_stem,
+    point_stem,
+    run_root_folder_name,
+    scale_folder_name,
+    source_channel_name,
+    statistics_stem,
+    synchronization_prefix,
+    task_run_folder_name,
+)
 from compute.validation import validate_scales
 from compute.processing_task import ProcessingTask
 from image_cropper_app import run_cropper
@@ -83,6 +96,7 @@ from utils.animation import animate_visibility
 from compute.run_control import RunCancelled
 from compute.memory_estimate import estimate_label
 from ml.errors import ClusteringError
+from ml.ui_state import ml_controls_editable
 from history import (
     RunHistoryStore, feature_checkpoint_available,
     restore_feature_checkpoint, save_feature_checkpoint,
@@ -136,8 +150,7 @@ class ImageProcessor:
 
         # Создаём корневую папку для первой задачи
         if len(self.tasks) == 1:
-            current_time = time.strftime("%d_%m_%Y_%H_%M")
-            root_folder_name = f"ВП_{current_time}"
+            root_folder_name = run_root_folder_name(datetime.now())
             self.create_downloads_folder(root_folder_name)
         return task.task_id
 
@@ -213,9 +226,9 @@ class ImageProcessor:
         if hasattr(task, 'task_folder_path') and task.task_folder_path:
             return task.task_folder_path
 
-        task_start_time = time.strftime("%d_%m_%Y_%H_%M_%S")
-        milliseconds = int(time.time() * 1000) % 1000
-        task_folder_name = f"{task.task_name} {task_start_time}_{milliseconds:03d}_{uuid4().hex[:8]}"
+        task_folder_name = task_run_folder_name(
+            task.task_id, datetime.now(), uuid4().hex[:8]
+        )
         task.task_folder_path = os.path.join(self.root_folder_path, task_folder_name)
         try:
             os.makedirs(task.task_folder_path, exist_ok=True)
@@ -232,7 +245,9 @@ class ImageProcessor:
                 raise ValueError("Папка задачи не инициализирована")
             task_folder = task.task_folder_path
 
-        scale_folder_path = os.path.join(task_folder, f"Scale_{scale}")
+        scale_folder_path = os.path.join(
+            task_folder, "scales", scale_folder_name(scale)
+        )
         try:
             os.makedirs(scale_folder_path, exist_ok=True)
             return scale_folder_path
@@ -244,12 +259,13 @@ class ImageProcessor:
         """Сохранение исходных каналов для задачи"""
         self.progress.log_info("Сохранение исходных каналов...")
         if print_channels_txt:
-            colors = ['Red', 'Green', 'Blue']
             task_folder = self.create_task_folder(task)  # Создаём папку для задачи
+            source_folder = os.path.join(task_folder, "source")
+            os.makedirs(source_folder, exist_ok=True)
             for channel in range(len(task.data_copy)):
-                filename = f"Исходный_цветовой_канал_{colors[channel]}.txt"
+                filename = source_channel_name(channel) + ".txt"
                 array_2d = task.data_copy[channel]
-                file_path = os.path.join(task_folder, filename)
+                file_path = os.path.join(source_folder, filename)
                 np.savetxt(file_path, array_2d, fmt='%d', delimiter=",")
                 self.progress.log_info(f"Сохранен файл: {file_path}")
 
@@ -395,7 +411,7 @@ class ImageProcessor:
 
             # Центрирование всегда участвует в расчёте, но его служебные
             # значения сохраняются только по явному выбору пользователя.
-            insert_filename = "rows" if type_data == 0 else "cols"
+            cwt_axis = "row" if type_data == 0 else "col"
             means = []
             count = (
                 data_channel.shape[0] if type_data == 0
@@ -411,9 +427,13 @@ class ImageProcessor:
                 means.append(float(mean))
 
             if task.save_centering_means:
+                metadata_folder = os.path.join(
+                    task.task_folder_path, "metadata"
+                )
+                os.makedirs(metadata_folder, exist_ok=True)
                 file_mean_path = os.path.join(
-                    task.task_folder_path,
-                    f'mean_to_{insert_filename}_by_channel_{channel}.txt'
+                    metadata_folder,
+                    centering_mean_name(cwt_axis, channel) + ".txt"
                 )
                 np.savetxt(file_mean_path, np.asarray(means), fmt="%.10g")
 
@@ -507,7 +527,7 @@ class ImageProcessor:
             channel = task.data[channel_index].astype(np.float32)
             for scale in task.scales:
                 scale_folder = self.create_scale_folder(scale, task_folder)
-                output_folder = os.path.join(scale_folder, "2D_Morlet")
+                output_folder = os.path.join(scale_folder, "wavelets_2d")
                 os.makedirs(output_folder, exist_ok=True)
 
                 for angle in task.orientations:
@@ -542,10 +562,7 @@ class ImageProcessor:
                             task.morlet_anisotropy
                         )[0, 0]
 
-                    file_stem = (
-                        f"2D_Morlet_{channel_name}_scale_{scale}_"
-                        f"angle_{angle:g}"
-                    )
+                    file_stem = cwt2d_stem(channel_index, scale, angle)
                     magnitude = np.abs(coefficients)
                     save_coefficient_preview(task_folder, file_stem, coefficients)
                     phase = np.angle(coefficients)
@@ -595,7 +612,7 @@ class ImageProcessor:
     def save_print_wavelets(self, task, type_data, info_out):
         import matplotlib.pyplot as plt
         colors = ['Красный', 'Зелёный', 'Синий']
-        type_matrix_str = "построчно" if type_data == 0 else "по_столбцам"
+        cwt_axis = "row" if type_data == 0 else "col"
 
         total_scales = task.num_scale * 3
         current_scale = 0
@@ -610,8 +627,12 @@ class ImageProcessor:
             for scale in range(task.num_scale):
                 scale_folder_path = self.create_scale_folder(task.scales[scale], task_folder)
                 array_2d = task.result[type_data][channel][scale]
-                save_coefficient_preview(task.task_folder_path,
-                    f"1D_{type_matrix_str}_{colors[channel]}_масштаб_{task.scales[scale]}", array_2d)
+                file_stem = cwt1d_stem(
+                    cwt_axis, channel, task.scales[scale]
+                )
+                save_coefficient_preview(
+                    task.task_folder_path, file_stem, array_2d
+                )
 
                 current_scale += 1
                 progress = 0.1 + (current_scale / total_scales) * 0.9
@@ -620,7 +641,7 @@ class ImageProcessor:
                     f"Сохранение результатов: {colors[channel]}, масштаб {task.scales[scale]}")
 
                 if info_out == 0 or info_out == 10:
-                    filename = f"Расчет_вейвлетов_{type_matrix_str}_Масштаб_{task.scales[scale]}_{colors[channel]}.txt"
+                    filename = file_stem + ".txt"
                     file_path = os.path.join(scale_folder_path, filename)
                     np.savetxt(file_path, array_2d, fmt='%.3f', delimiter=",")
                     self.progress.log_debug(f"Сохранен текстовый файл: {file_path}")
@@ -635,7 +656,7 @@ class ImageProcessor:
                     fig.savefig(
                         os.path.join(
                             scale_folder_path,
-                            f'График_расчетов_В_П_{type_matrix_str}_Масштаб_{task.scales[scale]}_{colors[channel]}.png'),
+                            file_stem + ".png"),
                         dpi=300)
 
                     plt.close(fig)
@@ -644,7 +665,7 @@ class ImageProcessor:
                     np.save(
                         os.path.join(
                             scale_folder_path,
-                            f'Wavelet_{type_matrix_str}_Scale_{task.scales[scale]}_{colors[channel]}.npy'
+                            file_stem + ".npy"
                         ),
                         array_2d
                     )
@@ -693,447 +714,457 @@ class ImageProcessor:
                        knn_var, knn_bool_text_var, knn_bool_image_var,
                        print_text_var, print_graphic, pipette_state,
                        pipeline_plan=None):
-        """
-        Поиск экстремумов после вейвлет-преобразования.
+        """Analyse both feature axes independently inside every selected CWT.
 
-        Реализовано:
-        - используется только построчная матрица Str, потому что анализ идёт вдоль строк изображения;
-        - для гистограммы берутся только максимумы верхней огибающей;
-        - сохраняются обычные и сжатые гистограммы по блокам масштабов;
-        - дополнительно рассчитывается межстрочная синхронизация максимумов верхней огибающей;
-        - межстрочная синхронизация считается по бинарным событиям вдоль оси X;
-        - масштабы внутри блока объединяются через OR;
-        - для каждой пары строк считается метрика Jaccard/Dice/Phi.
+        ``cwt_axis`` identifies how coefficients were produced. ``feature_axis``
+        identifies whether extrema/envelopes are traced along rows or columns.
+        Keeping both dimensions gives four unambiguous combinations instead of
+        silently treating the extrema axis as the CWT source direction.
         """
-
         plan = pipeline_plan or task.resolve_pipeline()
         max_var = bool(max_var or plan.maxima_required)
 
         self.progress.update_progress(0.1, "Начало поиска экстремумов...")
-        self.progress.log_info("Запущена функция подсчета экстремумов")
+        self.progress.log_info(
+            "Запущен анализ всех осей признаков для каждого 1D CWT"
+        )
 
-        use_gpu_knn = plan.knn and self.backend.use_gpu and self.knn_processor.is_gpu_available()
+        use_gpu_knn = (
+            plan.knn
+            and self.backend.use_gpu
+            and self.knn_processor.is_gpu_available()
+        )
+        if plan.knn:
+            device = "GPU" if use_gpu_knn else "CPU"
+            self.progress.log_info(f"Использование {device} для KNN вычислений")
 
-        if knn_var:
-            if use_gpu_knn:
-                self.progress.log_info("Использование GPU для KNN вычислений")
-            else:
-                self.progress.log_info("Использование CPU для KNN вычислений")
+        branches = []
+        if row_var:
+            branches.append({
+                "type_data": 0,
+                "cwt_axis": "row",
+                "cwt_label": "Row CWT",
+            })
+        if col_var:
+            branches.append({
+                "type_data": 1,
+                "cwt_axis": "col",
+                "cwt_label": "Column CWT",
+            })
 
+        feature_axes = (
+            {
+                "axis": "row", "label": "по строкам",
+                "max_key": "max_by_row", "min_key": "min_by_row",
+            },
+            {
+                "axis": "col", "label": "по столбцам",
+                "max_key": "max_by_column", "min_key": "min_by_column",
+            },
+        )
+
+        channels_to_process = [0] if pipette_state == "normal" else list(range(3))
+        colors = ["Красный", "Зелёный", "Синий"]
+        channel_codes = list(CHANNEL_CODES)
+        total_operations = len(branches) * len(channels_to_process) * task.num_scale
+        current_operation = 0
         extremes = []
 
-        # Для этой задачи нужен только Str: построчное вейвлет-преобразование.
-        channels_count = 1 if pipette_state == 'normal' else 3
-        total_operations = channels_count * task.num_scale
-        current_operation = 0
-
-        type_data = 0
-        direction = "построчно"
-        type_matrix_str = "Str"
-
-        channels_to_process = [0] if pipette_state == 'normal' else range(3)
-        colors = ['Красный', 'Зелёный', 'Синий']
-        channel_codes = ['red', 'green', 'blue']
-
-        # Размеры блоков масштабов для сжатых гистограмм и межстрочной синхронизации.
-        # Можно задать в task.scale_block_sizes, например [5].
-        scale_block_sizes = getattr(task, 'scale_block_sizes', [5])
+        scale_block_sizes = getattr(task, "scale_block_sizes", [5])
         if isinstance(scale_block_sizes, int):
             scale_block_sizes = [scale_block_sizes]
 
-        # Настройки межстрочной синхронизации.
-        # row_sync_stride=25 означает сравнивать строки 0, 25, 50, ...
-        # tolerance=1 расширяет событие по X на ±1 пиксель, чтобы учитывать небольшой сдвиг.
-        row_sync_stride = int(getattr(task, 'row_sync_stride', 1))
-        row_sync_tolerance = int(getattr(task, 'row_sync_tolerance', 1))
-        row_sync_metrics = getattr(task, 'row_sync_metrics', ['jaccard'])
+        row_sync_stride = int(getattr(task, "row_sync_stride", 1))
+        row_sync_tolerance = int(getattr(task, "row_sync_tolerance", 1))
+        row_sync_metrics = getattr(task, "row_sync_metrics", ["jaccard"])
         if isinstance(row_sync_metrics, str):
             row_sync_metrics = [row_sync_metrics]
 
-        for channel in channels_to_process:
-            channel_name = colors[channel]
-            channel_code = channel_codes[channel]
+        from compute.extremes.interpolator import Interpolator
+        interpolator = Interpolator(self.backend) if plan.envelopes else None
 
-            row_hist_scales = []
-            row_hist_max_counts = []
-            row_index_for_histogram = None
+        for branch in branches:
+            type_data = branch["type_data"]
+            cwt_axis = branch["cwt_axis"]
+            cwt_label = branch["cwt_label"]
 
-            # Для межстрочной синхронизации сохраняем точки максимумов верхней огибающей
-            # отдельно для каждого масштаба.
-            upper_points_by_scale = {}
-
-            for scale in range(task.num_scale):
-                current_operation += 1
-
-                progress = 0.1 + (current_operation / max(total_operations, 1)) * 0.8
-                self.progress.update_progress(
-                    progress,
-                    f"Поиск экстремумов: {channel_name}, масштаб {task.scales[scale]}, {direction}"
-                )
-
-                # Получение коэффициентов вейвлета Str: [channel][scale] -> 2D матрица.
-                coefs_2d = task.result[type_data][channel][scale]
-                # Keep computational precision: rounding can erase strict peaks.
-                # Formatting belongs to export, not extrema/envelope detection.
-
-                # Для построения верхней огибающей нужны максимумы по строкам.
-                # Остальные направления оставлены для совместимости с текущим сохранением/KNN.
-                if self.backend.use_gpu:
-                    coefs_2d, pmaxr, pmaxc, pminr, pminc = ExtremesFinder.find_extremes_gpu(
-                        coefs_2d,
-                        row_var=row_var,
-                        col_var=col_var,
-                        max_var=max_var,
-                        min_var=min_var
-                    )
-                else:
-                    coefs_2d, pmaxr, pmaxc, pminr, pminc = self.find_extremes(
-                        coefs=coefs_2d,
-                        row_var=row_var,
-                        col_var=col_var,
-                        max_var=max_var,
-                        min_var=min_var
-                    )
-
-                self.progress.log_info(
-                    f"Масштаб {task.scales[scale]}, {channel_name}, {direction}: "
-                    f"макс_строк={len(pmaxr)}, мин_строк={len(pminr)}, "
-                    f"макс_столб={len(pmaxc)}, мин_столб={len(pminc)}"
-                )
-
-                upper_max_row_points = []
-                lower_min_row_points = []
-                upper_max_col_points = []
-                lower_min_col_points = []
-                if plan.envelopes:
-                    from compute.extremes.interpolator import Interpolator
-                    interpolator = Interpolator(self.backend)
-                    upper_max_row_points, lower_min_row_points = interpolator.get_envelopes(
-                        coefs_2d, pmaxr, pminr, direction='row'
-                    )
-                    upper_max_col_points, lower_min_col_points = interpolator.get_envelopes(
-                        coefs_2d, pmaxc, pminc, direction='col'
-                    )
-
-                # Валидация точек.
-                if not isinstance(upper_max_row_points, (list, np.ndarray)) or len(upper_max_row_points) == 0:
-                    upper_max_row_points = []
-                if not isinstance(lower_min_row_points, (list, np.ndarray)) or len(lower_min_row_points) == 0:
-                    lower_min_row_points = []
-                if not isinstance(upper_max_col_points, (list, np.ndarray)) or len(upper_max_col_points) == 0:
-                    upper_max_col_points = []
-                if not isinstance(lower_min_col_points, (list, np.ndarray)) or len(lower_min_col_points) == 0:
-                    lower_min_col_points = []
-
-                scale_value = task.scales[scale]
-                if plan.synchronization:
-                    upper_points_by_scale[scale_value] = upper_max_row_points
-
-                # Гистограмма: считаем только максимумы верхней огибающей на средней строке изображения.
-                if plan.statistics or plan.synchronization:
-                    if row_index_for_histogram is None:
-                        row_index_for_histogram = coefs_2d.shape[0] // 2
-                    row_hist_scales.append(scale_value)
-
-                if plan.statistics:
-                    upper_count_on_row = self.count_points_on_row(
-                        upper_max_row_points,
-                        row_index_for_histogram
-                    )
-                    row_hist_max_counts.append(upper_count_on_row)
-                    self.progress.log_info(
-                        f"Масштаб {scale_value}, {channel_name}, "
-                        f"строка y={row_index_for_histogram}: "
-                        f"максимумов верхней огибающей={upper_count_on_row}"
-                    )
-
-                # Сырые экстремумы и точки огибающих являются разными
-                # артефактами и сохраняются независимо.
-                raw_extremes_to_process = []
-                raw_titles = []
-
-                if max_var:
-                    if row_var:
-                        raw_extremes_to_process.append(pmaxr)
-                        raw_titles.append(
-                            f"{type_matrix_str}_Сырые_максимумы_по_строкам_масштаб_{scale_value}_{channel_name}"
-                        )
-                    if col_var:
-                        raw_extremes_to_process.append(pmaxc)
-                        raw_titles.append(
-                            f"{type_matrix_str}_Сырые_максимумы_по_столбцам_масштаб_{scale_value}_{channel_name}"
-                        )
-
-                if min_var:
-                    if row_var:
-                        raw_extremes_to_process.append(pminr)
-                        raw_titles.append(
-                            f"{type_matrix_str}_Сырые_минимумы_по_строкам_масштаб_{scale_value}_{channel_name}"
-                        )
-                    if col_var:
-                        raw_extremes_to_process.append(pminc)
-                        raw_titles.append(
-                            f"{type_matrix_str}_Сырые_минимумы_по_столбцам_масштаб_{scale_value}_{channel_name}"
-                        )
-
-                scale_folder = self.find_scale_folder(task, scale_value)
-
-                for i, p in enumerate(raw_extremes_to_process):
-                    if len(p) > 0:
-                        if plan.extrema and task.output_extremes_text:
-                            self.save_extremes_to_file(scale_folder, raw_titles[i], p)
-                            self.progress.log_debug(f"Сохранен текстовый файл: {raw_titles[i]}.txt")
-
-                        if plan.extrema and task.output_extremes_image:
-                            self.save_extremes_graphic(
-                                scale_folder, raw_titles[i], p, coefs_2d=coefs_2d
-                            )
-
-                envelope_points = []
-                envelope_titles = []
-                if plan.envelopes:
-                    if max_var and row_var:
-                        envelope_points.append(upper_max_row_points)
-                        envelope_titles.append(
-                            f"{type_matrix_str}_Верхняя_огибающая_по_строкам_масштаб_{scale_value}_{channel_name}"
-                        )
-                    if max_var and col_var:
-                        envelope_points.append(upper_max_col_points)
-                        envelope_titles.append(
-                            f"{type_matrix_str}_Верхняя_огибающая_по_столбцам_масштаб_{scale_value}_{channel_name}"
-                        )
-                    if min_var and row_var:
-                        envelope_points.append(lower_min_row_points)
-                        envelope_titles.append(
-                            f"{type_matrix_str}_Нижняя_огибающая_по_строкам_масштаб_{scale_value}_{channel_name}"
-                        )
-                    if min_var and col_var:
-                        envelope_points.append(lower_min_col_points)
-                        envelope_titles.append(
-                            f"{type_matrix_str}_Нижняя_огибающая_по_столбцам_масштаб_{scale_value}_{channel_name}"
-                        )
-
-                for title, points in zip(envelope_titles, envelope_points):
-                    if len(points) == 0:
-                        continue
-                    if task.output_envelopes_text:
-                        self.save_extremes_to_file(scale_folder, title, points)
-                    if task.output_envelopes_image:
-                        self.save_extremes_graphic(
-                            scale_folder, title, points, coefs_2d=coefs_2d
-                        )
-
-                # Подготовка данных для KNN. Оставлено для совместимости с текущей архитектурой.
-                knn_extremes = {
-                    'type_data': type_data,
-                    'channel': channel,
-                    'scale': scale_value,
-                    'max_by_row': (
-                        upper_max_row_points if plan.envelopes else pmaxr
-                    ) if (row_var and max_var) else [],
-                    'max_by_column': (
-                        upper_max_col_points if plan.envelopes else pmaxc
-                    ) if (col_var and max_var) else [],
-                    'min_by_row': (
-                        lower_min_row_points if plan.envelopes else pminr
-                    ) if (row_var and min_var) else [],
-                    'min_by_column': (
-                        lower_min_col_points if plan.envelopes else pminc
-                    ) if (col_var and min_var) else []
+            for channel in channels_to_process:
+                channel_name = colors[channel]
+                channel_code = channel_codes[channel]
+                statistics_by_axis = {
+                    feature["axis"]: {
+                        "scales": [], "counts": [], "slice_index": None,
+                    }
+                    for feature in feature_axes
                 }
-                extremes.append(knn_extremes)
+                row_upper_points_by_scale = {}
 
-                if plan.knn:
-                    self.progress.update_progress(0.85, "Обработка KNN...")
-                    from compute.knn.knn_cpu import process_extremes_with_knn
-                    knn_result = process_extremes_with_knn(
-                        knn_extremes,
-                        scale_folder,
-                        knn_var,
-                        task.original_image,
-                        knn_bool_text_var,
-                        knn_bool_image_var,
-                        use_gpu=use_gpu_knn,
-                        progress_callback=self.progress.update_progress,
-                        log_callback=self.progress.log_info
+                for scale_index in range(task.num_scale):
+                    current_operation += 1
+                    scale_value = task.scales[scale_index]
+                    progress = 0.1 + (
+                        current_operation / max(total_operations, 1)
+                    ) * 0.8
+                    self.progress.update_progress(
+                        progress,
+                        (
+                            f"{cwt_label}, все оси: {channel_name}, "
+                            f"масштаб {scale_value}"
+                        ),
                     )
-                    task.knn_results[(channel_code, scale_value)] = knn_result
 
-            # После всех масштабов текущего канала сохраняем итоговую гистограмму.
-            if len(row_hist_scales) > 0:
-                histogram_dir = os.path.join(
-                    task.task_folder_path,
-                    "Гистограммы_экстремумов_огибающих"
-                )
+                    # Every source branch reads only its own coefficient tensor.
+                    coefs_2d = task.result[type_data][channel][scale_index]
 
-                histogram_file_base = (
-                    f"hist_upper_envelope_maxima_row_y_{row_index_for_histogram}_{channel_code}"
-                )
+                    detection_kwargs = {
+                        "row_var": True,
+                        "col_var": True,
+                        "max_var": max_var,
+                        "min_var": min_var,
+                    }
+                    if self.backend.use_gpu:
+                        detected = ExtremesFinder.find_extremes_gpu(
+                            coefs_2d, **detection_kwargs
+                        )
+                    else:
+                        detected = self.find_extremes(
+                            coefs=coefs_2d, **detection_kwargs
+                        )
+                    coefs_2d, pmaxr, pmaxc, pminr, pminc = detected
+                    scale_folder = self.find_scale_folder(task, scale_value)
+                    knn_extremes = {
+                        "type_data": type_data,
+                        "cwt_axis": cwt_axis,
+                        "channel": channel,
+                        "scale": scale_value,
+                        "max_by_row": [],
+                        "max_by_column": [],
+                        "min_by_row": [],
+                        "min_by_column": [],
+                    }
+
+                    raw_by_axis = {
+                        "row": (pmaxr, pminr),
+                        "col": (pmaxc, pminc),
+                    }
+                    for feature in feature_axes:
+                        feature_axis = feature["axis"]
+                        raw_max, raw_min = raw_by_axis[feature_axis]
+                        self.progress.log_info(
+                            f"{cwt_label}, {feature['label']}, "
+                            f"масштаб {scale_value}, {channel_name}: "
+                            f"максимумов={len(raw_max)}, минимумов={len(raw_min)}"
+                        )
+
+                        upper_points, lower_points = [], []
+                        if plan.envelopes:
+                            upper_points, lower_points = interpolator.get_envelopes(
+                                coefs_2d, raw_max, raw_min,
+                                direction=feature_axis,
+                            )
+                        upper_points = self._valid_point_collection(upper_points)
+                        lower_points = self._valid_point_collection(lower_points)
+
+                        if max_var:
+                            knn_extremes[feature["max_key"]] = (
+                                upper_points if plan.envelopes else raw_max
+                            )
+                        if min_var:
+                            knn_extremes[feature["min_key"]] = (
+                                lower_points if plan.envelopes else raw_min
+                            )
+
+                        if plan.synchronization and (
+                            cwt_axis == "row" and feature_axis == "row"
+                        ):
+                            row_upper_points_by_scale[scale_value] = upper_points
+
+                        stats = statistics_by_axis[feature_axis]
+                        if plan.statistics:
+                            if stats["slice_index"] is None:
+                                dimension = 0 if feature_axis == "row" else 1
+                                stats["slice_index"] = (
+                                    coefs_2d.shape[dimension] // 2
+                                )
+                            selected_upper = (
+                                upper_points if plan.envelopes else raw_max
+                            )
+                            count = self.count_points_on_axis(
+                                selected_upper,
+                                stats["slice_index"],
+                                feature_axis,
+                            )
+                            stats["scales"].append(scale_value)
+                            stats["counts"].append(count)
+
+                        exports = (
+                            ("ext", "max", raw_max, max_var,
+                             task.output_extremes_text,
+                             task.output_extremes_image),
+                            ("ext", "min", raw_min, min_var,
+                             task.output_extremes_text,
+                             task.output_extremes_image),
+                            ("env", "upper", upper_points,
+                             plan.envelopes and max_var,
+                             task.output_envelopes_text,
+                             task.output_envelopes_image),
+                            ("env", "lower", lower_points,
+                             plan.envelopes and min_var,
+                             task.output_envelopes_text,
+                             task.output_envelopes_image),
+                        )
+                        for artifact, kind, points, enabled, save_text, save_image in exports:
+                            if not enabled or not points:
+                                continue
+                            title = point_stem(
+                                artifact, cwt_axis, feature_axis,
+                                channel_code, scale_value, kind,
+                            )
+                            if save_text:
+                                self.save_extremes_to_file(
+                                    scale_folder, title, points
+                                )
+                            if save_image:
+                                self.save_extremes_graphic(
+                                    scale_folder, title, points,
+                                    coefs_2d=coefs_2d,
+                                )
+
+                    extremes.append(knn_extremes)
+
+                    if plan.knn:
+                        self.progress.update_progress(
+                            progress, f"KNN для {cwt_label}, обе оси..."
+                        )
+                        from compute.knn.knn_cpu import (
+                            process_extremes_with_knn,
+                        )
+                        knn_result = process_extremes_with_knn(
+                            knn_extremes,
+                            scale_folder,
+                            knn_var,
+                            task.original_image,
+                            knn_bool_text_var,
+                            knn_bool_image_var,
+                            use_gpu=use_gpu_knn,
+                            source_direction=cwt_axis,
+                            progress_callback=self.progress.update_progress,
+                            log_callback=self.progress.log_info,
+                        )
+                        for point_type, payload in knn_result.items():
+                            if payload:
+                                task.knn_results[
+                                    (
+                                        cwt_axis,
+                                        channel_code,
+                                        float(scale_value),
+                                        point_type,
+                                    )
+                                ] = payload
 
                 if plan.statistics:
-                    task.statistics_results[channel_code] = {
-                        "row_index": row_index_for_histogram,
-                        "scales": list(row_hist_scales),
-                        "upper_envelope_maxima_counts": list(
-                            row_hist_max_counts
-                        ),
-                        "scale_blocks": {},
-                    }
-
-                saved_png_path, saved_csv_path = self.save_upper_envelope_maxima_row_histogram(
-                    histogram_dir,
-                    histogram_file_base,
-                    row_hist_scales,
-                    row_hist_max_counts,
-                    row_index_for_histogram,
-                    channel_name=channel_name,
-                    save_png=(plan.statistics
-                              and task.statistics_output_image),
-                    save_csv=(plan.statistics
-                              and task.statistics_output_csv)
-                )
-
-                if saved_png_path:
-                    self.progress.log_info(
-                        f"Гистограмма максимумов верхней огибающей сохранена: {saved_png_path}"
-                    )
-                elif plan.statistics and task.statistics_output_image:
-                    self.progress.log_error(
-                        f"Не удалось сохранить PNG-гистограмму максимумов верхней огибающей для канала {channel_name}"
-                    )
-
-                if saved_csv_path:
-                    self.progress.log_info(
-                        f"CSV с данными гистограммы сохранён: {saved_csv_path}"
-                    )
-
-                # Сжатые гистограммы по блокам масштабов.
-                for block_size in (
-                        scale_block_sizes if plan.statistics else []):
-                    try:
-                        block_size = int(block_size)
-                    except (TypeError, ValueError):
-                        self.progress.log_error(
-                            f"Некорректный размер блока масштабов: {block_size}"
+                    for feature in feature_axes:
+                        stats = statistics_by_axis[feature["axis"]]
+                        if not stats["scales"]:
+                            continue
+                        self._save_direction_statistics(
+                            task=task,
+                            branch=branch,
+                            feature=feature,
+                            channel_name=channel_name,
+                            channel_code=channel_code,
+                            scales=stats["scales"],
+                            counts=stats["counts"],
+                            slice_index=stats["slice_index"],
+                            scale_block_sizes=scale_block_sizes,
                         )
-                        continue
 
-                    if block_size <= 1:
-                        continue
-
-                    block_labels, block_counts, block_ranges = self.compress_scale_counts_to_blocks(
-                        row_hist_scales,
-                        row_hist_max_counts,
-                        block_size
-                    )
-                    task.statistics_results[channel_code]["scale_blocks"][
-                        block_size
-                    ] = {
-                        "labels": list(block_labels),
-                        "counts": list(block_counts),
-                        "ranges": list(block_ranges),
-                    }
-
-                    block_file_base = (
-                        f"hist_upper_envelope_maxima_row_y_{row_index_for_histogram}_"
-                        f"{channel_code}_blocks_{block_size}"
-                    )
-
-                    block_png_path, block_csv_path = self.save_upper_envelope_maxima_block_histogram(
-                        histogram_dir,
-                        block_file_base,
-                        block_labels,
-                        block_counts,
-                        block_ranges,
-                        row_index_for_histogram,
-                        block_size,
+                # Synchronization retains its existing, explicitly row-based
+                # scientific meaning. It is not silently applied to columns.
+                if (
+                    plan.synchronization
+                    and cwt_axis == "row"
+                    and row_upper_points_by_scale
+                ):
+                    self._save_row_synchronization(
+                        task=task,
                         channel_name=channel_name,
-                        save_png=task.statistics_output_image,
-                        save_csv=task.statistics_output_csv
+                        channel_code=channel_code,
+                        scales=statistics_by_axis["row"]["scales"]
+                        or list(row_upper_points_by_scale),
+                        upper_points_by_scale=row_upper_points_by_scale,
+                        scale_block_sizes=scale_block_sizes,
+                        row_sync_stride=row_sync_stride,
+                        row_sync_tolerance=row_sync_tolerance,
+                        row_sync_metrics=row_sync_metrics,
                     )
 
-                    if block_png_path:
-                        self.progress.log_info(
-                            f"Сжатая гистограмма по блокам масштабов сохранена: {block_png_path}"
-                        )
-                    elif task.statistics_output_image:
-                        self.progress.log_error(
-                            f"Не удалось сохранить сжатую гистограмму для канала {channel_name}, "
-                            f"размер блока={block_size}"
-                        )
-
-                    if block_csv_path:
-                        self.progress.log_info(
-                            f"CSV с данными сжатой гистограммы сохранён: {block_csv_path}"
-                        )
-
-                # Межстрочная синхронизация.
-                # Сравниваем бинарные ряды разных строк по X внутри блоков масштабов.
-                if (plan.synchronization
-                        and len(upper_points_by_scale) > 0):
-                    image_height, image_width = task.original_image.shape[:2]
-
-                    safe_stride = max(1, row_sync_stride)
-                    rows_to_analyze = list(range(0, image_height, safe_stride))
-                    middle_row = image_height // 2
-                    if middle_row not in rows_to_analyze:
-                        rows_to_analyze.append(middle_row)
-                        rows_to_analyze = sorted(rows_to_analyze)
-
-                    sync_dir = os.path.join(
-                        task.task_folder_path,
-                        "Синхронизация_строк"
-                    )
-
-                    sync_title = f"row_sync_upper_envelope_maxima_{channel_code}"
-
-                    for block_size in scale_block_sizes:
-                        try:
-                            block_size = int(block_size)
-                        except (TypeError, ValueError):
-                            continue
-
-                        if block_size <= 0:
-                            continue
-
-                        for metric_name in row_sync_metrics:
-                            sync_results = self.calculate_row_synchronization_for_scale_block(
-                                path=sync_dir,
-                                title=sync_title,
-                                points_by_scale=upper_points_by_scale,
-                                scales=row_hist_scales,
-                                rows_to_analyze=rows_to_analyze,
-                                image_width=image_width,
-                                block_size=block_size,
-                                tolerance=row_sync_tolerance,
-                                metric_name=metric_name,
-                                channel_name=channel_name,
-                                save_heatmap=task.synchronization_output_heatmap,
-                                save_matrix_csv=(
-                                    task.synchronization_output_matrix_csv
-                                ),
-                                save_pairs_csv=(
-                                    task.synchronization_output_pairs_csv
-                                )
-                            )
-                            result_key = (
-                                channel_code, block_size, metric_name
-                            )
-                            task.synchronization_results[result_key] = (
-                                sync_results
-                            )
-
-        self.progress.update_progress(0.95, "Завершение поиска экстремумов...")
-
-        total_points = sum(
-            len(extreme['max_by_row']) + len(extreme['max_by_column']) +
-            len(extreme['min_by_row']) + len(extreme['min_by_column'])
-            for extreme in extremes
+        self.progress.update_progress(
+            0.95, "Завершение поиска экстремумов..."
         )
-
-        self.progress.log_info(f"Всего найдено точек экстремумов: {total_points}")
+        total_points = sum(
+            len(item["max_by_row"])
+            + len(item["max_by_column"])
+            + len(item["min_by_row"])
+            + len(item["min_by_column"])
+            for item in extremes
+        )
+        self.progress.log_info(
+            f"Всего найдено точек экстремумов: {total_points}"
+        )
         self.progress.update_progress(1.0, "Поиск экстремумов завершен")
         return extremes
+
+    @staticmethod
+    def _valid_point_collection(points):
+        if not isinstance(points, (list, np.ndarray)) or len(points) == 0:
+            return []
+        return points.tolist() if isinstance(points, np.ndarray) else points
+
+    def _save_direction_statistics(
+            self, *, task, branch, feature, channel_name, channel_code, scales,
+            counts, slice_index, scale_block_sizes):
+        cwt_axis = branch["cwt_axis"]
+        feature_axis = feature["axis"]
+        coordinate = "y" if feature_axis == "row" else "x"
+        histogram_dir = os.path.join(
+            task.task_folder_path,
+            "statistics",
+        )
+        file_base = statistics_stem(
+            cwt_axis, feature_axis, channel_code,
+            coordinate, slice_index,
+        )
+        result_key = (cwt_axis, feature_axis, channel_code)
+        task.statistics_results[result_key] = {
+            "cwt_direction": cwt_axis,
+            "feature_axis": feature_axis,
+            "slice_index": slice_index,
+            "scales": list(scales),
+            "upper_envelope_maxima_counts": list(counts),
+            "scale_blocks": {},
+        }
+
+        png_path, csv_path = (
+            self.save_upper_envelope_maxima_row_histogram(
+                histogram_dir,
+                file_base,
+                scales,
+                counts,
+                slice_index,
+                channel_name=channel_name,
+                save_png=task.statistics_output_image,
+                save_csv=task.statistics_output_csv,
+                axis=feature_axis,
+                cwt_direction=cwt_axis,
+            )
+        )
+        if png_path:
+            self.progress.log_info(f"Гистограмма сохранена: {png_path}")
+        if csv_path:
+            self.progress.log_info(f"CSV статистики сохранён: {csv_path}")
+
+        for block_size in scale_block_sizes:
+            try:
+                block_size = int(block_size)
+            except (TypeError, ValueError):
+                self.progress.log_error(
+                    f"Некорректный размер блока масштабов: {block_size}"
+                )
+                continue
+            if block_size <= 1:
+                continue
+
+            labels, block_counts, ranges = (
+                self.compress_scale_counts_to_blocks(
+                    scales, counts, block_size
+                )
+            )
+            task.statistics_results[result_key]["scale_blocks"][
+                block_size
+            ] = {
+                "labels": list(labels),
+                "counts": list(block_counts),
+                "ranges": list(ranges),
+            }
+            block_base = statistics_stem(
+                cwt_axis, feature_axis, channel_code,
+                coordinate, slice_index, block_size=block_size,
+            )
+            block_png, block_csv = (
+                self.save_upper_envelope_maxima_block_histogram(
+                    histogram_dir,
+                    block_base,
+                    labels,
+                    block_counts,
+                    ranges,
+                    slice_index,
+                    block_size,
+                    channel_name=channel_name,
+                    save_png=task.statistics_output_image,
+                    save_csv=task.statistics_output_csv,
+                    axis=feature_axis,
+                    cwt_direction=cwt_axis,
+                )
+            )
+            if block_png:
+                self.progress.log_info(
+                    f"Сжатая гистограмма сохранена: {block_png}"
+                )
+            if block_csv:
+                self.progress.log_info(
+                    f"CSV блочной статистики сохранён: {block_csv}"
+                )
+
+    def _save_row_synchronization(
+            self, *, task, channel_name, channel_code, scales,
+            upper_points_by_scale, scale_block_sizes, row_sync_stride,
+            row_sync_tolerance, row_sync_metrics):
+        image_height, image_width = task.original_image.shape[:2]
+        rows_to_analyze = list(
+            range(0, image_height, max(1, row_sync_stride))
+        )
+        middle_row = image_height // 2
+        if middle_row not in rows_to_analyze:
+            rows_to_analyze.append(middle_row)
+            rows_to_analyze.sort()
+
+        sync_dir = os.path.join(
+            task.task_folder_path, "synchronization"
+        )
+        sync_title = synchronization_prefix("row", channel_code)
+        for block_size in scale_block_sizes:
+            try:
+                block_size = int(block_size)
+            except (TypeError, ValueError):
+                continue
+            if block_size <= 0:
+                continue
+            for metric_name in row_sync_metrics:
+                results = (
+                    self.calculate_row_synchronization_for_scale_block(
+                        path=sync_dir,
+                        title=sync_title,
+                        points_by_scale=upper_points_by_scale,
+                        scales=scales,
+                        rows_to_analyze=rows_to_analyze,
+                        image_width=image_width,
+                        block_size=block_size,
+                        tolerance=row_sync_tolerance,
+                        metric_name=metric_name,
+                        channel_name=channel_name,
+                        save_heatmap=task.synchronization_output_heatmap,
+                        save_matrix_csv=(
+                            task.synchronization_output_matrix_csv
+                        ),
+                        save_pairs_csv=(
+                            task.synchronization_output_pairs_csv
+                        ),
+                    )
+                )
+                task.synchronization_results[
+                    (channel_code, block_size, metric_name)
+                ] = results
 
     @staticmethod
     def save_extremes_to_file(path, title, local_points):
@@ -1251,6 +1282,17 @@ class ImageProcessor:
         return int(np.sum(y == row_index))
 
     @staticmethod
+    def count_points_on_axis(points, slice_index, axis):
+        """Count points on a row (y) or column (x) image slice."""
+        if points is None or len(points) == 0:
+            return 0
+        points = np.asarray(points)
+        if points.ndim != 2 or points.shape[1] != 2:
+            return 0
+        coordinate = 1 if axis == "row" else 0
+        return int(np.sum(points[:, coordinate] == slice_index))
+
+    @staticmethod
     def save_upper_envelope_maxima_row_histogram(
             path,
             file_base_name,
@@ -1259,7 +1301,9 @@ class ImageProcessor:
             row_index,
             channel_name=None,
             save_png=True,
-            save_csv=True
+            save_csv=True,
+            axis="row",
+            cwt_direction=None,
     ):
         """
         Строит и сохраняет гистограмму распределения количества максимумов
@@ -1290,13 +1334,24 @@ class ImageProcessor:
                     f"{len(scales)} != {len(max_counts)}"
                 )
 
+            direction = "rows" if axis == "row" else "columns"
+            cwt_direction = cwt_direction or axis
+            coordinate_name = "row_index" if axis == "row" else "column_index"
+            coordinate_label = "строка изображения y" if axis == "row" else "столбец изображения x"
+
             # Дополнительно сохраняем численные данные, чтобы можно было проверить график.
             if save_csv:
                 csv_path = os.path.join(path, f"{file_base_name}.csv")
                 with open(csv_path, 'w', encoding='utf-8') as file:
-                    file.write("scale,upper_envelope_maxima_count,row_index\n")
+                    file.write(
+                        f"scale,upper_envelope_maxima_count,{coordinate_name},"
+                        "cwt_direction,feature_axis\n"
+                    )
                     for scale, count in zip(scales, max_counts):
-                        file.write(f"{scale},{int(count)},{row_index}\n")
+                        file.write(
+                            f"{scale},{int(count)},{row_index},"
+                            f"{cwt_direction},{direction}\n"
+                        )
 
             if not save_png:
                 return None, csv_path
@@ -1317,7 +1372,7 @@ class ImageProcessor:
             title_channel = f"Канал: {channel_name}" if channel_name else ""
             ax.set_title(
                 "Распределение максимумов верхней огибающей по масштабам\n"
-                f"{title_channel}, строка изображения y = {row_index}"
+                f"{title_channel}, {coordinate_label} = {row_index}"
             )
             ax.set_xlabel("Масштаб вейвлет-преобразования")
             ax.set_ylabel("Количество максимумов верхней огибающей")
@@ -1420,7 +1475,9 @@ class ImageProcessor:
             block_size,
             channel_name=None,
             save_png=True,
-            save_csv=True
+            save_csv=True,
+            axis="row",
+            cwt_direction=None,
     ):
         """
         Сохраняет сжатую гистограмму по блокам масштабов.
@@ -1453,12 +1510,18 @@ class ImageProcessor:
                     f"{len(block_labels)} != {len(block_counts)}"
                 )
 
+            direction = "rows" if axis == "row" else "columns"
+            cwt_direction = cwt_direction or axis
+            coordinate_name = "row_index" if axis == "row" else "column_index"
+            coordinate_label = "строка изображения y" if axis == "row" else "столбец изображения x"
+
             if save_csv:
                 csv_path = os.path.join(path, f"{file_base_name}.csv")
                 with open(csv_path, 'w', encoding='utf-8') as file:
                     file.write(
                         "block_label,block_start_scale,block_end_scale,"
-                        "scales_in_block,upper_envelope_maxima_sum,row_index,block_size\n"
+                        f"scales_in_block,upper_envelope_maxima_sum,{coordinate_name},"
+                        "block_size,cwt_direction,feature_axis\n"
                     )
                     for label, count, block_range in zip(
                             block_labels, block_counts, block_ranges):
@@ -1466,7 +1529,8 @@ class ImageProcessor:
                         scales_as_text = "|".join(str(s) for s in block_scales)
                         file.write(
                             f"{label},{scale_start},{scale_end},"
-                            f"{scales_as_text},{int(count)},{row_index},{block_size}\n"
+                            f"{scales_as_text},{int(count)},{row_index},{block_size},"
+                            f"{cwt_direction},{direction}\n"
                         )
 
             if not save_png:
@@ -1488,7 +1552,7 @@ class ImageProcessor:
             title_channel = f"Канал: {channel_name}" if channel_name else ""
             ax.set_title(
                 "Сжатое распределение максимумов верхней огибающей по блокам масштабов\n"
-                f"{title_channel}, строка изображения y = {row_index}, "
+                f"{title_channel}, {coordinate_label} = {row_index}, "
                 f"размер блока = {block_size}"
             )
             ax.set_xlabel("Блок масштабов")
@@ -1864,10 +1928,11 @@ class ImageProcessor:
             self.progress.log_error("Папка задачи не инициализирована")
             return None
 
-        scale_folder_name = f"Scale_{scale}"
-        scale_folder_path = os.path.join(task.task_folder_path, scale_folder_name)
+        scale_folder_path = os.path.join(
+            task.task_folder_path, "scales", scale_folder_name(scale)
+        )
         if os.path.exists(scale_folder_path) and os.path.isdir(scale_folder_path):
-            return scale_folder_path + "\\"
+            return scale_folder_path
         else:
             print(f"Directory {scale_folder_path} is not found")
             return None
@@ -1918,7 +1983,7 @@ class ImageProcessor:
             else:
                 self.compute_wavelets(task, info_out)
 
-                # Текущий конвейер огибающих относится к построчному 1D-анализу.
+                # Row CWT and Column CWT feed independent point pipelines.
                 self.progress.update_progress(0.7, "Начало поиска экстремумов...")
                 if pipeline_plan.point_pipeline_required:
                     selected = ["экстремумы"]
@@ -2095,11 +2160,15 @@ class WorkspaceTabs(ctk.CTkFrame):
     def tab(self, name):
         return self._pages[name]
 
+    def current_tab(self):
+        return self._current_name
+
     def set(self, name):
         if name not in self._pages:
             return
-        if getattr(self, 'on_select', None) is not None:
-            self.on_select(name)
+        # Переключаем саму страницу до её обновления. Если код конкретной
+        # вкладки завершится ошибкой, навигация всё равно не должна оставаться
+        # на предыдущей странице и создавать впечатление «заблокированной».
         self._pages[name].tkraise()
         self._current_name = name
         if name in self._visible_tab_names:
@@ -2123,6 +2192,13 @@ class WorkspaceTabs(ctk.CTkFrame):
                 )
             else:
                 underline.place_forget()
+        if getattr(self, 'on_select', None) is not None:
+            try:
+                self.on_select(name)
+            except Exception:
+                # Передаём исключение штатному обработчику Tk уже после того,
+                # как состояние навигации стало согласованным.
+                self.winfo_toplevel().report_callback_exception(*sys.exc_info())
 
     def set_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
@@ -2145,6 +2221,13 @@ class App(TkinterApp):
         super().__init__()
         self._compute_thread = None
         self._ml_thread = None
+        # Explicit UI lock states. Never infer widget availability from
+        # Thread.is_alive(): worker shutdown and Tk callbacks are asynchronous.
+        self._ml_ui_locked = False
+        # Explicit UI lock state. Do not infer it from Thread.is_alive():
+        # the worker may still be technically alive for a few milliseconds
+        # after the Tk unlock callback has already run.
+        self._compute_ui_locked = False
         self._startup_pending = True
         self._startup_steps = self._initialize_workspace()
         if show_splash:
@@ -2216,24 +2299,29 @@ class App(TkinterApp):
         IconButton(self.layout_controls, 'focus', 'Фокус на рабочей области', self._toggle_focus_layout).pack(side='left', padx=3)
 
         # Глобальная навигация находится отдельно от этапов текущего исследования.
-        self.home_button = ctk.CTkButton(
-            self.layout_controls,
-            text="Начальная",
-            width=105,
+        nav_button_style = dict(
             height=28,
+            corner_radius=0,
             fg_color="transparent",
             hover_color=AppTheme.NAV_HOVER,
+            text_color=AppTheme.NAV_TEXT_INACTIVE,
+            border_width=0,
+            font=ctk.CTkFont(size=14),
+        )
+        self.home_button = ctk.CTkButton(
+            self.layout_controls,
+            text="Главная",
+            width=100,
             command=self._show_welcome,
+            **nav_button_style,
         )
         self.home_button.pack(side="right", padx=(4, 3))
         self.history_button = ctk.CTkButton(
             self.layout_controls,
             text="История",
             width=95,
-            height=28,
-            fg_color="transparent",
-            hover_color=AppTheme.NAV_HOVER,
             command=self._show_history_page,
+            **nav_button_style,
         )
         self.history_button.pack(side="right", padx=3)
 
@@ -2306,7 +2394,9 @@ class App(TkinterApp):
                 self.ml_algorithm_var, self.ml_point_filter_var,
                 self.ml_feature_set_var, self.ml_standardize_var,
                 self.ml_n_clusters_var, self.ml_random_state_var,
-                self.ml_eps_var, self.ml_min_samples_var):
+                self.ml_eps_var, self.ml_min_samples_var, self.ml_dataset_var,
+                self.ml_dbscan_tile_size_var, self.ml_dbscan_tile_overlap_var,
+                self.ml_dbscan_max_points_var):
             variable.trace_add('write', self._store_ml_settings_for_current_task)
 
         # Переменная для GPU/CPU переключения
@@ -2392,7 +2482,7 @@ class App(TkinterApp):
         )
         recent_card.grid(row=1, column=1, sticky="nsew")
         recent_header = ctk.CTkFrame(recent_card, fg_color="transparent")
-        recent_header.pack(fill="x", padx=22, pady=(24, 10))
+        recent_header.pack(fill="x", padx=22, pady=(18, 7))
         ctk.CTkLabel(
             recent_header,
             text="Последние исследования",
@@ -2413,12 +2503,19 @@ class App(TkinterApp):
             recent_card, fg_color="transparent"
         )
         self.welcome_recent_container.pack(
-            fill="both", expand=True, padx=18, pady=(2, 18)
+            fill="both", expand=True, padx=18, pady=(0, 12)
         )
         return page
 
+    def _welcome_recent_limit(self):
+        """Показывать 4 карточки на обычном Full HD и 3 на низких экранах."""
+        try:
+            return 6 if self.winfo_screenheight() >= 900 else 5
+        except Exception:
+            return 5
+
     def _refresh_welcome_recent_runs(self):
-        """Обновить пять последних исследований на начальном экране."""
+        """Обновить последние исследования на главном экране."""
         container = getattr(self, "welcome_recent_container", None)
         if container is None:
             return
@@ -2426,7 +2523,7 @@ class App(TkinterApp):
             child.destroy()
 
         try:
-            runs = self.run_history.list_runs(limit=5)
+            runs = self.run_history.list_runs(limit=self._welcome_recent_limit())
         except Exception as error:
             ctk.CTkLabel(
                 container,
@@ -2467,6 +2564,8 @@ class App(TkinterApp):
             details = {
                 "wavelet": run.get("analysis_mode", "—"),
                 "scales": "—",
+                "stages": run.get("pipeline_preset", "—"),
+                "nuances": "",
             }
 
         try:
@@ -2479,62 +2578,85 @@ class App(TkinterApp):
         except Exception:
             created = str(run.get("created_at", ""))[:16].replace("T", "  ")
 
-        card = ctk.CTkFrame(
-            parent,
-            border_width=1,
-            border_color=AppTheme.BORDER,
-            corner_radius=8,
-            fg_color=AppTheme.NAV_SELECTED_BACKGROUND,
+        status_raw = str(run.get("status", "") or "")
+        status_text = {
+            "completed": "Завершён",
+            "cancelled": "Отменён",
+        }.get(status_raw, "Ошибка" if status_raw else "")
+        status_color = (
+            AppTheme.SUCCESS if status_raw == "completed"
+            else AppTheme.TEXT_SECONDARY if status_raw == "cancelled"
+            else AppTheme.DANGER if status_raw
+            else AppTheme.TEXT_SECONDARY
         )
-        card.pack(fill="x", padx=4, pady=5)
+
+        card = ctk.CTkFrame(
+            parent, border_width=1, border_color=AppTheme.BORDER,
+            corner_radius=8, fg_color=AppTheme.NAV_SELECTED_BACKGROUND,
+        )
+        card.pack(fill="x", padx=4, pady=3)
 
         top = ctk.CTkFrame(card, fg_color="transparent")
-        top.pack(fill="x", padx=14, pady=(11, 2))
-        source = os.path.basename(run.get("image_path") or "") or run.get("task_name", "Исследование")
+        top.pack(fill="x", padx=12, pady=(6, 2))
         ctk.CTkLabel(
-            top,
-            text=source,
-            font=AppTheme.section_title_font(),
-            anchor="w",
-        ).pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(
-            top,
-            text=created,
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-        ).pack(side="right", padx=(10, 0))
-
-        status = run.get("status", "")
-        summary = f"{details.get('wavelet', '—')}  ·  масштабы: {details.get('scales', '—')}"
-        if status:
-            summary += f"  ·  {status}"
-        ctk.CTkLabel(
-            card,
-            text=summary,
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w",
-        ).pack(fill="x", padx=14, pady=(1, 8))
-
-        actions = ctk.CTkFrame(card, fg_color="transparent")
-        actions.pack(fill="x", padx=14, pady=(0, 10))
-        ctk.CTkButton(
-            actions,
-            text="Продолжить",
-            width=110,
-            height=29,
-            command=lambda run_id=run["id"]: self._continue_research(run_id),
+            top, text=f"Эксперимент №{run['id']}",
+            font=ctk.CTkFont(size=15, weight="bold"), anchor="w"
         ).pack(side="left")
+        ctk.CTkLabel(
+            top, text=created, font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY
+        ).pack(side="right")
+
+        middle = ctk.CTkFrame(card, fg_color="transparent")
+        middle.pack(fill="x", padx=12, pady=(0, 2))
+        ctk.CTkLabel(
+            middle, text=details.get("wavelet", "—"),
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=AppTheme.NAV_HOVER, corner_radius=6,
+            padx=8, pady=2
+        ).pack(side="left")
+        if status_text:
+            ctk.CTkLabel(
+                middle, text=status_text, font=AppTheme.caption_font(),
+                text_color=status_color, fg_color=AppTheme.NAV_BACKGROUND,
+                corner_radius=6, padx=7, pady=2
+            ).pack(side="left", padx=(6, 0))
+
+        # Действия держим на той же строке, что и бейджи: это экономит
+        # почти треть высоты карточки, не ухудшая читаемость.
         if run.get("output_path"):
             ctk.CTkButton(
-                actions,
-                text="Результаты",
-                width=105,
-                height=29,
-                fg_color="transparent",
-                hover_color=AppTheme.NAV_HOVER,
+                middle, text="Результаты", width=96, height=25,
+                fg_color="transparent", hover_color=AppTheme.NAV_HOVER,
+                text_color=AppTheme.NAV_TEXT_ACTIVE, font=ctk.CTkFont(size=13),
                 command=lambda folder=run["output_path"]: self._open_results_from_welcome(folder),
-            ).pack(side="left", padx=(7, 0))
+            ).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(
+            middle, text="Продолжить", width=102, height=25,
+            font=ctk.CTkFont(size=13),
+            command=lambda run_id=run["id"]: self._continue_research(run_id)
+        ).pack(side="right")
+
+        meta = [
+            f"Масштабы: {details.get('scales', '—')}",
+            f"Сценарий: {run.get('pipeline_preset', '—')}"
+        ]
+        if run.get("duration_seconds"):
+            meta.append(format_time(run["duration_seconds"]))
+        ctk.CTkLabel(
+            card, text="  ·  ".join(meta), font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY, anchor="w", wraplength=900
+        ).pack(fill="x", padx=12, pady=(0, 5))
+
+        # Заметка полезна для идентификации запуска, но на главном экране
+        # показываем её одной короткой строкой, чтобы карточки не разрастались.
+        note = str(run.get("researcher_note", "") or "").strip()
+        if note:
+            short_note = note if len(note) <= 110 else note[:107].rstrip() + "..."
+            ctk.CTkLabel(
+                card, text=f"Заметка: {short_note}", font=AppTheme.caption_font(),
+                text_color=AppTheme.MUTED, anchor="w", wraplength=900
+            ).pack(fill="x", padx=12, pady=(0, 5))
 
     def _workspace_is_busy(self):
         return any(
@@ -2545,12 +2667,30 @@ class App(TkinterApp):
             )
         )
 
+    def _set_global_navigation_state(self, active=None):
+        """Стилизовать глобальные кнопки навигации в духе верхних вкладок."""
+        mapping = {
+            "home": getattr(self, "home_button", None),
+            "history": getattr(self, "history_button", None),
+        }
+        for name, button in mapping.items():
+            if button is None:
+                continue
+            is_active = name == active
+            button.configure(
+                text_color=(
+                    AppTheme.NAV_TEXT_ACTIVE if is_active
+                    else AppTheme.NAV_TEXT_INACTIVE
+                ),
+                fg_color="transparent",
+            )
+
     def _show_welcome(self, force=False):
-        """Показать начальный экран, не уничтожая рабочую сессию."""
+        """Показать главный экран, не уничтожая рабочую сессию."""
         if not force and self._workspace_is_busy():
             mb.showwarning(
                 "Выполнение",
-                "Нельзя перейти на начальный экран, пока выполняется расчёт.",
+                "Нельзя перейти на главный экран, пока выполняется расчёт.",
             )
             return
 
@@ -2563,6 +2703,7 @@ class App(TkinterApp):
             progress_manager.frame.pack_forget()
 
         self._refresh_welcome_recent_runs()
+        self._set_global_navigation_state("home")
         self.welcome_frame.pack(fill="both", expand=True)
 
     def _show_workspace(self):
@@ -2581,6 +2722,12 @@ class App(TkinterApp):
             )
         if hasattr(self, "progress_manager") and not self.progress_manager.frame.winfo_manager():
             self.progress_manager.frame.pack(fill="x", padx=20, pady=(4, 10))
+        current_tab = None
+        if hasattr(self, "workspace_tabs"):
+            current_tab = self.workspace_tabs.current_tab()
+        self._set_global_navigation_state(
+            "history" if current_tab == "Предыдущие запуски" else None
+        )
 
     def _start_new_research(self):
         self._show_workspace()
@@ -2708,6 +2855,8 @@ class App(TkinterApp):
 
         # ML-настройки. Набор полей алгоритма перестраивается динамически.
         self.ml_algorithm_var = tk.StringVar(value="K-means")
+        self.ml_dataset_var = tk.StringVar(value="")
+        self._ml_dataset_options = {}
         self.ml_point_filter_var = tk.StringVar(value="Все точки KNN")
         self.ml_feature_set_var = tk.StringVar(value="Геометрия KNN")
         self.ml_standardize_var = tk.BooleanVar(value=True)
@@ -2715,6 +2864,9 @@ class App(TkinterApp):
         self.ml_random_state_var = tk.StringVar(value="42")
         self.ml_eps_var = tk.StringVar(value="0.8")
         self.ml_min_samples_var = tk.StringVar(value="5")
+        self.ml_dbscan_tile_size_var = tk.StringVar(value="256")
+        self.ml_dbscan_tile_overlap_var = tk.StringVar(value="32")
+        self.ml_dbscan_max_points_var = tk.StringVar(value="30000")
         self._ml_thread = None
         self._ml_preview_image = None
 
@@ -2846,8 +2998,22 @@ class App(TkinterApp):
         self.analysis_panel = self._create_analysis_tab(
             self.workspace_tabs.tab("Параметры расчёта")
         )
-        self.workspace_tabs.on_select = self._ensure_workspace_tab
+        self.workspace_tabs.on_select = self._on_workspace_tab_selected
         self.workspace_tabs.set("Данные")
+
+    def _on_workspace_tab_selected(self, name):
+        self._set_global_navigation_state(
+            "history" if name == "Предыдущие запуски" else None
+        )
+        self._ensure_workspace_tab(name)
+
+        if name == "ML" and hasattr(self, "ml_panel"):
+            # Состояние ML-контролов нельзя брать из старого состояния виджетов.
+            # KNN мог завершиться уже после создания вкладки, а общий unlock UI
+            # мог ещё находиться в очереди Tk. Пересчитываем доступность при
+            # КАЖДОМ входе на вкладку и ещё раз в следующем цикле event loop.
+            self._update_ml_tab_state()
+            self.after_safe(0, self._refresh_ml_controls_state)
 
     def _ensure_workspace_tab(self, name):
         """Build optional pages once, retaining their state and fixed containers."""
@@ -2860,14 +3026,12 @@ class App(TkinterApp):
         elif name == "ML" and not hasattr(self, 'ml_panel'):
             self.ml_panel = self._create_ml_tab(self.workspace_tabs.tab(name))
             self._update_ml_tab_state()
-            if self._compute_thread is not None and self._compute_thread.is_alive():
-                self._lock_controls_in(self.ml_panel)
         elif name == "Предыдущие запуски":
             if not hasattr(self, 'history_panel'):
                 self.history_panel = self._create_history_tab(self.workspace_tabs.tab(name))
             elif getattr(self, '_history_dirty', False):
                 self._refresh_history_tab(force=True)
-            if self._compute_thread is not None and self._compute_thread.is_alive():
+            if getattr(self, '_compute_ui_locked', False):
                 self._lock_controls_in(self.history_panel)
 
     def _create_history_tab(self, parent):
@@ -3530,6 +3694,14 @@ class App(TkinterApp):
             justify="left"
         )
         self.ml_source_label.pack(fill="x", padx=12, pady=(0, 10))
+        source_select = ctk.CTkFrame(source_frame, fg_color="transparent")
+        source_select.pack(fill="x", padx=12, pady=(0, 10))
+        ctk.CTkLabel(source_select, text="KNN-набор", font=AppTheme.body_font(), anchor="w").pack(side="left")
+        self.ml_dataset_selector = ctk.CTkOptionMenu(
+            source_select, values=["Нет KNN-наборов"], variable=self.ml_dataset_var,
+            command=lambda _value: self._store_ml_settings_for_current_task(), width=560,
+            state="disabled")
+        self.ml_dataset_selector.pack(side="right")
 
         settings_frame = ctk.CTkFrame(content)
         settings_frame.pack(fill="x", padx=10, pady=8)
@@ -3543,21 +3715,19 @@ class App(TkinterApp):
         common_grid = ctk.CTkFrame(settings_frame, fg_color="transparent")
         common_grid.pack(fill="x", padx=12, pady=(0, 8))
         common_grid.grid_columnconfigure(1, weight=1)
+        self.ml_algorithm_selector = ctk.CTkOptionMenu(
+            common_grid, values=["K-means", "DBSCAN"],
+            variable=self.ml_algorithm_var,
+            command=self._on_ml_algorithm_changed, width=220
+        )
+        self.ml_feature_set_selector = ctk.CTkOptionMenu(
+            common_grid,
+            values=["Геометрия KNN", "Координаты + KNN"],
+            variable=self.ml_feature_set_var, width=260
+        )
         labels_and_widgets = [
-            ("Алгоритм", ctk.CTkOptionMenu(
-                common_grid, values=["K-means", "DBSCAN"],
-                variable=self.ml_algorithm_var,
-                command=self._on_ml_algorithm_changed, width=220)),
-            ("Тип точек", ctk.CTkOptionMenu(
-                common_grid,
-                values=["Все точки KNN", "Максимумы по строкам",
-                        "Минимумы по строкам", "Максимумы по столбцам",
-                        "Минимумы по столбцам"],
-                variable=self.ml_point_filter_var, width=260)),
-            ("Набор признаков", ctk.CTkOptionMenu(
-                common_grid,
-                values=["Геометрия KNN", "Координаты + KNN"],
-                variable=self.ml_feature_set_var, width=260)),
+            ("Алгоритм", self.ml_algorithm_selector),
+            ("Набор признаков", self.ml_feature_set_selector),
         ]
         for row, (label_text, widget) in enumerate(labels_and_widgets):
             ctk.CTkLabel(
@@ -3610,12 +3780,21 @@ class App(TkinterApp):
             wraplength=760
         )
         self.ml_result_label.pack(fill="x", padx=12, pady=(2, 8))
+        ctk.CTkLabel(
+            results_frame,
+            text="Пространственный результат сохраняется как ML-слой. Откройте вкладку «Результаты» и добавьте его через «+ Слой».",
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w", justify="left", wraplength=760
+        ).pack(fill="x", padx=12, pady=(0, 6))
 
         preview_controls = ctk.CTkFrame(results_frame, fg_color="transparent")
         preview_controls.pack(fill="x", padx=12, pady=(2, 6))
         self.ml_preview_selector = ctk.CTkOptionMenu(
             preview_controls,
-            values=["Кластеры на изображении", "Кластеры в признаках"],
+            values=[
+                "Кластеры на изображении", "Кластеры в признаках",
+                "По масштабам", "По RGB-каналам"
+            ],
             command=lambda _value: self._refresh_ml_preview(),
             width=250,
             state="disabled",
@@ -3633,6 +3812,17 @@ class App(TkinterApp):
             corner_radius=6
         )
         self.ml_preview_label.pack(fill="x", padx=12, pady=(4, 12))
+        # CTkLabel не во всех версиях CustomTkinter корректно освобождает
+        # прежний PhotoImage при configure(image=None). Оставляем постоянную
+        # прозрачную заглушку, чтобы Tk никогда не ссылался на уже удалённый
+        # pyimage после смены параметров или повторной кластеризации.
+        empty_preview = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        self._ml_empty_preview_image = ctk.CTkImage(
+            light_image=empty_preview,
+            dark_image=empty_preview,
+            size=(1, 1),
+        )
+        self.ml_preview_label.configure(image=self._ml_empty_preview_image)
         self._on_ml_algorithm_changed(self.ml_algorithm_var.get())
         return panel
 
@@ -3647,11 +3837,30 @@ class App(TkinterApp):
                 text="Активная задача не выбрана",
                 text_color=AppTheme.TEXT_SECONDARY
             )
-            self.ml_run_button.configure(state="disabled")
             self._show_ml_result(None)
+            self._refresh_ml_controls_state()
             return
 
+        self._loading_task_settings = True
         has_knn = bool(getattr(task, "knn_results", None))
+        if has_knn:
+            from ml.clustering import knn_dataset_options
+            dataset_options = knn_dataset_options(task.knn_results)
+        else:
+            dataset_options = []
+        self._ml_dataset_options = {item["label"]: item["key"] for item in dataset_options}
+        if page_created:
+            values = list(self._ml_dataset_options) or ["Нет KNN-наборов"]
+            self.ml_dataset_selector.configure(values=values, state="normal" if dataset_options else "disabled")
+            wanted = getattr(task, "ml_dataset_key", None)
+            selected_label = None
+            if wanted is not None:
+                selected_label = next((label for label, key in self._ml_dataset_options.items()
+                                       if tuple(key) == tuple(wanted)), None)
+            if selected_label is None and dataset_options:
+                selected_label = dataset_options[0]["label"]
+                task.ml_dataset_key = dataset_options[0]["key"]
+            self.ml_dataset_var.set(selected_label or "Нет KNN-наборов")
         source_status = (
             "KNN-признаки готовы к кластеризации" if has_knn else
             "KNN-признаки ещё не рассчитаны. На вкладке «Параметры расчёта» "
@@ -3662,9 +3871,7 @@ class App(TkinterApp):
                 text=f"{task.task_name}: {source_status}",
                 text_color=AppTheme.TEXT_ON_DARK if has_knn else AppTheme.TEXT_SECONDARY
             )
-            self.ml_run_button.configure(state="normal" if has_knn else "disabled")
 
-        self._loading_task_settings = True
         self.ml_algorithm_var.set(
             "K-means" if task.ml_algorithm == "kmeans" else "DBSCAN"
         )
@@ -3683,45 +3890,152 @@ class App(TkinterApp):
         self.ml_random_state_var.set(str(task.ml_random_state))
         self.ml_eps_var.set(f"{task.ml_eps:g}")
         self.ml_min_samples_var.set(str(task.ml_min_samples))
+        self.ml_dbscan_tile_size_var.set(str(getattr(task, "ml_dbscan_tile_size", 256)))
+        self.ml_dbscan_tile_overlap_var.set(str(getattr(task, "ml_dbscan_tile_overlap", 32)))
+        self.ml_dbscan_max_points_var.set(str(getattr(task, "ml_dbscan_max_points_per_tile", 30000)))
         self._loading_task_settings = False
         self._on_ml_algorithm_changed(self.ml_algorithm_var.get())
         self._show_ml_result(task.ml_result)
+        self._refresh_ml_controls_state()
 
     def _on_ml_algorithm_changed(self, _value=None):
-        """Показать только параметры выбранного алгоритма."""
+        """Показать параметры выбранного алгоритма без уничтожения CTkEntry.
+
+        Важно: CTkEntry, привязанный к постоянному StringVar, нельзя постоянно
+        destroy()/создавать заново. В некоторых версиях CustomTkinter trace
+        переменной переживает уничтожение внутреннего tk.Entry, после чего
+        следующий variable.set() вызывает TclError ``invalid command name``.
+        Поэтому обе группы параметров создаются один раз и затем только
+        переключаются через pack_forget()/pack().
+        """
         frame = getattr(self, "ml_algorithm_parameters", None)
         if frame is None:
             return
-        for child in frame.winfo_children():
-            child.destroy()
-        frame.grid_columnconfigure(1, weight=1)
-        if self.ml_algorithm_var.get() == "K-means":
-            fields = [
+
+        if not getattr(self, "_ml_parameter_widgets_built", False):
+            self._ml_kmeans_parameters_frame = ctk.CTkFrame(
+                frame, fg_color="transparent"
+            )
+            self._ml_dbscan_parameters_frame = ctk.CTkFrame(
+                frame, fg_color="transparent"
+            )
+
+            self._ml_kmeans_parameter_entries = []
+            self._ml_dbscan_parameter_entries = []
+
+            kmeans_fields = [
                 ("Количество кластеров", self.ml_n_clusters_var),
                 ("Начальное состояние", self.ml_random_state_var),
             ]
+            dbscan_fields = [
+                ("Радиус соседства ε", self.ml_eps_var),
+                ("Минимум точек", self.ml_min_samples_var),
+                ("Размер пространственного тайла, px", self.ml_dbscan_tile_size_var),
+                ("Перекрытие тайлов, px", self.ml_dbscan_tile_overlap_var),
+                ("Максимум точек в тайле", self.ml_dbscan_max_points_var),
+            ]
+
+            def build_group(container, fields, target_entries):
+                container.grid_columnconfigure(1, weight=1)
+                for row, (label, variable) in enumerate(fields):
+                    ctk.CTkLabel(
+                        container,
+                        text=label,
+                        font=AppTheme.body_font(),
+                        anchor="w",
+                    ).grid(
+                        row=row, column=0, sticky="w",
+                        padx=(0, 14), pady=4,
+                    )
+                    entry = ctk.CTkEntry(
+                        container, textvariable=variable, width=160
+                    )
+                    entry.grid(row=row, column=1, sticky="w", pady=4)
+                    target_entries.append(entry)
+
+            build_group(
+                self._ml_kmeans_parameters_frame,
+                kmeans_fields,
+                self._ml_kmeans_parameter_entries,
+            )
+            build_group(
+                self._ml_dbscan_parameters_frame,
+                dbscan_fields,
+                self._ml_dbscan_parameter_entries,
+            )
+            self._ml_parameter_entries = (
+                self._ml_kmeans_parameter_entries
+                + self._ml_dbscan_parameter_entries
+            )
+            self._ml_parameter_widgets_built = True
+
+        # Никаких destroy(): только переключение уже существующих групп.
+        self._ml_kmeans_parameters_frame.pack_forget()
+        self._ml_dbscan_parameters_frame.pack_forget()
+
+        if self.ml_algorithm_var.get() == "K-means":
+            self._ml_kmeans_parameters_frame.pack(fill="x")
             help_text = (
                 "K-means делит все точки на заранее заданное число групп. "
                 "Шумовые точки отдельно не выделяются."
             )
         else:
-            fields = [
-                ("Радиус соседства ε", self.ml_eps_var),
-                ("Минимум точек", self.ml_min_samples_var),
-            ]
+            self._ml_dbscan_parameters_frame.pack(fill="x")
             help_text = (
-                "DBSCAN сам определяет число плотных групп и помечает "
-                "одиночные точки как шум."
+                "DBSCAN выполняется локально по пространственным тайлам с перекрытием. "
+                "Все точки участвуют в анализе; перекрытие уменьшает граничные артефакты. "
+                "Номера кластеров разных тайлов не являются глобальными классами."
             )
-        for row, (label, variable) in enumerate(fields):
-            ctk.CTkLabel(
-                frame, text=label, font=AppTheme.body_font(), anchor="w"
-            ).grid(row=row, column=0, sticky="w", padx=(0, 14), pady=4)
-            ctk.CTkEntry(frame, textvariable=variable, width=160).grid(
-                row=row, column=1, sticky="w", pady=4
-            )
+
         if getattr(self, "ml_algorithm_help_label", None) is not None:
             self.ml_algorithm_help_label.configure(text=help_text)
+        self._refresh_ml_controls_state()
+
+    def _refresh_ml_controls_state(self):
+        """Пересчитать доступность ML-контролов из фаз UI-операций.
+
+        Нельзя использовать ``Thread.is_alive()`` для состояния виджетов:
+        callback завершения уже выполняется в Tk-потоке, когда worker ещё может
+        оставаться alive до выхода из своей функции. Именно это окно гонки
+        оставляло параметры ML заблокированными после готового KNN/ML.
+        Проверки ``is_alive()`` остаются только в командах запуска, где они
+        защищают от реального параллельного старта второй операции.
+        """
+        if not hasattr(self, "ml_run_button"):
+            return
+
+        task = getattr(self, "current_task", None)
+        has_knn = bool(task is not None and getattr(task, "knn_results", None))
+        compute_locked = bool(getattr(self, "_compute_ui_locked", False))
+        ml_locked = bool(getattr(self, "_ml_ui_locked", False))
+        editable = ml_controls_editable(
+            knn_ready=has_knn,
+            compute_locked=compute_locked,
+            ml_locked=ml_locked,
+        )
+        state = "normal" if editable else "disabled"
+
+        for widget_name in (
+            "ml_dataset_selector",
+            "ml_algorithm_selector",
+            "ml_feature_set_selector",
+            "ml_standardize_checkbox",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.configure(state=state)
+
+        for entry in getattr(self, "_ml_parameter_entries", []):
+            try:
+                if entry.winfo_exists():
+                    entry.configure(state=state)
+            except Exception:
+                pass
+
+        self.ml_run_button.configure(
+            state=state,
+            text=("Выполняется..." if ml_locked else "Выполнить кластеризацию")
+        )
 
     def _store_ml_settings(self, task):
         point_filters = {
@@ -3731,7 +4045,11 @@ class App(TkinterApp):
             "Минимумы по столбцам": "min_by_column",
         }
         task.ml_algorithm = "kmeans" if self.ml_algorithm_var.get() == "K-means" else "dbscan"
-        task.ml_point_filter = point_filters[self.ml_point_filter_var.get()]
+        selected_dataset = self._ml_dataset_options.get(self.ml_dataset_var.get())
+        if selected_dataset is None:
+            raise ValueError("Не выбран KNN-набор")
+        task.ml_dataset_key = tuple(selected_dataset)
+        task.ml_point_filter = "all"
         task.ml_feature_set = (
             "knn" if self.ml_feature_set_var.get() == "Геометрия KNN"
             else "coordinates_knn"
@@ -3741,6 +4059,9 @@ class App(TkinterApp):
         task.ml_random_state = int(self.ml_random_state_var.get())
         task.ml_eps = float(self.ml_eps_var.get().replace(",", "."))
         task.ml_min_samples = int(self.ml_min_samples_var.get())
+        task.ml_dbscan_tile_size = int(self.ml_dbscan_tile_size_var.get())
+        task.ml_dbscan_tile_overlap = int(self.ml_dbscan_tile_overlap_var.get())
+        task.ml_dbscan_max_points_per_tile = int(self.ml_dbscan_max_points_var.get())
 
     def _store_ml_settings_for_current_task(self, *_args):
         task = getattr(self, "current_task", None)
@@ -3775,29 +4096,53 @@ class App(TkinterApp):
         except Exception as error:
             mb.showerror("ML", f"Не удалось создать папку результатов: {error}")
             return
-        self.ml_run_button.configure(state="disabled", text="Выполняется...")
+        self._ml_ui_locked = True
+        self._refresh_ml_controls_state()
         self.progress_manager.run_control.reset()
         self.ml_result_label.configure(
             text="Подготовка признаков и кластеризация...",
             text_color=AppTheme.TEXT_SECONDARY,
         )
+        ml_stages = [
+            "Подготовка признаков",
+            "Стандартизация",
+            "Кластеризация",
+            "Метрики качества",
+            "Сохранение и визуализация",
+        ]
         self.progress_manager.begin_run(
             f"{task.task_name} · повторная ML-кластеризация",
-            [f"{task.task_name} · ML-кластеризация"]
+            ml_stages,
         )
-        self.progress_manager.begin_stage(f"{task.task_name} · ML-кластеризация")
+        self.cancel_compute_button.configure(state="normal", text="Отменить расчёт")
         self._ml_thread = threading.Thread(
             target=self._ml_clustering_worker, args=(task,), daemon=True
         )
         self._ml_thread.start()
 
     def _ml_clustering_worker(self, task):
-        from ml.clustering import run_clustering
+        from ml.clustering import run_clustering, knn_dataset_options
         started = time.time()
         snapshot = task.settings_snapshot()
         try:
             save_run_image(task)
             snapshot = task.settings_snapshot()
+            stage_names = {
+                "features": "Подготовка признаков",
+                "scaling": "Стандартизация",
+                "clustering": "Кластеризация",
+                "metrics": "Метрики качества",
+                "saving": "Сохранение и визуализация",
+            }
+            active_stage = {"key": None}
+
+            def ml_progress(stage_key, value, message):
+                stage_name = stage_names.get(stage_key, stage_key)
+                if active_stage["key"] != stage_key:
+                    self.progress_manager.begin_stage(stage_name)
+                    active_stage["key"] = stage_key
+                self.progress_manager.update_progress(value, message)
+
             result = run_clustering(
                 knn_results=task.knn_results,
                 algorithm=task.ml_algorithm,
@@ -3810,6 +4155,12 @@ class App(TkinterApp):
                 random_state=task.ml_random_state,
                 eps=task.ml_eps,
                 min_samples=task.ml_min_samples,
+                dataset_key=task.ml_dataset_key,
+                dbscan_tile_size=getattr(task, "ml_dbscan_tile_size", 256),
+                dbscan_tile_overlap=getattr(task, "ml_dbscan_tile_overlap", 32),
+                dbscan_max_points_per_tile=getattr(task, "ml_dbscan_max_points_per_tile", 30000),
+                progress_callback=ml_progress,
+                cancel_callback=self.progress_manager.run_control.check,
             )
             task.ml_result = result
             save_feature_checkpoint(task)
@@ -3831,6 +4182,14 @@ class App(TkinterApp):
             )
             self.after_safe(0, self._refresh_history_tab)
             self.after_safe(0, lambda: self._finish_ml_clustering(task, result))
+        except RunCancelled:
+            self.run_history.add_run(
+                task=task, status="cancelled",
+                duration_seconds=time.time() - started,
+                settings=snapshot, ml_algorithm=task.ml_algorithm,
+            )
+            self.after_safe(0, self._refresh_history_tab)
+            self.after_safe(0, self._cancel_ml_clustering)
         except (ClusteringError, ValueError) as error:
             self.run_history.add_run(
                 task=task, status="failed",
@@ -3852,11 +4211,24 @@ class App(TkinterApp):
             self.after_safe(0, self._refresh_history_tab)
             self.after_safe(0, lambda e=str(error): self._fail_ml_clustering(e))
 
+    def _cancel_ml_clustering(self):
+        self._ml_ui_locked = False
+        self._refresh_ml_controls_state()
+        self.cancel_compute_button.configure(state="disabled", text="Отменить расчёт")
+        self.progress_manager.cancel_run()
+        if hasattr(self, "ml_result_label"):
+            self.ml_result_label.configure(
+                text="ML-расчёт отменён пользователем",
+                text_color=AppTheme.TEXT_SECONDARY,
+            )
+
     def _finish_ml_clustering(self, task, result):
+        self._ml_ui_locked = False
+        self.cancel_compute_button.configure(state="disabled", text="Отменить расчёт")
         self._show_saved_results(task.task_folder_path)
         if self.current_task is task:
-            self.ml_run_button.configure(state="normal", text="Выполнить кластеризацию")
             self._show_ml_result(result)
+        self._refresh_ml_controls_state()
         self.progress_manager.log_info(
             f"ML-кластеризация завершена: {result['output_dir']}"
         )
@@ -3868,7 +4240,9 @@ class App(TkinterApp):
         )
 
     def _fail_ml_clustering(self, message):
-        self.ml_run_button.configure(state="normal", text="Выполнить кластеризацию")
+        self._ml_ui_locked = False
+        self.cancel_compute_button.configure(state="disabled", text="Отменить расчёт")
+        self._refresh_ml_controls_state()
         self.ml_result_label.configure(text=message, text_color=AppTheme.DANGER)
         self.progress_manager.fail_run(f"Ошибка ML: {message}")
 
@@ -3886,50 +4260,103 @@ class App(TkinterApp):
             )
             self.ml_preview_selector.configure(state="disabled")
             self.ml_open_folder_button.configure(state="disabled")
-            self.ml_preview_label.configure(image=None, text="")
-            self._ml_preview_image = None
+            self._set_ml_preview_image(None)
             return
         metrics = result["metrics"]
-        counts = ", ".join(
-            (f"шум: {count}" if label == -1 else f"кластер {label + 1}: {count}")
-            for label, count in result["counts"].items()
+        if result.get("tiled"):
+            stats = result.get("dbscan_statistics") or {}
+            anomaly_mean = stats.get("anomaly_mean", result["metrics"].get("anomaly_mean"))
+            counts = (
+                f"A>0: {stats.get('anomaly_nonzero', 0):,}; "
+                f"устойчивые A≥{stats.get('anomaly_threshold', 0.75):.2f}: {stats.get('anomaly_stable', 0):,}; "
+                f"A=1: {stats.get('anomaly_full', 0):,}; "
+                f"средняя A: {anomaly_mean:.3f}" if anomaly_mean is not None else
+                f"A>0: {stats.get('anomaly_nonzero', 0):,}"
+            )
+        else:
+            counts = ", ".join(
+                (f"шум: {count}" if label == -1 else f"кластер {label + 1}: {count}")
+                for label, count in result["counts"].items()
+            )
+        timings = result.get("timings", {})
+        timing_text = "; ".join(
+            f"{name}: {timings[name]:.2f} c"
+            for name in ("feature_extraction", "clustering", "quality_metrics", "saving_and_visualization")
+            if name in timings
+        )
+        silhouette_sample = metrics.get("silhouette_sample_size", 0)
+        sample_text = (
+            f" (выборка {silhouette_sample:,})" if silhouette_sample else ""
         )
         self.ml_result_label.configure(
             text=(
-                f"Алгоритм: {result['algorithm_name']}\n"
-                f"Кластеров: {metrics['cluster_count']}; шумовых точек: {metrics['noise_count']}\n"
-                f"Распределение: {counts}\n"
-                f"Silhouette: {self._format_metric(metrics['silhouette'])}; "
-                f"Davies–Bouldin: {self._format_metric(metrics['davies_bouldin'])}; "
-                f"Calinski–Harabasz: {self._format_metric(metrics['calinski_harabasz'])}\n"
-                "Silhouette: ближе к 1 — лучше; Davies–Bouldin: меньше — лучше; "
-                "Calinski–Harabasz: больше — лучше."
+                f"Алгоритм: {result['algorithm_name']}; точек: {result.get('point_count', len(result.get('records', []))):,}\n"
+                f"Набор: {result.get('dataset', {}).get('channel', '—')} · a={result.get('dataset', {}).get('scale', '—')} · "
+                f"{result.get('dataset', {}).get('point_type_name', '—')} · {result.get('dataset', {}).get('direction', '—')}\n"
+                + ((f"Локальный сеточный DBSCAN: тайлов {result.get('dbscan_statistics', {}).get('tiles', '—')}\n")
+                   if result.get("tiled") else
+                   (f"Кластеров: {metrics['cluster_count']}; шумовых точек: {metrics['noise_count']}\n"))
+                + f"Результат: {counts}\n"
+                + (("DBSCAN: локальные ID тайлов не являются глобальными кластерами; "
+                    "основной показатель — устойчивость аномалии A∈[0,1].\n") if result.get("tiled") else
+                   (f"Silhouette: {self._format_metric(metrics['silhouette'])}{sample_text}; "
+                    f"Davies–Bouldin: {self._format_metric(metrics['davies_bouldin'])}; "
+                    f"Calinski–Harabasz: {self._format_metric(metrics['calinski_harabasz'])}\n"))
+                + (f"Время: {timing_text}\n" if timing_text else "")
+                + (("DBSCAN: анализируйте отдельные ML-слои по масштабу, каналу, типу точек и направлению во вкладке «Результаты»."
+                    ) if result.get("tiled") else
+                   "Silhouette: ближе к 1 — лучше; Davies–Bouldin: меньше — лучше; Calinski–Harabasz: больше — лучше.")
             ),
             text_color=AppTheme.TEXT_ON_DARK,
         )
-        self.ml_preview_selector.configure(state="normal")
+        preview_values = ["Аномальность в признаках" if result.get("tiled") else "Кластеры в признаках"]
+        self.ml_preview_selector.configure(values=preview_values, state="normal")
+        if self.ml_preview_selector.get() not in preview_values:
+            self.ml_preview_selector.set(preview_values[0])
         self.ml_open_folder_button.configure(state="normal")
         self._refresh_ml_preview()
+
+    def _set_ml_preview_image(self, image=None, text=""):
+        """Атомарно заменить ML-превью, не оставляя Tk со старым pyimage."""
+        if not hasattr(self, "ml_preview_label"):
+            return
+        replacement = image or getattr(self, "_ml_empty_preview_image", None)
+        # Старое изображение должно оставаться достижимым до того момента,
+        # когда Tk действительно переключит image-option на новое.
+        previous = getattr(self, "_ml_preview_image", None)
+        self.ml_preview_label.configure(image=replacement, text=text)
+        self._ml_preview_image = image
+        del previous
 
     def _refresh_ml_preview(self):
         task = self.current_task
         result = task.ml_result if task is not None else None
         if not result:
             return
-        path = (
-            result["image_plot_path"]
-            if self.ml_preview_selector.get() == "Кластеры на изображении"
-            else result["feature_plot_path"]
-        )
+        preview_paths = {
+            "Кластеры на изображении": result.get("image_plot_path"),
+            "Кластеры в признаках": result.get("feature_plot_path"),
+            "Аномальность в признаках": result.get("feature_plot_path"),
+            "По масштабам": result.get("scale_plot_path"),
+            "По RGB-каналам": result.get("channel_plot_path"),
+            "Шум DBSCAN": result.get("noise_plot_path"),
+        }
+        path = preview_paths.get(self.ml_preview_selector.get())
+        if not path:
+            self._set_ml_preview_image(None, "Визуализация недоступна")
+            return
         try:
-            image = Image.open(path)
-            image.thumbnail((760, 430), Image.Resampling.LANCZOS)
-            self._ml_preview_image = ctk.CTkImage(
+            with Image.open(path) as source_image:
+                image = source_image.convert("RGBA")
+                image.thumbnail((760, 430), Image.Resampling.LANCZOS)
+            preview_image = ctk.CTkImage(
                 light_image=image.copy(), dark_image=image.copy(), size=image.size
             )
-            self.ml_preview_label.configure(image=self._ml_preview_image, text="")
+            self._set_ml_preview_image(preview_image)
         except Exception as error:
-            self.ml_preview_label.configure(image=None, text=f"Не удалось показать изображение: {error}")
+            self._set_ml_preview_image(
+                None, f"Не удалось показать изображение: {error}"
+            )
 
     def _open_ml_result_folder(self):
         task = self.current_task
@@ -4489,16 +4916,16 @@ class App(TkinterApp):
         direction_frame = ctk.CTkFrame(grid, fg_color="transparent")
         direction_frame.grid(row=0, column=0, sticky="nw", padx=(0, 10))
         ctk.CTkLabel(
-            direction_frame, text="Направления:",
+            direction_frame, text="Источники 1D CWT:",
             font=AppTheme.body_font(), anchor="w"
         ).pack(fill="x", pady=(0, 5))
         self.row_checkbox = ctk.CTkCheckBox(
-            direction_frame, text="По строкам", variable=self.row_var,
+            direction_frame, text="CWT по строкам", variable=self.row_var,
             command=self._on_direction_changed
         )
         self.row_checkbox.pack(anchor="w", pady=3)
         self.col_checkbox = ctk.CTkCheckBox(
-            direction_frame, text="По столбцам", variable=self.col_var,
+            direction_frame, text="CWT по столбцам", variable=self.col_var,
             command=self._on_direction_changed
         )
         self.col_checkbox.pack(anchor="w", pady=3)
@@ -4522,12 +4949,15 @@ class App(TkinterApp):
 
         self.extremes_hint_label = ctk.CTkLabel(
             self.extremes_section.content,
-            text="",
+            text=("Для каждого выбранного CWT экстремумы ищутся "
+                  "и по строкам, и по столбцам."),
             font=AppTheme.caption_font(),
             text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w"
+            anchor="w", justify="left", wraplength=500,
         )
-        # Подсказку намеренно не размещаем: состояние отражается доступностью элементов.
+        self.extremes_section.add_widget(
+            self.extremes_hint_label, pady=(6, 0)
+        )
 
     def _on_direction_changed(self):
         """Сразу синхронизировать направления и доступность зависимых этапов."""
@@ -5069,7 +5499,7 @@ class App(TkinterApp):
         task = self.current_task
         self._update_navigation_buttons()
         if task is None:
-            self._set_row_analysis_controls_enabled(False)
+            self._set_point_analysis_controls_enabled(False)
             self.analysis_mode_selector.configure(state="disabled")
             self.load_button.configure(state="disabled")
             self.pipette_button.configure(state="disabled")
@@ -5083,8 +5513,9 @@ class App(TkinterApp):
             )
             return
 
-        self._set_row_analysis_controls_enabled(
-            task.analysis_mode == "1d" and task.process_rows
+        self._set_point_analysis_controls_enabled(
+            task.analysis_mode == "1d"
+            and (task.process_rows or task.process_columns)
         )
         self.load_button.configure(state="normal")
         if not task.image_path:
@@ -5140,8 +5571,8 @@ class App(TkinterApp):
         if progress_manager is not None:
             progress_manager.set_status(text, color)
 
-    def _set_row_analysis_controls_enabled(self, enabled):
-        """Огибающие и KNN доступны только для построчного результата 1D."""
+    def _set_point_analysis_controls_enabled(self, enabled):
+        """Enable point stages when either independent 1D branch exists."""
         state = "normal" if enabled else "disabled"
         for widget in (
                 self.max_checkbox, self.min_checkbox, self.entry_near_point,
@@ -5151,9 +5582,10 @@ class App(TkinterApp):
 
         if self.extremes_hint_label is not None:
             self.extremes_hint_label.configure(
-                text=("Огибающие и синхронизация доступны для построчного результата."
+                text=(("Для каждого выбранного CWT экстремумы ищутся "
+                       "по строкам и по столбцам.")
                       if enabled else
-                      "Недоступно: включите 1D-преобразование по строкам."),
+                      "Недоступно: включите CWT по строкам и/или столбцам."),
                 text_color=(AppTheme.TEXT_SECONDARY if enabled else AppTheme.WARNING)
             )
         self._update_pipeline_controls_state()
@@ -5679,8 +6111,10 @@ class App(TkinterApp):
         if self.pipeline_preset_selector is not None:
             self.pipeline_preset_selector.configure(state="normal" if is_1d else "disabled")
 
-        row_available = is_1d and task.process_rows
-        stage_state = "normal" if row_available else "disabled"
+        direction_available = is_1d and bool(
+            task.process_rows or task.process_columns
+        )
+        stage_state = "normal" if direction_available else "disabled"
         for widget in stage_widgets:
             if widget is not None:
                 widget.configure(state=stage_state)
@@ -6045,11 +6479,15 @@ class App(TkinterApp):
     def _update_statistics_controls_state(self):
         """Блокировать настройки/экспорт статистик, пока этап не выбран."""
         task = getattr(self, "current_task", None)
-        row_analysis_available = bool(
-            task is not None and task.analysis_mode == "1d" and task.process_rows
+        point_analysis_available = bool(
+            task is not None
+            and task.analysis_mode == "1d"
+            and (task.process_rows or task.process_columns)
         )
         plan = task.resolve_pipeline() if task is not None else None
-        statistics_enabled = bool(row_analysis_available and plan and plan.statistics)
+        statistics_enabled = bool(
+            point_analysis_available and plan and plan.statistics
+        )
         state = "normal" if statistics_enabled else "disabled"
         for widget in self.statistics_output_widgets:
             widget.configure(state=state)
@@ -6144,11 +6582,15 @@ class App(TkinterApp):
             self.memory_label.configure(text=f'Для оценки памяти проверьте параметры: {error}')
 
     def _request_cancel(self):
-        if self._compute_thread is None or not self._compute_thread.is_alive():
+        compute_running = self._compute_thread is not None and self._compute_thread.is_alive()
+        ml_running = self._ml_thread is not None and self._ml_thread.is_alive()
+        if not compute_running and not ml_running:
             return
         self.progress_manager.run_control.cancel()
         self.cancel_compute_button.configure(state='disabled', text='Ожидание остановки…')
-        self.progress_manager.progress_label.configure(text='Отмена запрошена: ожидаем завершения текущей операции…')
+        self.progress_manager.progress_label.configure(
+            text='Отмена запрошена: ожидаем завершения текущей операции…'
+        )
 
     def safe_destroy(self):
         running = lambda: any(t is not None and t.is_alive() for t in
@@ -6156,7 +6598,8 @@ class App(TkinterApp):
         if running():
             if not getattr(self, '_waiting_to_close', False):
                 self._waiting_to_close = True
-                if self._compute_thread is not None and self._compute_thread.is_alive():
+                if ((self._compute_thread is not None and self._compute_thread.is_alive())
+                        or (self._ml_thread is not None and self._ml_thread.is_alive())):
                     self._request_cancel()
                 def finish_close():
                     if running():
@@ -6222,6 +6665,7 @@ class App(TkinterApp):
 
     def _disable_ui_during_compute(self, disable: bool):
         """Блокировка/разблокировка UI во время вычислений"""
+        self._compute_ui_locked = bool(disable)
         if disable:
             self._locked_controls = []
             self._lock_controls_in(self.workspace_frame)
@@ -6267,20 +6711,63 @@ class App(TkinterApp):
                     f"Не удалось изменить состояние элемента интерфейса: {e}"
                 )
 
-        self.workspace_tabs.set_enabled(True)
+        try:
+            self.workspace_tabs.set_enabled(True)
+        except (tk.TclError, RuntimeError) as error:
+            self.progress_manager.log_error(
+                f"Не удалось обновить навигацию после расчёта: {error}"
+            )
 
         if not disable:
+            # Состояния, сохранённые ДО расчёта, уже могут быть неактуальны.
+            # В частности, ML-поля могли быть disabled лишь потому, что KNN на
+            # тот момент ещё не существовал. Ошибка одного старого Tk-виджета
+            # также не должна обрывать всю процедуру разблокировки.
             for widget, old_state in getattr(self, '_locked_controls', []):
-                if widget.winfo_exists():
-                    widget.configure(state=old_state)
+                try:
+                    if widget.winfo_exists():
+                        widget.configure(state=old_state)
+                except (tk.TclError, RuntimeError) as error:
+                    self.progress_manager.log_error(
+                        f"Пропущен устаревший элемент при разблокировке UI: {error}"
+                    )
             self._locked_controls = []
-            if hasattr(self, 'results_panel'):
-                for pane in (self.results_panel.left, self.results_panel.right):
-                    pane.refresh_control_states()
-                self.results_panel.update_colors()
-            self._update_gpu_section()
-            self._apply_analysis_mode_ui()
-            self._update_action_availability()
+
+            try:
+                if hasattr(self, 'results_panel'):
+                    for pane in (self.results_panel.left, self.results_panel.right):
+                        pane.refresh_control_states()
+                    self.results_panel.update_colors()
+            except (tk.TclError, RuntimeError) as error:
+                self.progress_manager.log_error(
+                    f"Не удалось обновить панель результатов после расчёта: {error}"
+                )
+
+            try:
+                self._update_gpu_section()
+            except (tk.TclError, RuntimeError) as error:
+                self.progress_manager.log_error(
+                    f"Не удалось обновить секцию устройства после расчёта: {error}"
+                )
+
+            try:
+                self._apply_analysis_mode_ui()
+                self._update_action_availability()
+            except (tk.TclError, RuntimeError) as error:
+                self.progress_manager.log_error(
+                    f"Не удалось полностью обновить основной UI после расчёта: {error}"
+                )
+            finally:
+                # Главное правило: готовый KNN + нет реально работающего worker =
+                # параметры ML активны. Не восстанавливаем их из old_state.
+                if hasattr(self, "ml_panel"):
+                    try:
+                        self._update_ml_tab_state()
+                        self.after_safe(0, self._refresh_ml_controls_state)
+                    except (tk.TclError, RuntimeError) as error:
+                        self.progress_manager.log_error(
+                            f"Не удалось обновить состояние ML-вкладки: {error}"
+                        )
 
     def _lock_controls_in(self, parent):
         if not hasattr(self, '_locked_controls'):
@@ -6308,6 +6795,13 @@ class App(TkinterApp):
         if not result:
             return ""
         metrics = result.get("metrics", {})
+        if result.get("tiled"):
+            stats = result.get("dbscan_statistics") or {}
+            return (
+                f"DBSCAN: A>0 — {stats.get('anomaly_nonzero', 0)}; "
+                f"устойчивые — {stats.get('anomaly_stable', 0)}; "
+                f"тайлов — {stats.get('tiles', 0)}"
+            )
         return (
             f"Кластеров: {metrics.get('cluster_count', 0)}; "
             f"шумовых точек: {metrics.get('noise_count', 0)}"
@@ -6337,7 +6831,7 @@ class App(TkinterApp):
                     task.process_rows or task.process_columns):
                 mb.showerror(
                     "Ошибка",
-                    f"Задача {i + 1}: не выбрано направление 1D-анализа"
+                    f"Задача {i + 1}: не выбран источник 1D CWT"
                 )
                 return
             if task.analysis_mode == "2d" and not task.orientations:

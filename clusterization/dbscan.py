@@ -82,7 +82,7 @@ plt.title("Исходное распределение точек")
 plt.xlabel("X")
 plt.ylabel("Y")
 plt.grid(True)
-plt.savefig("исход.png")
+plt.savefig("source.png")
 plt.close()
 
 dbscan = DBSCAN(epsilon=13, min_points=5)

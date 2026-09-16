@@ -297,18 +297,22 @@ class ProcessingTask:
                 maxima_required=False,
             )
 
-        row_pipeline_available = bool(self.process_rows)
-        knn = bool(self.calculate_knn and row_pipeline_available)
-        statistics = bool(self.calculate_statistics and self.process_rows)
+        point_pipeline_available = bool(
+            self.process_rows or self.process_columns
+        )
+        knn = bool(self.calculate_knn and point_pipeline_available)
+        statistics = bool(
+            self.calculate_statistics and point_pipeline_available
+        )
         synchronization = bool(
             self.calculate_synchronization and self.process_rows
         )
         ml_requested = False
-        envelopes = bool(row_pipeline_available and (
+        envelopes = bool(point_pipeline_available and (
             self.calculate_envelopes or knn or statistics or synchronization
         ))
         extrema = bool(
-            row_pipeline_available and (self.calculate_extrema or envelopes)
+            point_pipeline_available and (self.calculate_extrema or envelopes)
         )
         return PipelinePlan(
             mode="1d",

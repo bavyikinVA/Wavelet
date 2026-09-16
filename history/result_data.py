@@ -32,6 +32,7 @@ def load_result(item, folder):
         if 'morlet' in path.stem.lower():
             candidates.extend([path.with_name(path.stem + '_complex.npy'),
                                path.with_name(path.stem + '_magnitude.csv'),
+                               Path(folder) / 'previews' / (path.stem + '.npy'),
                                Path(folder) / 'Предпросмотр' / (path.stem + '.npy')])
         if 'кластеры_изображение' in path.stem:
             candidates.insert(0, path.parent / 'кластеры.csv')
@@ -122,7 +123,14 @@ def _read(filename, modified, size, category, shape):
                             for i, r in enumerate(rows)]), labels=['Блок', 'Количество максимумов'],
                             ticks=[r['block_label'] for r in rows], spatial=False)
             # Row ids and block size are metadata, not measured series.
-            keys = [k for k in rows[0] if k not in ('row_index', 'block_size', 'scales')]
+            keys = [
+                k for k in rows[0]
+                if k not in (
+                    'row_index', 'column_index', 'slice_index',
+                    'direction', 'cwt_direction', 'feature_axis',
+                    'block_size', 'scales'
+                )
+            ]
             try:
                 array = np.array([[float(r[k]) for k in keys] for r in rows])
                 return dict(kind='series', array=array, labels=keys, spatial=False)

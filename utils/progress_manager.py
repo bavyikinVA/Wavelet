@@ -411,7 +411,7 @@ class ProgressManager:
         if not output_dir:
             return ""
         os.makedirs(output_dir, exist_ok=True)
-        path = os.path.join(output_dir, "Журнал_запуска.txt")
+        path = os.path.join(output_dir, "run_log.txt")
         with open(path, "w", encoding="utf-8") as file:
             file.write(self._log_document(header))
         return path

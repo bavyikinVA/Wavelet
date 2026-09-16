@@ -182,7 +182,15 @@ class ArtifactPane(ctk.CTkFrame):
                   for key, menu in self.parameters.items())]
         previous = self.selector.get()
         previous_family = self.items.get(previous, {}).get('family')
-        self.items = {item['label']: item for item in items}
+        self.items = {}
+        for item in items:
+            base = item.get('display_label') or item['label']
+            label = base
+            counter = 2
+            while label in self.items:
+                label = f'{base} · вариант {counter}'
+                counter += 1
+            self.items[label] = item
         labels = list(self.items)
         self.selector.configure(values=labels or ['Нет файлов'], state='readonly')
         chosen = previous if previous in self.items else (labels[0] if labels else 'Нет файлов')

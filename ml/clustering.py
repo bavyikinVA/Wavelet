@@ -18,10 +18,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+
 from sklearn.cluster import DBSCAN, KMeans, MiniBatchKMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
+from result_naming import dated_folder_name, ml_dataset_slug
 
 from .errors import ClusteringError
 
@@ -100,7 +102,10 @@ def knn_dataset_options(knn_results: dict):
         points = np.asarray(payload.get("points", []))
         count = int(len(points)) if points.ndim >= 1 else 0
         key = (direction, channel, float(scale), point_type)
-        direction_name = "построчно" if direction in {"rows", "row", "str", "0"} else "по столбцам"
+        direction_name = (
+            "CWT по строкам" if direction in {"rows", "row", "str", "0"}
+            else "CWT по столбцам"
+        )
         channel_name = {"red": "Красный", "green": "Зелёный", "blue": "Синий"}.get(channel, channel)
         label = f"{channel_name} · a={float(scale):g} · {POINT_TYPE_LABELS.get(point_type, point_type)} · {direction_name} · {count:,} точек"
         result.append({"key": key, "label": label, "count": count})
@@ -559,11 +564,12 @@ def _dataset_slug(records):
     if not records:
         return "dataset"
     r = records[0]
-    channel = str(r.get("channel", "unknown")).replace(" ", "_")
-    scale = f"{float(r.get('scale', 0)):g}"
-    point_type = str(r.get("point_type", "points"))
-    direction = str(r.get("direction", "direction"))
-    return f"Scale_{scale}_Channel_{channel}_{point_type}_{direction}"
+    return ml_dataset_slug(
+        r.get("direction", "row"),
+        r.get("channel", "r"),
+        r.get("scale", 0),
+        r.get("point_type", "max_by_row"),
+    )
 
 def run_clustering(
     knn_results: dict,
@@ -667,18 +673,26 @@ def run_clustering(
             model_values, labels, silhouette_max_samples=silhouette_max_samples))
     _notify(progress_callback, "metrics", 1.0, "Метрики рассчитаны")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    timestamp = dated_folder_name(datetime.now())
     slug = _dataset_slug(table.records)
-    output_dir = os.path.join(output_root, "ML_кластеризация", slug, timestamp)
+    output_dir = os.path.join(output_root, "ml", slug, timestamp)
     os.makedirs(output_dir, exist_ok=True)
     if tiled:
-        base = f"ML_DBSCAN_аномальность_{slug}"
-        summary_path = os.path.join(output_dir, "статистика_DBSCAN.csv")
-        feature_plot_path = os.path.join(output_dir, "DBSCAN_аномальность_признаки.png")
+        base = f"ml_dbscan_{slug}"
+        summary_path = os.path.join(
+            output_dir, f"ml_dbscan_summary_{slug}.csv"
+        )
+        feature_plot_path = os.path.join(
+            output_dir, f"ml_dbscan_features_{slug}.png"
+        )
     else:
-        base = f"ML_KMeans_кластеры_{slug}"
-        summary_path = os.path.join(output_dir, "характеристики_кластеров.csv")
-        feature_plot_path = os.path.join(output_dir, "кластеры_признаки.png")
+        base = f"ml_kmeans_{slug}"
+        summary_path = os.path.join(
+            output_dir, f"ml_kmeans_summary_{slug}.csv"
+        )
+        feature_plot_path = os.path.join(
+            output_dir, f"ml_kmeans_features_{slug}.png"
+        )
     table_path = os.path.join(output_dir, base + ".csv")
 
     _notify(progress_callback, "saving", 0.0, "Сохранение ML-слоя…")
@@ -732,4 +746,3 @@ def run_clustering(
         "dbscan_tile_overlap": int(dbscan_tile_overlap) if tiled else None,
         "dbscan_max_points_per_tile": int(dbscan_max_points_per_tile) if tiled else None,
     }
-

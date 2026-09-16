@@ -10,7 +10,8 @@ import os
 import pickle
 
 
-CHECKPOINT_FILENAME = "Контрольная_точка_признаков.pkl.gz"
+CHECKPOINT_FILENAME = "feature_checkpoint.pkl.gz"
+LEGACY_CHECKPOINT_FILENAMES = ("Контрольная_точка_признаков.pkl.gz",)
 CHECKPOINT_VERSION = 1
 
 
@@ -18,8 +19,19 @@ def checkpoint_path(output_dir):
     return os.path.join(output_dir, CHECKPOINT_FILENAME)
 
 
+def existing_checkpoint_path(output_dir):
+    candidates = (CHECKPOINT_FILENAME, *LEGACY_CHECKPOINT_FILENAMES)
+    return next(
+        (os.path.join(output_dir, name) for name in candidates
+         if os.path.isfile(os.path.join(output_dir, name))),
+        checkpoint_path(output_dir),
+    )
+
+
 def feature_checkpoint_available(output_dir):
-    return bool(output_dir and os.path.isfile(checkpoint_path(output_dir)))
+    return bool(
+        output_dir and os.path.isfile(existing_checkpoint_path(output_dir))
+    )
 
 
 def save_feature_checkpoint(task):
@@ -45,7 +57,7 @@ def save_feature_checkpoint(task):
 
 
 def restore_feature_checkpoint(task, output_dir):
-    path = checkpoint_path(output_dir)
+    path = existing_checkpoint_path(output_dir)
     if not os.path.isfile(path):
         return []
     with gzip.open(path, "rb") as stream:
