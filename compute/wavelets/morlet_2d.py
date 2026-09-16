@@ -1,5 +1,3 @@
-"""Настоящее двумерное непрерывное преобразование Морле."""
-
 from __future__ import annotations
 
 import math

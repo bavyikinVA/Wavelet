@@ -149,7 +149,7 @@ class ArtifactPane(ctk.CTkFrame):
             return
         # All selector rows share their right edge; the layer action sits
         # outside that edge, with its own 8 px gap and 75 px button.
-        width = min(660, max(300, event.width / self._get_widget_scaling() - 103))
+        width = min(610, max(260, event.width / self._get_widget_scaling() - 218))
         for menu in self.parameters.values():
             menu.configure(width=(width-16)/3)
         self.selector.configure(width=width)

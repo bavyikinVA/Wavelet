@@ -1,10 +1,28 @@
 """Read native numerical artifacts without GUI dependencies."""
 import csv
+import hashlib
+from functools import lru_cache
 from history.array_cache import byte_cache
 from pathlib import Path
 import numpy as np
 from PIL import Image
 
+
+
+@lru_cache(maxsize=128)
+def _source_hash(filename, modified, size):
+    digest = hashlib.sha1()
+    with open(filename, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_identity(source, fallback):
+    if not source.is_file():
+        return ("folder", str(Path(fallback).resolve()))
+    stat = source.stat()
+    return ("sha1", stat.st_size, _source_hash(str(source), stat.st_mtime_ns, stat.st_size))
 
 def load_result(item, folder):
     path = Path(item['path'])
@@ -31,8 +49,9 @@ def load_result(item, folder):
     data['quantity'] = ('phase' if name.endswith('_phase') else
                         'magnitude' if name.endswith('_magnitude') else 'coefficient')
     # A run-local source identity prevents same-size, unrelated layers matching.
-    source_stat = source.stat() if source.is_file() else None
-    data['source_id'] = (str(source.resolve()), source_stat.st_mtime_ns, source_stat.st_size) if source_stat else str(Path(folder).resolve())
+    # Content identity lets sibling ML runs of the same research image be
+    # compared even though each run owns its own copied image.png.
+    data['source_id'] = _source_identity(source, folder)
     return data
 
 
@@ -87,12 +106,13 @@ def _read(filename, modified, size, category, shape):
         if rows and ('X' in rows[0] or 'x' in rows[0]):
             x, y = ('X', 'Y') if 'X' in rows[0] else ('x', 'y')
             points = np.array([[float(r[x]), float(r[y])] for r in rows])
-            colors = np.array([float(r.get('Кластер', 0)) for r in rows])
+            continuous = 'Аномальность DBSCAN' in rows[0]
+            colors = np.array([float(r.get('Аномальность DBSCAN', r.get('Кластер', 0))) for r in rows])
             edges = []
             if category == 'KNN' and 'point_id' in rows[0]:
                 coordinates = {r['point_id']: p for r, p in zip(rows, points)}
                 edges = [[coordinates[r['point_id']], coordinates[r['neighbor_id']]] for r in rows if r['neighbor_id'] in coordinates]
-            return dict(kind='points', points=points, colors=colors, edges=edges,
+            return dict(kind='points', points=points, colors=colors, edges=edges, continuous=continuous,
                         shape=shape or (int(points[:, 1].max())+1, int(points[:, 0].max())+1), spatial=shape is not None)
         if rows and list(rows[0])[0] == 'row' and category == 'Синхронизация':
             return _map(np.array([[float(v) for k, v in r.items() if k != 'row'] for r in rows]), spatial=False)
