@@ -342,15 +342,15 @@ previews/*.npy
 - анизотропность `γ`;
 - CPU/GPU;
 - выбранное представление каналов.
-
+  
 Используется комплексный двумерный вейвлет Morlet:
 
-$$
+```math
 \psi_{a,\theta}(x,y)
 =
 \frac{1}{a}
 \left(
-e^{\,i\omega_0 x_\theta / a}
+e^{i\omega_0 x_\theta/a}
 -
 e^{-\omega_0^2/2}
 \right)
@@ -362,17 +362,13 @@ e^{-\omega_0^2/2}
 \frac{y_\theta^2}{a^2\gamma^2}
 \right)
 \right]
-$$
+```
 
 где повёрнутые координаты определяются как:
 
-$$
+```math
 x_\theta = x\cos\theta + y\sin\theta
-$$
-
-$$
-y_\theta = -x\sin\theta + y\cos\theta
-$$
+```
 
 Обозначения:
 
