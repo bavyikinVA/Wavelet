@@ -106,7 +106,11 @@ def knn_dataset_options(knn_results: dict):
             "CWT по строкам" if direction in {"rows", "row", "str", "0"}
             else "CWT по столбцам"
         )
-        channel_name = {"red": "Красный", "green": "Зелёный", "blue": "Синий"}.get(channel, channel)
+        channel_name = {
+            "red": "Красный", "green": "Зелёный", "blue": "Синий",
+            "r": "Красный", "g": "Зелёный", "b": "Синий",
+            "gray": "Gray", "gs1": "GS1", "gs2": "GS2", "gs3": "GS3",
+        }.get(channel, channel)
         label = f"{channel_name} · a={float(scale):g} · {POINT_TYPE_LABELS.get(point_type, point_type)} · {direction_name} · {count:,} точек"
         result.append({"key": key, "label": label, "count": count})
     return sorted(result, key=lambda x: (x["key"][1], x["key"][2], x["key"][0], x["key"][3]))
@@ -138,7 +142,11 @@ def extract_knn_features(
     """Build one feature vector per point from one or more normalized KNN groups."""
     records = []
     selected_types = set(_selected_point_types(point_filter))
-    channel_order = {"red": 0.0, "green": 1.0, "blue": 2.0}
+    channel_order = {
+        "red": 0.0, "green": 1.0, "blue": 2.0,
+        "r": 0.0, "g": 1.0, "b": 2.0,
+        "gray": 0.0, "gs1": 0.0, "gs2": 1.0, "gs3": 2.0,
+    }
     groups = [g for g in _iter_knn_groups(knn_results) if g[3] in selected_types]
     total_groups = max(1, len(groups))
 

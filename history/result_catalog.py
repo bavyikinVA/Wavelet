@@ -170,14 +170,18 @@ def result_parameters(path):
     for token, label in [('красный', 'Красный'), ('зелёный', 'Зелёный'),
                          ('зеленый', 'Зелёный'), ('синий', 'Синий'),
                          ('channel_red', 'Красный'), ('channel_green', 'Зелёный'),
-                         ('channel_blue', 'Синий')]:
+                         ('channel_blue', 'Синий'), ('grayscale', 'Gray'),
+                         ('оттенки серого', 'Gray')]:
         if token in name:
             channel = label
-    channel_match = re.search(r'(?:^|_)(r|g|b)(?:_|\.|$)', basename)
+    channel_match = re.search(
+        r'(?:^|_)(r|g|b|gray|gs1|gs2|gs3)(?:_|\.|$)', basename
+    )
     if channel_match:
-        channel = {'r': 'Красный', 'g': 'Зелёный', 'b': 'Синий'}[
-            channel_match[1]
-        ]
+        channel = {
+            'r': 'Красный', 'g': 'Зелёный', 'b': 'Синий',
+            'gray': 'Gray', 'gs1': 'GS1', 'gs2': 'GS2', 'gs3': 'GS3',
+        }[channel_match[1]]
 
     def token_number(prefix):
         match = re.search(
@@ -216,7 +220,7 @@ def result_parameters(path):
     family = re.sub(r'(?:^|_)s(?:m?\d+(?:p\d+)?(?:em?\d+|e\d+)?)', '_s#', family)
     family = re.sub(r'(?:^|_)a(?:m?\d+(?:p\d+)?(?:em?\d+|e\d+)?)', '_a#', family)
     family = re.sub(r'красный|зелёный|зеленый|синий', 'channel_#', family)
-    family = re.sub(r'(?<=_)(r|g|b)(?=_)', 'channel_#', family)
+    family = re.sub(r'(?<=_)(r|g|b|gray|gs1|gs2|gs3)(?=_)', 'channel_#', family)
     algorithm = ('DBSCAN' if 'dbscan' in name else
                  'K-means' if 'kmeans' in name or 'k-means' in name else None)
     legacy_direction = (

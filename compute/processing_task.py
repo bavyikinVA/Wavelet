@@ -53,6 +53,9 @@ class PipelinePlan:
 
 class ProcessingTask:
     VALID_ANALYSIS_MODES = {"1d", "2d"}
+    VALID_CHANNEL_REPRESENTATIONS = {"rgb", "grayscale", "gram_schmidt"}
+    VALID_RGB_CHANNEL_MODES = {"all", "single"}
+    VALID_RGB_CHANNELS = {"R", "G", "B"}
     PIPELINE_PRESETS = {
         "Только вейвлет": {
             "calculate_extrema": False,
@@ -139,6 +142,21 @@ class ProcessingTask:
         self.color1 = None
         self.color2 = None
         self.gram_schmidt_applied = False
+
+        # Явная методика каналов. data/data_copy всегда хранят исходный RGB.
+        self.detected_color_type = "unknown"
+        self.grayscale_similarity = None
+        self.channel_representation = "rgb"
+        self.rgb_channel_mode = "all"
+        self.rgb_single_channel = "R"
+        self.grayscale_method = "rec709"
+
+        # Runtime-каналы текущего запуска; в историю напрямую не сериализуются.
+        self.analysis_data = []
+        self.analysis_channel_keys = []
+        self.analysis_channel_codes = []
+        self.analysis_channel_labels = []
+
         self.scales = np.array([])
         self.num_scale = 0
 
@@ -212,10 +230,100 @@ class ProcessingTask:
         self.statistics_results = {}
         self.synchronization_results = {}
         self.ml_result = None
+        self.ml_dataset_key = None
         self.task_folder_path = ""
         self.color1 = None
         self.color2 = None
         self.gram_schmidt_applied = False
+        self.detected_color_type = "unknown"
+        self.grayscale_similarity = None
+        self.channel_representation = "rgb"
+        self.rgb_channel_mode = "all"
+        self.rgb_single_channel = "R"
+        self.analysis_data = []
+        self.analysis_channel_keys = []
+        self.analysis_channel_codes = []
+        self.analysis_channel_labels = []
+
+    def invalidate_analysis_results(self):
+        """Clear derived data after changing the analysis representation/basis."""
+        self.result = {}
+        self.knn_results = {}
+        self.statistics_results = {}
+        self.synchronization_results = {}
+        self.ml_result = None
+        self.ml_dataset_key = None
+        self.analysis_data = []
+        self.analysis_channel_keys = []
+        self.analysis_channel_codes = []
+        self.analysis_channel_labels = []
+
+    def set_channel_analysis(self, representation, rgb_mode=None, single_channel=None):
+        representation = str(representation)
+        if representation not in self.VALID_CHANNEL_REPRESENTATIONS:
+            raise ValueError(f"Неизвестное представление изображения: {representation}")
+        new_mode = self.rgb_channel_mode if rgb_mode is None else str(rgb_mode)
+        if new_mode not in self.VALID_RGB_CHANNEL_MODES:
+            raise ValueError(f"Неизвестный режим RGB-каналов: {new_mode}")
+        new_single = self.rgb_single_channel if single_channel is None else str(single_channel).upper()
+        if new_single not in self.VALID_RGB_CHANNELS:
+            raise ValueError(f"Неизвестный RGB-канал: {new_single}")
+
+        changed = (
+            representation != self.channel_representation
+            or new_mode != self.rgb_channel_mode
+            or new_single != self.rgb_single_channel
+        )
+        self.channel_representation = representation
+        self.rgb_channel_mode = new_mode
+        self.rgb_single_channel = new_single
+        self.gram_schmidt_applied = representation == "gram_schmidt"
+        if changed:
+            self.invalidate_analysis_results()
+
+    def analysis_channel_codes_for_settings(self):
+        if self.channel_representation == "grayscale":
+            return ["gray"]
+        if self.channel_representation == "gram_schmidt":
+            return ["gs1", "gs2", "gs3"]
+        if self.rgb_channel_mode == "single":
+            return [self.rgb_single_channel.lower()]
+        return ["r", "g", "b"]
+
+    def channel_summary(self):
+        if self.channel_representation == "grayscale":
+            return "Gray ×1"
+        if self.channel_representation == "gram_schmidt":
+            return "Gram–Schmidt ×3"
+        if self.rgb_channel_mode == "single":
+            return f"{self.rgb_single_channel} ×1"
+        return "RGB ×3"
+
+    def channel_manifest(self):
+        basis = None
+        if self.channel_representation == "gram_schmidt":
+            basis = {
+                "color1": None if self.color1 is None else np.asarray(self.color1).tolist(),
+                "color2": None if self.color2 is None else np.asarray(self.color2).tolist(),
+            }
+        similarity = self.grayscale_similarity
+        channel_codes = self.analysis_channel_codes_for_settings()
+        channel_keys = {
+            "r": "R", "g": "G", "b": "B", "gray": "GRAY",
+            "gs1": "GS1", "gs2": "GS2", "gs3": "GS3",
+        }
+        return {
+            "detected_color_type": self.detected_color_type,
+            "grayscale_similarity": None if similarity is None else float(similarity),
+            "representation": self.channel_representation,
+            "rgb_mode": self.rgb_channel_mode,
+            "rgb_single_channel": self.rgb_single_channel,
+            "channels": [channel_keys[code] for code in channel_codes],
+            "channel_codes": channel_codes,
+            "grayscale_method": self.grayscale_method if self.channel_representation == "grayscale" else None,
+            "gram_schmidt_basis": basis,
+            "summary": self.channel_summary(),
+        }
 
     def to_dict(self):
         """Преобразование задачи в словарь для отображения"""
@@ -243,6 +351,7 @@ class ProcessingTask:
             'calculate_knn': self.calculate_knn,
             'pipeline_preset': self.pipeline_preset,
             'colors_selected': has_colors,
+            'channel_summary': self.channel_summary(),
         }
 
     def set_analysis_mode(self, mode):
@@ -340,6 +449,9 @@ class ProcessingTask:
         fields = (
             "analysis_mode", "image_path", "process_rows", "process_columns",
             "find_maxima", "find_minima", "gram_schmidt_applied",
+            "detected_color_type", "grayscale_similarity",
+            "channel_representation", "rgb_channel_mode",
+            "rgb_single_channel", "grayscale_method",
             "orientations", "morlet_omega0",
             "morlet_anisotropy", "pipeline_preset", "calculate_extrema",
             "calculate_envelopes", "calculate_knn", "calculate_statistics",
@@ -408,7 +520,7 @@ class ProcessingTask:
         return " → ".join(stages)
 
     def nuances_summary(self):
-        details = []
+        details = [f"каналы: {self.channel_summary()}"]
         if self.analysis_mode == "1d":
             directions = []
             if self.process_rows:
@@ -429,12 +541,11 @@ class ProcessingTask:
             details.append("блоки масштабов: " + ", ".join(map(str, self.scale_block_sizes)))
         if self.resolve_pipeline().synchronization:
             details.append("метрика: " + ", ".join(self.row_sync_metrics))
-        if self.gram_schmidt_applied:
-            details.append("Грамм–Шмидт")
         return " · ".join(details)
 
     def apply_settings_snapshot(self, snapshot):
         """Apply a saved configuration without silently reusing old result data."""
+        legacy_channels = "channel_representation" not in snapshot
         for name, value in snapshot.items():
             if name in {"scales", "color1", "color2", "image_path"}:
                 continue
@@ -445,6 +556,21 @@ class ProcessingTask:
         for name in ("color1", "color2"):
             value = snapshot.get(name)
             setattr(self, name, None if value is None else np.asarray(value))
+        if legacy_channels:
+            # Старый формат одновременно считал RGB-wavelets и скрыто менял
+            # point-pipeline. Однозначно восстановить его нельзя, поэтому
+            # выбираем прозрачную методику: GS при старом флаге, иначе RGB ×3.
+            if bool(snapshot.get("gram_schmidt_applied")):
+                self.channel_representation = "gram_schmidt"
+            else:
+                self.channel_representation = "rgb"
+                self.rgb_channel_mode = "all"
+                self.rgb_single_channel = "R"
+        self.gram_schmidt_applied = self.channel_representation == "gram_schmidt"
+        self.analysis_data = []
+        self.analysis_channel_keys = []
+        self.analysis_channel_codes = []
+        self.analysis_channel_labels = []
         # Source is restored by the application only if the file is still readable.
         self.image_path = snapshot.get("image_path", "")
         self.task_folder_path = ""

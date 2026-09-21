@@ -85,6 +85,13 @@ from result_naming import (
 )
 from compute.validation import validate_scales
 from compute.processing_task import ProcessingTask
+from compute.channel_analysis import (
+    apply_detection_defaults,
+    clear_prepared_channels,
+    prepare_task_channels,
+    prepared_channel_meta,
+    write_channel_manifest,
+)
 from image_cropper_app import run_cropper
 from pipette import run_pipette
 from utils.gui import TkinterApp, ScrollableFrame, CollapsibleFrame
@@ -179,18 +186,31 @@ class ImageProcessor:
             effective_image, image_path = result
             self.progress.log_info(f'Изображение загружено: {image_path}')
             original_image = np.array(effective_image, copy=True)
+            if original_image.ndim == 2:
+                original_image = np.repeat(original_image[:, :, None], 3, axis=2)
+            elif original_image.ndim == 3 and original_image.shape[2] >= 3:
+                original_image = original_image[:, :, :3].copy()
+            else:
+                raise ValueError("Неподдерживаемый формат изображения")
+
             source_channels = [original_image[:, :, i].copy() for i in range(3)]
             if not all(isinstance(ch, np.ndarray) for ch in source_channels):
                 raise ValueError("Один или несколько каналов изображения не являются массивами NumPy")
 
             # Источник заменяется атомарно только после успешного чтения.
-            # Последующий выбор 1D/2D изменяет лишь настройки анализа задачи.
             task.invalidate_source_results()
             task.image_path = image_path
             task.original_image = original_image
             task.data = source_channels
             task.data_copy = [channel.copy() for channel in source_channels]
-            task.gram_schmidt_applied = False
+            from compute.channel_analysis import apply_detection_defaults as _apply_detection_defaults
+            detected, similarity = _apply_detection_defaults(task, original_image)
+            self.progress.log_info(
+                "Тип изображения: "
+                f"{'grayscale' if detected == 'grayscale' else 'цветное'} "
+                f"(совпадение RGB: {similarity:.2%}); "
+                f"режим по умолчанию: {task.channel_summary()}"
+            )
             self.progress.log_info("Изображение успешно обработано")
             return True
         else:
@@ -203,8 +223,14 @@ class ImageProcessor:
         if color1 is None or color2 is None:
             self.progress.log_info('Выбор цветов отменён')
             return False
+        # Пипетка теперь задаёт именно базис Gram–Schmidt, поэтому сразу
+        # отбрасываем нулевые/коллинеарные цветовые векторы. Полное
+        # изображение при этой проверке не преобразуется.
+        change_channels(color1, color2, [[[0.0]], [[0.0]], [[0.0]]])
         task.color1, task.color2 = color1, color2
-        self.progress.log_info("Цвета успешно выбраны")
+        if task.channel_representation == "gram_schmidt":
+            task.invalidate_analysis_results()
+        self.progress.log_info("Цветовой базис Gram–Schmidt успешно выбран")
         return True
 
     def create_downloads_folder(self, folder_name):
@@ -270,10 +296,21 @@ class ImageProcessor:
                 self.progress.log_info(f"Сохранен файл: {file_path}")
 
     def gram_shmidt_transform_for_task(self, task):
-        self.progress.log_info("Применение преобразования Грамма-Шмидта...")
-        task.data = change_channels(task.color1, task.color2, task.data)
-        task.gram_schmidt_applied = True
-        self.progress.log_info("Преобразование Грамма-Шмидта завершено")
+        """Выбрать GS-представление, не изменяя исходные RGB-данные."""
+        color1 = getattr(task, "color1", None)
+        color2 = getattr(task, "color2", None)
+        if color1 is None or color2 is None:
+            raise ValueError("Сначала выберите два цвета пипеткой")
+        # Проверяем корректность базиса на крошечном служебном массиве.
+        # Полное изображение преобразуется только непосредственно перед CWT.
+        change_channels(color1, color2, [[[0.0]], [[0.0]], [[0.0]]])
+        if hasattr(task, "set_channel_analysis"):
+            task.set_channel_analysis("gram_schmidt")
+        else:
+            task.gram_schmidt_applied = True
+        self.progress.log_info(
+            "Для анализа выбрано представление Gram–Schmidt (GS1/GS2/GS3)"
+        )
 
     def load_scales_for_task(self, task, start, end, step):
         if step <= 0 or start <= 0 or end < start:
@@ -386,9 +423,12 @@ class ImageProcessor:
 
         self.progress.log_info(f"Начало вейвлет-преобразования ({backend_info}, {direction})")
 
-        num_channels = 3
-        num_rows = task.data[0].shape[0]
-        num_cols = task.data[0].shape[1]
+        if not task.analysis_data:
+            prepare_task_channels(task)
+        channel_meta = prepared_channel_meta(task)
+        num_channels = len(task.analysis_data)
+        num_rows = task.analysis_data[0].shape[0]
+        num_cols = task.analysis_data[0].shape[1]
 
         self.progress.log_info(f"Масштабы: {len(task.scales)}, Строки: {num_rows}, Столбцы: {num_cols}")
         self.progress.log_info(
@@ -398,7 +438,7 @@ class ImageProcessor:
         current_operation = 0
 
         for channel in range(num_channels):
-            channel_name = ['Красный', 'Зеленый', 'Синий'][channel]
+            _channel_key, channel_code, channel_name = channel_meta[channel]
 
             # Обновляем прогресс для каждого канала
             progress = current_operation / total_operations
@@ -407,7 +447,7 @@ class ImageProcessor:
                 f"Подготовка канала {channel_name}..."
             )
 
-            data_channel = task.data[channel].astype(np.float64)
+            data_channel = task.analysis_data[channel].astype(np.float64)
 
             # Центрирование всегда участвует в расчёте, но его служебные
             # значения сохраняются только по явному выбору пользователя.
@@ -433,7 +473,7 @@ class ImageProcessor:
                 os.makedirs(metadata_folder, exist_ok=True)
                 file_mean_path = os.path.join(
                     metadata_folder,
-                    centering_mean_name(cwt_axis, channel) + ".txt"
+                    centering_mean_name(cwt_axis, channel_code) + ".txt"
                 )
                 np.savetxt(file_mean_path, np.asarray(means), fmt="%.10g")
 
@@ -493,16 +533,24 @@ class ImageProcessor:
     def compute_wavelets(self, task, info_out):
         self.progress.update_progress(0.1, "Подготовка данных для вейвлет-преобразования...")
         if task.process_rows:
+            if not task.analysis_data:
+                prepare_task_channels(task)
+            channel_count = len(task.analysis_data)
+            height, width = task.analysis_data[0].shape
             data_3_channels = np.zeros(
-                (3, task.num_scale, task.data[0].shape[0], task.data[0].shape[1])
+                (channel_count, task.num_scale, height, width)
             )
             task.result[0] = self.wavelets(task, 0, data_3_channels)
             self.save_print_wavelets(task, 0, info_out)
 
         if task.process_columns:
             self.progress.update_progress(0.6, "Обработка столбцов...")
+            if not task.analysis_data:
+                prepare_task_channels(task)
+            channel_count = len(task.analysis_data)
+            height, width = task.analysis_data[0].shape
             data_3_channels_tr = np.zeros(
-                (3, task.num_scale, task.data[0].shape[0], task.data[0].shape[1])
+                (channel_count, task.num_scale, height, width)
             )
             task.result[1] = self.wavelets(task, 1, data_3_channels_tr)
             self.save_print_wavelets(task, 1, info_out)
@@ -518,13 +566,15 @@ class ImageProcessor:
         )
 
         task_folder = self.create_task_folder(task)
-        total = 3 * len(task.scales) * len(task.orientations)
+        if not task.analysis_data:
+            prepare_task_channels(task)
+        channel_meta = prepared_channel_meta(task)
+        total = len(channel_meta) * len(task.scales) * len(task.orientations)
         completed = 0
         use_gpu = self.backend.use_gpu and self.backend.is_gpu_available()
-        channel_names = ["Красный", "Зелёный", "Синий"]
 
-        for channel_index, channel_name in enumerate(channel_names):
-            channel = task.data[channel_index].astype(np.float32)
+        for channel_index, (_channel_key, channel_code, channel_name) in enumerate(channel_meta):
+            channel = task.analysis_data[channel_index].astype(np.float32)
             for scale in task.scales:
                 scale_folder = self.create_scale_folder(scale, task_folder)
                 output_folder = os.path.join(scale_folder, "wavelets_2d")
@@ -562,7 +612,7 @@ class ImageProcessor:
                             task.morlet_anisotropy
                         )[0, 0]
 
-                    file_stem = cwt2d_stem(channel_index, scale, angle)
+                    file_stem = cwt2d_stem(channel_code, scale, angle)
                     magnitude = np.abs(coefficients)
                     save_coefficient_preview(task_folder, file_stem, coefficients)
                     phase = np.angle(coefficients)
@@ -611,10 +661,12 @@ class ImageProcessor:
 
     def save_print_wavelets(self, task, type_data, info_out):
         import matplotlib.pyplot as plt
-        colors = ['Красный', 'Зелёный', 'Синий']
+        channel_meta = prepared_channel_meta(task)
+        colors = [item[2] for item in channel_meta]
+        channel_codes = [item[1] for item in channel_meta]
         cwt_axis = "row" if type_data == 0 else "col"
 
-        total_scales = task.num_scale * 3
+        total_scales = task.num_scale * len(channel_meta)
         current_scale = 0
 
         if not task:
@@ -623,12 +675,12 @@ class ImageProcessor:
 
         task_folder = self.create_task_folder(task)
 
-        for channel in range(3):
+        for channel in range(len(channel_meta)):
             for scale in range(task.num_scale):
                 scale_folder_path = self.create_scale_folder(task.scales[scale], task_folder)
                 array_2d = task.result[type_data][channel][scale]
                 file_stem = cwt1d_stem(
-                    cwt_axis, channel, task.scales[scale]
+                    cwt_axis, channel_codes[channel], task.scales[scale]
                 )
                 save_coefficient_preview(
                     task.task_folder_path, file_stem, array_2d
@@ -712,8 +764,7 @@ class ImageProcessor:
 
     def compute_points(self, task, row_var, col_var, max_var, min_var,
                        knn_var, knn_bool_text_var, knn_bool_image_var,
-                       print_text_var, print_graphic, pipette_state,
-                       pipeline_plan=None):
+                       print_text_var, print_graphic, pipeline_plan=None):
         """Analyse both feature axes independently inside every selected CWT.
 
         ``cwt_axis`` identifies how coefficients were produced. ``feature_axis``
@@ -763,9 +814,23 @@ class ImageProcessor:
             },
         )
 
-        channels_to_process = [0] if pipette_state == "normal" else list(range(3))
-        colors = ["Красный", "Зелёный", "Синий"]
-        channel_codes = list(CHANNEL_CODES)
+        available_count = (
+            len(task.result[branches[0]["type_data"]]) if branches else 0
+        )
+        channel_codes = list(getattr(task, "analysis_channel_codes", []))
+        colors = list(getattr(task, "analysis_channel_labels", []))
+        if len(channel_codes) != available_count or len(colors) != available_count:
+            fallback_codes = list(CHANNEL_CODES[:available_count])
+            fallback_labels = {
+                "r": "Красный (R)", "g": "Зелёный (G)", "b": "Синий (B)",
+                "gray": "Оттенки серого (Gray)",
+                "gs1": "Gram–Schmidt 1 (GS1)",
+                "gs2": "Gram–Schmidt 2 (GS2)",
+                "gs3": "Gram–Schmidt 3 (GS3)",
+            }
+            channel_codes = fallback_codes
+            colors = [fallback_labels.get(code, code) for code in fallback_codes]
+        channels_to_process = list(range(available_count))
         total_operations = len(branches) * len(channels_to_process) * task.num_scale
         current_operation = 0
         extremes = []
@@ -835,7 +900,7 @@ class ImageProcessor:
                     knn_extremes = {
                         "type_data": type_data,
                         "cwt_axis": cwt_axis,
-                        "channel": channel,
+                        "channel": channel_code,
                         "scale": scale_value,
                         "max_by_row": [],
                         "max_by_column": [],
@@ -1947,10 +2012,16 @@ class ImageProcessor:
                 self.backend.ensure_initialized()
                 self.progress.log_info(
                     f"Вычислительный бэкенд: {self.backend.get_backend_info()['device_name']}")
-            pipette_state = 'disabled' if task.has_colors_selected() else 'normal'
             self.progress.begin_stage(f"{task.task_name} · Подготовка данных")
             task_folder = self.create_task_folder(task)
             self.progress.log_info(f"Создана папка для {task.task_name}: {task_folder}")
+            prepared = prepare_task_channels(task)
+            self.progress.log_info(
+                "Каналы анализа: " + ", ".join(item.key for item in prepared)
+                + f" ({task.channel_summary()})"
+            )
+            manifest_path = write_channel_manifest(task, task_folder)
+            self.progress.log_info(f"Manifest запуска: {manifest_path}")
 
             # Сохранение исходных каналов - 5%
             self.progress.update_progress(0.05, "Сохранение исходных каналов...")
@@ -2009,7 +2080,6 @@ class ImageProcessor:
                         task.output_knn_image,
                         task.output_extremes_text,
                         task.output_extremes_image,
-                        pipette_state,
                         pipeline_plan=pipeline_plan
                     )
 
@@ -2024,8 +2094,10 @@ class ImageProcessor:
             self.progress.log_error(error_msg)
             raise
         finally:
-            # Очищаем временные данные в задаче после вычислений
+            # Очищаем тяжёлые временные коэффициенты; KNN/статистики остаются
+            # доступными для ML и истории. Исходный RGB не меняется.
             task.result = {}
+            clear_prepared_channels(task)
             # self.clear_gpu_cache()
 
     @staticmethod
@@ -2817,6 +2889,9 @@ class App(TkinterApp):
         """Инициализация всех переменных UI"""
         self.analysis_mode_var = tk.StringVar(value="1D-анализ")
         self.pipeline_preset_var = tk.StringVar(value="Только вейвлет")
+        self.channel_representation_var = tk.StringVar(value="RGB")
+        self.rgb_channel_mode_var = tk.StringVar(value="Все RGB")
+        self.rgb_single_channel_var = tk.StringVar(value="R")
         self.calculate_extrema_var = tk.BooleanVar(value=False)
         self.calculate_envelopes_var = tk.BooleanVar(value=False)
         self.calculate_knn_var = tk.BooleanVar(value=False)
@@ -2883,6 +2958,11 @@ class App(TkinterApp):
         self.print_load_image = None
         self.pipette_button = None
         self.gram_shmidt_button = None
+        self.channel_representation_menu = None
+        self.rgb_mode_menu = None
+        self.rgb_single_channel_menu = None
+        self.channel_detection_label = None
+        self.channel_effective_label = None
         self.entry_start = None
         self.entry_end = None
         self.entry_step = None
@@ -3454,9 +3534,8 @@ class App(TkinterApp):
                     b, g, r = cv2.split(image)
                     task.data = [r, g, b]
                     task.data_copy = [channel.copy() for channel in task.data]
-                    if (snapshot.get("gram_schmidt_applied") and
-                            task.color1 is not None and task.color2 is not None):
-                        task.data = change_channels(task.color1, task.color2, task.data)
+                    # Представление будет подготовлено перед новым расчётом;
+                    # исходный RGB при восстановлении истории не преобразуется.
                 else:
                     task.image_path = ""
             else:
@@ -4802,52 +4881,203 @@ class App(TkinterApp):
 
 
     def _setup_channel_section(self):
-        """Настройка секции работы с каналами"""
-        # Пипетка
-        pipette_frame = ctk.CTkFrame(self.channel_section.content, fg_color="transparent")
-        self.channel_section.add_widget(pipette_frame, pady=2)
-
-        pipette_label = ctk.CTkLabel(
-            pipette_frame,
-            text="Выбор цветовых каналов:",
-            font=AppTheme.body_font(),
-            anchor="w"
+        """Явный выбор представления и каналов исследования."""
+        representation_frame = ctk.CTkFrame(
+            self.channel_section.content, fg_color="transparent"
         )
-        pipette_label.pack(fill="x")
+        self.channel_section.add_widget(representation_frame, pady=(2, 6))
+        ctk.CTkLabel(
+            representation_frame,
+            text="Представление изображения:",
+            font=AppTheme.body_font(),
+            anchor="w",
+        ).pack(fill="x")
+        self.channel_representation_menu = ctk.CTkOptionMenu(
+            representation_frame,
+            values=["RGB", "Grayscale", "Gram–Schmidt"],
+            variable=self.channel_representation_var,
+            command=self._on_channel_settings_changed,
+            width=AppTheme.ACTION_BUTTON_WIDTH,
+        )
+        self.channel_representation_menu.pack(anchor="w", pady=(5, 0))
+        self.channel_detection_label = ctk.CTkLabel(
+            representation_frame,
+            text="Тип изображения ещё не определён",
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w",
+        )
+        self.channel_detection_label.pack(fill="x", pady=(5, 0))
 
+        rgb_frame = ctk.CTkFrame(
+            self.channel_section.content, fg_color="transparent"
+        )
+        self.channel_section.add_widget(rgb_frame, pady=(2, 6))
+        ctk.CTkLabel(
+            rgb_frame, text="RGB-каналы:", font=AppTheme.body_font(), anchor="w"
+        ).pack(fill="x")
+        controls = ctk.CTkFrame(rgb_frame, fg_color="transparent")
+        controls.pack(fill="x", pady=(5, 0))
+        self.rgb_mode_menu = ctk.CTkOptionMenu(
+            controls,
+            values=["Все RGB", "Один канал"],
+            variable=self.rgb_channel_mode_var,
+            command=self._on_channel_settings_changed,
+            width=155,
+        )
+        self.rgb_mode_menu.pack(side="left")
+        self.rgb_single_channel_menu = ctk.CTkOptionMenu(
+            controls,
+            values=["R", "G", "B"],
+            variable=self.rgb_single_channel_var,
+            command=self._on_channel_settings_changed,
+            width=80,
+        )
+        self.rgb_single_channel_menu.pack(side="left", padx=(8, 0))
+
+        self.channel_effective_label = ctk.CTkLabel(
+            self.channel_section.content,
+            text="Будут рассчитаны: R, G, B",
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w",
+        )
+        self.channel_section.add_widget(
+            self.channel_effective_label, pady=(0, 8)
+        )
+
+        pipette_frame = ctk.CTkFrame(
+            self.channel_section.content, fg_color="transparent"
+        )
+        self.channel_section.add_widget(pipette_frame, pady=2)
+        ctk.CTkLabel(
+            pipette_frame,
+            text="Цветовой базис Gram–Schmidt:",
+            font=AppTheme.body_font(),
+            anchor="w",
+        ).pack(fill="x")
         self.pipette_button = ctk.CTkButton(
             pipette_frame,
-            text="Активировать пипетку",
+            text="Выбрать цвета пипеткой",
             command=self.pipette_channel,
             width=AppTheme.ACTION_BUTTON_WIDTH,
             height=AppTheme.BUTTON_HEIGHT,
-            font=AppTheme.body_font()
+            font=AppTheme.body_font(),
         )
-        pipette_frame.pack(fill="x")
         self.pipette_button.pack(anchor="w", pady=(5, 0))
 
-        # Преобразование Грамма-Шмидта
-        gram_frame = ctk.CTkFrame(self.channel_section.content, fg_color="transparent")
-        self.channel_section.add_widget(gram_frame, pady=(10, 2))
-
-        gram_label = ctk.CTkLabel(
-            gram_frame,
-            text="Преобразование каналов:",
-            font=AppTheme.body_font(),
-            anchor="w"
+        gram_frame = ctk.CTkFrame(
+            self.channel_section.content, fg_color="transparent"
         )
-        gram_label.pack(fill="x")
-
+        self.channel_section.add_widget(gram_frame, pady=(8, 2))
         self.gram_shmidt_button = ctk.CTkButton(
             gram_frame,
-            text="Преобразование Грамма-Шмидта",
+            text="Использовать Gram–Schmidt",
             command=self.gramm_shmidt_transform,
             width=AppTheme.ACTION_BUTTON_WIDTH,
             height=AppTheme.BUTTON_HEIGHT,
-            font=AppTheme.body_font()
+            font=AppTheme.body_font(),
         )
-        gram_frame.pack(fill="x")
-        self.gram_shmidt_button.pack(anchor="w", pady=(5, 0))
+        self.gram_shmidt_button.pack(anchor="w")
+        self._update_channel_controls_state()
+
+    def _on_channel_settings_changed(self, _value=None):
+        task = getattr(self, "current_task", None)
+        if task is None or self._loading_task_settings:
+            self._update_channel_controls_state()
+            return
+
+        representation = {
+            "RGB": "rgb",
+            "Grayscale": "grayscale",
+            "Gram–Schmidt": "gram_schmidt",
+        }.get(self.channel_representation_var.get(), "rgb")
+        rgb_mode = (
+            "single" if self.rgb_channel_mode_var.get() == "Один канал"
+            else "all"
+        )
+        try:
+            task.set_channel_analysis(
+                representation,
+                rgb_mode=rgb_mode,
+                single_channel=self.rgb_single_channel_var.get(),
+            )
+        except ValueError as error:
+            mb.showwarning("Каналы анализа", str(error), parent=self)
+            return
+
+        self._update_channel_controls_state()
+        self._update_tasks_display()
+        self._update_ml_tab_state()
+        self._update_action_availability()
+
+    def _update_channel_controls_state(self):
+        task = getattr(self, "current_task", None)
+        has_source = bool(task is not None and task.image_path)
+        representation = self.channel_representation_var.get()
+        is_rgb = representation == "RGB"
+        is_single = is_rgb and self.rgb_channel_mode_var.get() == "Один канал"
+        has_colors = bool(task is not None and task.has_colors_selected())
+
+        if self.channel_representation_menu is not None:
+            self.channel_representation_menu.configure(
+                state="normal" if has_source else "disabled"
+            )
+        if self.rgb_mode_menu is not None:
+            self.rgb_mode_menu.configure(
+                state="normal" if has_source and is_rgb else "disabled"
+            )
+        if self.rgb_single_channel_menu is not None:
+            self.rgb_single_channel_menu.configure(
+                state="normal" if has_source and is_single else "disabled"
+            )
+
+        if task is None:
+            detection = "Тип изображения ещё не определён"
+            effective = "Будут рассчитаны: —"
+        else:
+            if task.detected_color_type == "grayscale":
+                similarity = task.grayscale_similarity
+                suffix = (
+                    f" · совпадение RGB {similarity:.2%}"
+                    if similarity is not None else ""
+                )
+                detection = "Обнаружено: grayscale" + suffix
+            elif task.detected_color_type == "color":
+                detection = "Обнаружено: цветное изображение"
+            else:
+                detection = "Тип изображения ещё не определён"
+
+            codes = task.analysis_channel_codes_for_settings()
+            readable = {
+                "r": "R", "g": "G", "b": "B", "gray": "Gray",
+                "gs1": "GS1", "gs2": "GS2", "gs3": "GS3",
+            }
+            effective = "Будут рассчитаны: " + ", ".join(
+                readable.get(code, code) for code in codes
+            )
+            if task.channel_representation == "gram_schmidt" and not has_colors:
+                effective += " · требуется цветовой базис"
+
+        if self.channel_detection_label is not None:
+            self.channel_detection_label.configure(text=detection)
+        if self.channel_effective_label is not None:
+            self.channel_effective_label.configure(text=effective)
+        if self.pipette_button is not None:
+            self.pipette_button.configure(
+                text="Изменить цвета пипеткой" if has_colors else "Выбрать цвета пипеткой",
+                state="normal" if has_source else "disabled",
+                fg_color=AppTheme.PRIMARY,
+                hover_color=AppTheme.PRIMARY_HOVER,
+            )
+        if self.gram_shmidt_button is not None:
+            selected = bool(task is not None and task.channel_representation == "gram_schmidt")
+            self.gram_shmidt_button.configure(
+                text="Gram–Schmidt выбран" if selected else "Использовать Gram–Schmidt",
+                state="normal" if has_source and has_colors else "disabled",
+                fg_color=AppTheme.SUCCESS if selected else AppTheme.PRIMARY,
+                hover_color=AppTheme.SUCCESS_HOVER if selected else AppTheme.PRIMARY_HOVER,
+            )
 
     def _setup_scales_section(self):
         """Настройка секции масштабов"""
@@ -5236,7 +5466,7 @@ class App(TkinterApp):
     def _get_processing_lines(self, task):
         """Получить отдельные строки состояния для карточки задачи."""
         mode_name = self.ANALYSIS_MODE_NAMES[task.analysis_mode]
-        lines = []
+        lines = [f"Каналы анализа: {task.channel_summary()}"]
 
         if task.analysis_mode == "1d":
             directions = []
@@ -5281,9 +5511,6 @@ class App(TkinterApp):
             )
         else:
             lines.append("Пипетка: не настроена")
-
-        if task.is_gram_schmidt_applied():
-            lines.append("Преобразование Грамма-Шмидта: применено")
 
         return lines
 
@@ -5363,7 +5590,19 @@ class App(TkinterApp):
             )
             self.morlet_omega0_var.set(f"{self.current_task.morlet_omega0:g}")
             self.morlet_anisotropy_var.set(f"{self.current_task.morlet_anisotropy:g}")
+            self.channel_representation_var.set({
+                "rgb": "RGB",
+                "grayscale": "Grayscale",
+                "gram_schmidt": "Gram–Schmidt",
+            }.get(self.current_task.channel_representation, "RGB"))
+            self.rgb_channel_mode_var.set(
+                "Один канал"
+                if self.current_task.rgb_channel_mode == "single"
+                else "Все RGB"
+            )
+            self.rgb_single_channel_var.set(self.current_task.rgb_single_channel)
             self._loading_task_settings = False
+            self._update_channel_controls_state()
             # Обновляем информацию о загруженном изображении
             if self.current_task.image_path:
                 self.load_button.configure(
@@ -5380,43 +5619,6 @@ class App(TkinterApp):
                     hover_color=AppTheme.PRIMARY_HOVER
                 )
                 self.print_load_image.configure(text="Изображение не загружено", text_color=AppTheme.MUTED)
-
-            # Проверяем наличие цветов для пипетки
-            has_colors = (self.current_task.color1 is not None and
-                          self.current_task.color2 is not None and
-                          isinstance(self.current_task.color1, np.ndarray) and
-                          isinstance(self.current_task.color2, np.ndarray) and
-                          self.current_task.color1.size > 0 and
-                          self.current_task.color2.size > 0)
-
-            if has_colors:
-                self.pipette_button.configure(
-                    text="Пипетка активирована",
-                    state='disabled',
-                    fg_color=AppTheme.DISABLED,
-                    hover_color=AppTheme.DISABLED_HOVER
-                )
-                # Активируем кнопку Грамма-Шмидта если есть цвета
-                self.gram_shmidt_button.configure(
-                    text="Преобразование Грамма-Шмидта",  # Всегда сбрасываем текст
-                    state='normal',
-                    fg_color=AppTheme.PRIMARY,
-                    hover_color=AppTheme.PRIMARY_HOVER
-                )
-            else:
-                self.pipette_button.configure(
-                    text="Активировать пипетку",
-                    state='normal',
-                    fg_color=AppTheme.PRIMARY,
-                    hover_color=AppTheme.PRIMARY_HOVER
-                )
-                # Деактивируем кнопку Грамма-Шмидта если нет цветов
-                self.gram_shmidt_button.configure(
-                    text="Преобразование Грамма-Шмидта",  # Всегда сбрасываем текст
-                    state='disabled',
-                    fg_color=AppTheme.DISABLED,
-                    hover_color=AppTheme.DISABLED_HOVER
-                )
 
             # Обновляем KNN
             self.knn_text_var.set(str(self.current_task.k_neighbors))
@@ -5457,18 +5659,7 @@ class App(TkinterApp):
                 hover_color=AppTheme.PRIMARY_HOVER
             )
             self.print_load_image.configure(text="Изображение не загружено", text_color=AppTheme.MUTED)
-            self.pipette_button.configure(
-                text="Активировать пипетку",
-                state='normal',
-                fg_color=AppTheme.PRIMARY,
-                hover_color=AppTheme.PRIMARY_HOVER
-            )
-            self.gram_shmidt_button.configure(
-                text="Преобразование Грамма-Шмидта",
-                state='disabled',
-                fg_color=AppTheme.DISABLED,
-                hover_color=AppTheme.DISABLED_HOVER
-            )
+            self._update_channel_controls_state()
             self.button_save_scales.configure(
                 text="Применить масштабы",
                 fg_color=AppTheme.PRIMARY,
@@ -5493,17 +5684,16 @@ class App(TkinterApp):
         self._update_tasks_display()
 
     def _update_action_availability(self):
+        """Применить естественную последовательность обязательных шагов."""
         if hasattr(self, 'memory_label'):
             self._refresh_memory_estimate()
-        """Применить естественную последовательность обязательных шагов."""
         task = self.current_task
         self._update_navigation_buttons()
+        self._update_channel_controls_state()
         if task is None:
             self._set_point_analysis_controls_enabled(False)
             self.analysis_mode_selector.configure(state="disabled")
             self.load_button.configure(state="disabled")
-            self.pipette_button.configure(state="disabled")
-            self.gram_shmidt_button.configure(state="disabled")
             self.button_save_scales.configure(state="disabled")
             self.button_load_scales_file.configure(state="disabled")
             self.app_start_button.configure(state="disabled")
@@ -5520,8 +5710,6 @@ class App(TkinterApp):
         self.load_button.configure(state="normal")
         if not task.image_path:
             self.analysis_mode_selector.configure(state="disabled")
-            self.pipette_button.configure(state="disabled")
-            self.gram_shmidt_button.configure(state="disabled")
             self.button_save_scales.configure(state="disabled")
             self.button_load_scales_file.configure(state="disabled")
             self.app_start_button.configure(state="disabled")
@@ -5532,10 +5720,17 @@ class App(TkinterApp):
             return
 
         self.analysis_mode_selector.configure(state="normal")
-        if not task.has_colors_selected():
-            self.pipette_button.configure(state="normal")
         self.button_save_scales.configure(state="normal")
         self.button_load_scales_file.configure(state="normal")
+
+        if (task.channel_representation == "gram_schmidt"
+                and not task.has_colors_selected()):
+            self.app_start_button.configure(state="disabled")
+            self._set_workflow_status(
+                "Шаг 2 из 3: задайте цветовой базис Gram–Schmidt пипеткой",
+                AppTheme.WARNING
+            )
+            return
 
         if len(task.scales) == 0:
             self.app_start_button.configure(state="disabled")
@@ -5561,7 +5756,7 @@ class App(TkinterApp):
             hover_color=AppTheme.PRIMARY_HOVER
         )
         self._set_workflow_status(
-            "Шаг 3 из 3: настройте форматы вывода и запустите вычисления",
+            f"Шаг 3 из 3: {task.channel_summary()} · можно запускать вычисления",
             AppTheme.TEXT_ON_DARK
         )
 
@@ -5635,35 +5830,25 @@ class App(TkinterApp):
             mb.showerror('Ошибка', f'Не удалось открыть пипетку: {error}', parent=self)
 
     def gramm_shmidt_transform(self):
-        """Обработчик преобразования Грамма-Шмидта для текущей задачи"""
+        """Выбрать Gram–Schmidt как представление текущего исследования."""
         if not self.current_task:
             mb.showwarning("Внимание", "Сначала создайте задачу")
             return
-
-        if (self.current_task.color1 is None or
-                self.current_task.color2 is None or
-                not isinstance(self.current_task.color1, np.ndarray) or
-                not isinstance(self.current_task.color2, np.ndarray) or
-                self.current_task.color1.size == 0 or
-                self.current_task.color2.size == 0):
+        if (getattr(self.current_task, "color1", None) is None or
+                getattr(self.current_task, "color2", None) is None):
             mb.showwarning("Внимание", "Сначала выберите цвета пипеткой")
             return
-
         try:
             self.image_processor.gram_shmidt_transform_for_task(self.current_task)
         except ValueError as error:
             self.progress_manager.log_error(str(error))
-            mb.showwarning("Не удалось преобразовать каналы", str(error))
+            mb.showwarning("Gram–Schmidt", str(error))
             return
-        self.gram_shmidt_button.configure(
-            text="Преобразование применено",
-            state='disabled',
-            fg_color=AppTheme.DISABLED,
-            hover_color=AppTheme.DISABLED_HOVER
-        )
-
-        # Обновляем отображение задач, чтобы показать новый статус
+        self.channel_representation_var.set("Gram–Schmidt")
+        self._update_channel_controls_state()
         self._update_tasks_display()
+        self._update_ml_tab_state()
+        self._update_action_availability()
 
     def load_scales(self):
         """Загрузка масштабов для текущей задачи"""
@@ -5774,6 +5959,17 @@ class App(TkinterApp):
         task = getattr(self, 'current_task', None)
         if task is None or self._loading_task_settings:
             return
+
+        task.channel_representation = {
+            "RGB": "rgb",
+            "Grayscale": "grayscale",
+            "Gram–Schmidt": "gram_schmidt",
+        }.get(self.channel_representation_var.get(), "rgb")
+        task.rgb_channel_mode = (
+            "single" if self.rgb_channel_mode_var.get() == "Один канал" else "all"
+        )
+        task.rgb_single_channel = self.rgb_single_channel_var.get()
+        task.gram_schmidt_applied = task.channel_representation == "gram_schmidt"
 
         task.process_rows = bool(self.row_var.get())
         task.process_columns = bool(self.col_var.get())
@@ -6826,6 +7022,13 @@ class App(TkinterApp):
                 return
             if len(task.scales) == 0:
                 mb.showerror("Ошибка", f"Задача {i + 1}: не заданы масштабы")
+                return
+            if (task.channel_representation == "gram_schmidt"
+                    and not task.has_colors_selected()):
+                mb.showerror(
+                    "Каналы анализа",
+                    f"Задача {i + 1}: для Gram–Schmidt не задан цветовой базис"
+                )
                 return
             if task.analysis_mode == "1d" and not (
                     task.process_rows or task.process_columns):

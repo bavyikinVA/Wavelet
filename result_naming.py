@@ -7,7 +7,7 @@ import re
 from datetime import datetime
 
 
-CHANNEL_CODES = ("r", "g", "b")
+CHANNEL_CODES = ("r", "g", "b", "gray", "gs1", "gs2", "gs3")
 VALID_AXES = {"row", "col"}
 
 
@@ -57,6 +57,10 @@ def _channel(value) -> str:
     aliases = {
         "red": "r", "green": "g", "blue": "b",
         "красный": "r", "зелёный": "g", "зеленый": "g", "синий": "b",
+        "grayscale": "gray", "grey": "gray", "серый": "gray",
+        "оттенки серого": "gray",
+        "gram-schmidt 1": "gs1", "gram-schmidt 2": "gs2",
+        "gram-schmidt 3": "gs3",
     }
     value = aliases.get(value, value)
     if value not in CHANNEL_CODES:

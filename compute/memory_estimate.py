@@ -23,6 +23,7 @@ def estimate_memory(tasks):
             continue
         h, w = image.shape[:2]
         n, scales = h*w, len(task.scales)
+        channel_count = max(1, len(task.analysis_channel_codes_for_settings()))
         if task.analysis_mode == '2d':
             # The application processes one scale/orientation/channel at a time.
             radius = max(2, math.ceil(4 * max(task.scales) * max(1., task.morlet_anisotropy)))
@@ -31,14 +32,14 @@ def estimate_memory(tasks):
             gpu_peaks.append(work)
         else:
             directions = int(task.process_rows) + int(task.process_columns)
-            work = n*scales*8*(3*directions + 3)  # retained channels plus worker/result copies
-            gpu_peaks.append(n*scales*8*3 + n*32)
+            work = n*scales*8*(channel_count*directions + channel_count)
+            gpu_peaks.append(n*scales*8*channel_count + n*32)
             plan = task.resolve_pipeline()
             if plan.extrema:
                 work += n*64
             if plan.knn or plan.ml:
                 # Conservative dense-point scenario; Python containers vary.
-                work += n*scales*3*max(1, task.k_neighbors)*48
+                work += n*scales*channel_count*max(1, task.k_neighbors)*48
             if plan.synchronization:
                 work += h*h*16
         peaks.append(int(work))

@@ -326,10 +326,14 @@ def draw_knn_graph(points, neighbors_dict, scale, channel, extreme_type, filenam
             ax.set_xlim(0, w)
             ax.set_ylim(h, 0)
 
-        colors_ru = ['Красный', 'Зеленый', 'Синий']
+        channel_label = {
+            "r": "Красный (R)", "g": "Зелёный (G)", "b": "Синий (B)",
+            "gray": "Gray", "gs1": "GS1", "gs2": "GS2", "gs3": "GS3",
+            0: "Красный (R)", 1: "Зелёный (G)", 2: "Синий (B)",
+        }.get(channel, str(channel))
         ax.set_title(
             f'Граф {k}-ближайших соседей\n'
-            f'Масштаб: {scale}, Канал: {colors_ru[channel]}, Тип: {extreme_type}'
+            f'Масштаб: {scale}, Канал: {channel_label}, Тип: {extreme_type}'
         )
         ax.set_xlabel('X (пиксели)')
         ax.set_ylabel('Y (пиксели)')
