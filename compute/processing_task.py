@@ -1,6 +1,7 @@
 import numpy as np
 import os
 from dataclasses import dataclass
+from compute.backend_policy import ExecutionProtocol
 
 
 @dataclass(frozen=True)
@@ -157,8 +158,20 @@ class ProcessingTask:
         self.analysis_channel_codes = []
         self.analysis_channel_labels = []
 
-        self.scales = np.array([])
+        self.scales = np.array([], dtype=np.float32)
         self.num_scale = 0
+
+        # Computational reproducibility policy for this task/run.
+        self.requested_backend = "auto"
+        self.strict_backend = False
+        self.execution_protocol = ExecutionProtocol(
+            requested_backend=self.requested_backend,
+            strict_backend=self.strict_backend,
+        )
+        # Incremental execution: downstream stages may reuse artifacts from
+        # the same task while the scientific CWT inputs remain unchanged.
+        self.reuse_existing_results = True
+        self.last_completed_cwt_signature = None
 
         # Параметры 1D-анализа
         self.process_rows = True
@@ -232,6 +245,7 @@ class ProcessingTask:
         self.ml_result = None
         self.ml_dataset_key = None
         self.task_folder_path = ""
+        self.last_completed_cwt_signature = None
         self.color1 = None
         self.color2 = None
         self.gram_schmidt_applied = False
@@ -257,6 +271,7 @@ class ProcessingTask:
         self.analysis_channel_keys = []
         self.analysis_channel_codes = []
         self.analysis_channel_labels = []
+        self.last_completed_cwt_signature = None
 
     def set_channel_analysis(self, representation, rgb_mode=None, single_channel=None):
         representation = str(representation)
@@ -352,6 +367,8 @@ class ProcessingTask:
             'pipeline_preset': self.pipeline_preset,
             'colors_selected': has_colors,
             'channel_summary': self.channel_summary(),
+            'requested_backend': self.requested_backend,
+            'strict_backend': self.strict_backend,
         }
 
     def set_analysis_mode(self, mode):
@@ -463,7 +480,7 @@ class ProcessingTask:
             "synchronization_output_heatmap", "synchronization_output_matrix_csv",
             "synchronization_output_pairs_csv", "scale_block_sizes",
             "row_sync_stride", "row_sync_tolerance", "row_sync_metrics",
-            "k_neighbors", "ml_algorithm", "ml_point_filter", "ml_feature_set",
+            "reuse_existing_results", "k_neighbors", "ml_algorithm", "ml_point_filter", "ml_feature_set",
             "ml_standardize", "ml_n_clusters", "ml_random_state", "ml_eps",
             "ml_min_samples", "ml_dataset_key", "ml_dbscan_tile_size", "ml_dbscan_tile_overlap", "ml_dbscan_max_points_per_tile", "save_source_channels", "save_centering_means",
         )
@@ -579,6 +596,7 @@ class ProcessingTask:
         self.statistics_results = {}
         self.synchronization_results = {}
         self.ml_result = None
+        self.last_completed_cwt_signature = None
 
     def get_image_dimensions(self):
         """Получить размеры изображения"""

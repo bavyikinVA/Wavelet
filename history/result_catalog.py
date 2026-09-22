@@ -139,6 +139,7 @@ def discover_results(folder):
     local = [
         _artifact(path, root)
         for path in root.rglob('*') if path.is_file()
+        and not any(part.casefold().startswith('.pipeline_cache') for part in path.relative_to(root).parts)
         and (path.name.casefold() in {'image.png', 'изображение.png'}
              or (path.suffix.lower() in {'.npy', '.npz', '.csv', '.txt'}
                  and not path.stem.casefold().startswith('график_расчетов')))

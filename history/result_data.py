@@ -82,6 +82,29 @@ def _read(filename, modified, size, category, shape):
         try:
             if mapped.ndim != 2:
                 raise ValueError(f'Ожидается матрица 2D, получено {mapped.shape}')
+
+            # Incremental pipeline caches extrema/envelopes as lossless Nx2
+            # coordinate arrays.  They are viewer layers, not raster maps.
+            # Treating an empty (0, 2) point cache as an image used to create
+            # a zero-height RasterLevels source and crash with division by zero.
+            parts = {part.casefold() for part in path.parts}
+            is_point_cache = '.pipeline_cache' in parts and 'points' in parts
+            if is_point_cache and category in ('Экстремумы', 'Огибающие'):
+                if mapped.shape[1] != 2:
+                    raise ValueError(
+                        f'Ожидается массив координат Nx2, получено {mapped.shape}'
+                    )
+                points = np.array(mapped, copy=True)
+                return dict(
+                    kind='points',
+                    points=points,
+                    shape=shape or (
+                        (int(points[:, 1].max()) + 1) if len(points) else 0,
+                        (int(points[:, 0].max()) + 1) if len(points) else 0,
+                    ),
+                    spatial=shape is not None,
+                )
+
             return _map(mapped, shape if category != 'Синхронизация' else None,
                         spatial=category != 'Синхронизация')
         finally:

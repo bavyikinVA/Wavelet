@@ -9,8 +9,14 @@ logger = logging.getLogger(__name__)
 class CupyWaveletGPU:
     def __init__(self):
         self.cp = cp
-        self._available = True
+        self._available = False
+        if self.cp.cuda.runtime.getDeviceCount() <= 0:
+            raise RuntimeError("No CUDA-capable device detected")
+        probe = self.cp.asarray([1.0, 2.0], dtype=self.cp.float32)
+        _ = self.cp.sum(probe)
+        self.cp.cuda.Stream.null.synchronize()
         self._compile_kernels()
+        self._available = True
 
     def _compile_kernels(self):
         """Compile optimized CUDA kernels"""
@@ -85,7 +91,7 @@ class CupyWaveletGPU:
 
             results.append(self.cp.asnumpy(signal_result))
 
-        return np.array(results)
+        return np.asarray(results, dtype=np.float32)
 
     def _compute_batch_chunked(self, data_batch: np.ndarray, scales: np.ndarray) -> np.ndarray:
         """Обработка больших батчей по частям"""
@@ -129,7 +135,7 @@ class CupyWaveletGPU:
             # Очищаем память после каждого чанка
             self.cp.get_default_memory_pool().free_all_blocks()
 
-        return np.array(results)
+        return np.asarray(results, dtype=np.float32)
 
     def is_available(self):
         return self._available
@@ -152,7 +158,7 @@ class CupyWaveletGPU:
             }
         except Exception as e:
             return {
-                "available": True,
+                "available": False,
                 "device_name": "CuPy GPU",
                 "error": str(e)
             }

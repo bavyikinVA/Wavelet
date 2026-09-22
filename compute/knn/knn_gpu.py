@@ -2,6 +2,7 @@ import logging
 import time
 import cupy as cp
 import numpy as np
+from compute.backend_policy import GPUUnavailableError, classify_gpu_exception
 
 logger = logging.getLogger("WaveletApp")
 
@@ -26,8 +27,9 @@ class KNN_GPU:
 
     def _check_availability(self) -> bool:
         try:
-            test = self.cp.array([1.0, 2.0, 3.0])
+            test = self.cp.array([1.0, 2.0, 3.0], dtype=self.cp.float32)
             self.cp.sum(test)
+            self.cp.cuda.Stream.null.synchronize()
             return True
         except Exception as e:
             logger.warning(f"GPU недоступен: {e}")
@@ -68,8 +70,10 @@ class KNN_GPU:
 
     def find_k_nearest_neighbors(self, points: np.ndarray, k: int):
 
-        if not self._available or len(points) < 2:
-            return None
+        if not self._available:
+            raise GPUUnavailableError("GPU KNN processor is unavailable")
+        if len(points) < 2:
+            return {}
 
         try:
             t_total_start = time.perf_counter()
@@ -79,7 +83,7 @@ class KNN_GPU:
             if n <= k:
                 k = n - 1
 
-            k_actual = k + 1
+            k_actual = k
 
             upload_time = 0.0
             compute_time = 0.0
@@ -145,6 +149,21 @@ class KNN_GPU:
 
                     self.cp.maximum(dist, 0.0, out=dist)
 
+                    # Явно исключаем self-neighbor. Раньше код выбирал k+1
+                    # кандидатов и затем удалял первый после сортировки,
+                    # предполагая, что self-distance всегда ровно 0 и всегда
+                    # будет первой. В float32 это не гарантируется из-за
+                    # округления формулы ||q||^2 + ||r||^2 - 2 q·r.
+                    overlap_start = max(q_start, r_start)
+                    overlap_end = min(q_end, r_end)
+                    if overlap_start < overlap_end:
+                        global_self = self.cp.arange(
+                            overlap_start, overlap_end, dtype=self.cp.int32
+                        )
+                        local_q = global_self - q_start
+                        local_r = global_self - r_start
+                        dist[local_q, local_r] = self.cp.inf
+
                     global_idx = self.cp.arange(r_start, r_end, dtype=self.cp.int32)
                     expanded_idx = self.cp.broadcast_to(global_idx, dist.shape)
 
@@ -176,9 +195,6 @@ class KNN_GPU:
 
                 top_dist = self.cp.take_along_axis(top_dist, order, axis=1)
                 top_idx = self.cp.take_along_axis(top_idx, order, axis=1)
-
-                top_dist = top_dist[:, 1:]
-                top_idx = top_idx[:, 1:]
 
                 if self.use_sqrt:
                     self.cp.sqrt(top_dist, out=top_dist)
@@ -239,6 +255,10 @@ class KNN_GPU:
             return neighbors_dict
 
         except Exception as e:
-            logger.error(f"GPU KNN ошибка: {e}")
             self.clear_cache()
-            return None
+            mapped = classify_gpu_exception(e)
+            if mapped is None:
+                logger.exception("GPU KNN algorithm error")
+                raise
+            logger.error(f"GPU KNN infrastructure error: {mapped}")
+            raise mapped from e

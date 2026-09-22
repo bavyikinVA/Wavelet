@@ -208,8 +208,28 @@ def write_channel_manifest(task, task_folder: str | Path) -> Path:
             except OSError:
                 pass
 
-    document.setdefault("schema_version", 1)
+    document["schema_version"] = max(2, int(document.get("schema_version", 1)))
     document["channel_analysis"] = task.channel_manifest()
+    protocol = getattr(task, "execution_protocol", None)
+    if protocol is not None:
+        document["computation"] = protocol.to_dict()
+
+    # Incremental execution metadata.  The signature intentionally excludes
+    # downstream stage toggles, so enabling KNN after envelopes can reuse the
+    # already computed CWT of the same task.
+    try:
+        from history.pipeline_resume import cwt_signature, cwt_signature_payload
+        document["resume"] = {
+            "cwt_signature": cwt_signature(task),
+            "cwt_inputs": cwt_signature_payload(task),
+            "reuse_existing_results": bool(
+                getattr(task, "reuse_existing_results", True)
+            ),
+        }
+    except Exception:
+        # Manifest persistence must not turn an otherwise valid computation
+        # into a failed run.
+        pass
 
     temp_path = path.with_suffix(".json.tmp")
     temp_path.write_text(

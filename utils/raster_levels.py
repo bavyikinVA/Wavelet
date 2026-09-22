@@ -42,6 +42,11 @@ class RasterLevels:
         source = self.levels[0]
         h, w = source.shape[:2]
         physical_h, physical_w = self.shape
+        # Empty or malformed raster artifacts must not bring down the Tk draw
+        # loop.  Point caches are handled by result_data, but keep this guard
+        # for legacy/corrupt user files as well.
+        if h <= 0 or w <= 0 or physical_h <= 0 or physical_w <= 0:
+            return None
         sx, sy = physical_w/w, physical_h/h
         x0, x1 = sorted(xlim)
         y0, y1 = sorted(ylim)

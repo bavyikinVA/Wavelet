@@ -3,6 +3,7 @@ import sys
 import warnings
 import platform
 from uuid import uuid4
+from dataclasses import replace
 
 
 warnings.filterwarnings(
@@ -70,6 +71,16 @@ from PIL import Image
 from Gram_Shmidt import change_channels
 from history.source_image import save_run_image
 from history.result_catalog import save_coefficient_preview
+from history.pipeline_resume import (
+    cwt_signature,
+    load_complete_cwt,
+    load_point_cache,
+    save_point_cache,
+)
+from history.pipeline_state import (
+    stage_statuses, minimal_execution_plan, mark_stage_ready,
+    format_stage_status, format_execution_plan,
+)
 from result_naming import (
     CHANNEL_CODES,
     centering_mean_name,
@@ -84,6 +95,8 @@ from result_naming import (
     task_run_folder_name,
 )
 from compute.validation import validate_scales
+from compute.numerics import COMPUTE_DTYPE, COMPUTE_DTYPE_NAME
+from compute.backend_policy import GPU_FALLBACK_ERRORS, GPUUnavailableError, classify_gpu_exception
 from compute.processing_task import ProcessingTask
 from compute.channel_analysis import (
     apply_detection_defaults,
@@ -350,7 +363,7 @@ class ImageProcessor:
         rows = data.shape[0]
         cols = data.shape[1]
         scales_size = len(scales)
-        result = np.zeros((rows, scales_size, cols))
+        result = np.zeros((rows, scales_size, cols), dtype=COMPUTE_DTYPE)
 
         self.progress.log_info(f"CPU обработка {rows} строк...")
 
@@ -376,7 +389,7 @@ class ImageProcessor:
         scales_size = len(scales)
         rows = data.shape[0]
 
-        result_3d = np.zeros((scales_size, cols, rows))
+        result_3d = np.zeros((scales_size, cols, rows), dtype=COMPUTE_DTYPE)
 
         self.progress.log_info(f"CPU обработка {cols} столбцов...")
 
@@ -410,8 +423,12 @@ class ImageProcessor:
             result = self.gpu_processor.morlet_wavelet_batch(data_channel, scales)  # [rows, scales, cols]
             return result
 
-        except Exception as e:
-            self.progress.log_error(f"GPU батчевая обработка не удалась: {e}. Возврат к CPU.")
+        except GPU_FALLBACK_ERRORS as e:
+            if self.backend.strict_backend:
+                raise
+            self.progress.log_error(
+                f"GPU батчевая обработка недоступна ({e.__class__.__name__}): {e}. Возврат к CPU."
+            )
             return self.process_channel(data_channel, scales)
 
     def wavelets(self, task, type_data, data_3_channel):
@@ -447,11 +464,12 @@ class ImageProcessor:
                 f"Подготовка канала {channel_name}..."
             )
 
-            data_channel = task.analysis_data[channel].astype(np.float64)
+            data_channel = np.asarray(task.analysis_data[channel], dtype=COMPUTE_DTYPE)
 
             # Центрирование всегда участвует в расчёте, но его служебные
             # значения сохраняются только по явному выбору пользователя.
             cwt_axis = "row" if type_data == 0 else "col"
+            protocol_stage = f"wavelet:{cwt_axis}:{channel_code}"
             means = []
             count = (
                 data_channel.shape[0] if type_data == 0
@@ -496,10 +514,22 @@ class ImageProcessor:
                                                                                      task.scales)
                         data_channel_after_transposed = np.transpose(data_channel_after, (1, 2, 0))
 
-                    data_3_channel[channel] = data_channel_after_transposed
+                    data_3_channel[channel] = np.asarray(
+                        data_channel_after_transposed, dtype=COMPUTE_DTYPE
+                    )
+                    task.execution_protocol.record_stage(
+                        protocol_stage, actual_backend="gpu", dtype=COMPUTE_DTYPE_NAME
+                    )
 
-                except Exception as e:
-                    self.progress.log_error(f"Ошибка GPU: {e}. Переход на CPU...")
+                except GPU_FALLBACK_ERRORS as e:
+                    if task.execution_protocol.strict_backend or self.backend.strict_backend:
+                        raise
+                    self.progress.log_error(
+                        f"Ошибка инфраструктуры GPU ({e.__class__.__name__}): {e}. Переход на CPU..."
+                    )
+                    task.execution_protocol.record_fallback(
+                        protocol_stage, reason=e.__class__.__name__, message=str(e)
+                    )
                     # Fallback to CPU
                     if type_data == 0:
                         data_channel_after = self.process_channel(data_channel, task.scales)
@@ -508,7 +538,14 @@ class ImageProcessor:
                         data_channel_after = self.process_channel_columns(data_channel, task.scales)
                         data_channel_after_transposed = data_channel_after
 
-                    data_3_channel[channel] = data_channel_after_transposed
+                    data_3_channel[channel] = np.asarray(
+                        data_channel_after_transposed, dtype=COMPUTE_DTYPE
+                    )
+                    task.execution_protocol.record_stage(
+                        protocol_stage, actual_backend="cpu", dtype=COMPUTE_DTYPE_NAME,
+                        fallback=True,
+                        details={"fallback_reason": e.__class__.__name__},
+                    )
             else:
                 if type_data == 0:
                     data_channel_after = self.process_channel(data_channel, task.scales)
@@ -517,7 +554,12 @@ class ImageProcessor:
                     data_channel_after = self.process_channel_columns(data_channel, task.scales)
                     data_channel_after_transposed = data_channel_after
 
-                data_3_channel[channel] = data_channel_after_transposed
+                data_3_channel[channel] = np.asarray(
+                    data_channel_after_transposed, dtype=COMPUTE_DTYPE
+                )
+                task.execution_protocol.record_stage(
+                    protocol_stage, actual_backend="cpu", dtype=COMPUTE_DTYPE_NAME
+                )
             current_operation += 1
             self.progress.update_progress(
                 current_operation / total_operations,
@@ -538,7 +580,7 @@ class ImageProcessor:
             channel_count = len(task.analysis_data)
             height, width = task.analysis_data[0].shape
             data_3_channels = np.zeros(
-                (channel_count, task.num_scale, height, width)
+                (channel_count, task.num_scale, height, width), dtype=COMPUTE_DTYPE
             )
             task.result[0] = self.wavelets(task, 0, data_3_channels)
             self.save_print_wavelets(task, 0, info_out)
@@ -550,7 +592,7 @@ class ImageProcessor:
             channel_count = len(task.analysis_data)
             height, width = task.analysis_data[0].shape
             data_3_channels_tr = np.zeros(
-                (channel_count, task.num_scale, height, width)
+                (channel_count, task.num_scale, height, width), dtype=COMPUTE_DTYPE
             )
             task.result[1] = self.wavelets(task, 1, data_3_channels_tr)
             self.save_print_wavelets(task, 1, info_out)
@@ -588,6 +630,9 @@ class ImageProcessor:
                          f"ориентация {angle:g}°")
                     )
 
+                    stage_name = (
+                        f"wavelet_2d:{channel_code}:{float(scale):g}:{float(angle):g}"
+                    )
                     if use_gpu:
                         try:
                             coefficients = cwt2d_morlet_gpu(
@@ -595,9 +640,22 @@ class ImageProcessor:
                                 task.morlet_omega0,
                                 task.morlet_anisotropy
                             )[0, 0]
+                            task.execution_protocol.record_stage(
+                                stage_name, actual_backend="gpu", dtype="complex64"
+                            )
                         except Exception as error:
+                            mapped = classify_gpu_exception(error)
+                            if mapped is None:
+                                raise
+                            if task.execution_protocol.strict_backend or self.backend.strict_backend:
+                                raise mapped from error
                             self.progress.log_error(
-                                f"Ошибка 2D Morlet на GPU: {error}. Переход на CPU."
+                                f"Ошибка 2D Morlet на GPU ({mapped.__class__.__name__}): "
+                                f"{mapped}. Переход на CPU."
+                            )
+                            task.execution_protocol.record_fallback(
+                                stage_name, reason=mapped.__class__.__name__,
+                                message=str(mapped),
                             )
                             use_gpu = False
                             coefficients = cwt2d_morlet_cpu(
@@ -605,12 +663,20 @@ class ImageProcessor:
                                 task.morlet_omega0,
                                 task.morlet_anisotropy
                             )[0, 0]
+                            task.execution_protocol.record_stage(
+                                stage_name, actual_backend="cpu", dtype="complex64",
+                                fallback=True,
+                                details={"fallback_reason": mapped.__class__.__name__},
+                            )
                     else:
                         coefficients = cwt2d_morlet_cpu(
                             channel, [scale], [angle],
                             task.morlet_omega0,
                             task.morlet_anisotropy
                         )[0, 0]
+                        task.execution_protocol.record_stage(
+                            stage_name, actual_backend="cpu", dtype="complex64"
+                        )
 
                     file_stem = cwt2d_stem(channel_code, scale, angle)
                     magnitude = np.abs(coefficients)
@@ -773,18 +839,35 @@ class ImageProcessor:
         silently treating the extrema axis as the CWT source direction.
         """
         plan = pipeline_plan or task.resolve_pipeline()
+        protocol = getattr(task, "execution_protocol", None)
         max_var = bool(max_var or plan.maxima_required)
+        # Local import keeps this method independently testable when its code
+        # object is rebound with a minimal globals dictionary.
+        from history.pipeline_resume import (
+            cwt_signature as _resume_cwt_signature,
+            load_point_cache as _load_point_cache,
+            save_point_cache as _save_point_cache,
+        )
+        from history.pipeline_state import stage_statuses as _stage_statuses
+        resume_cache_folder = getattr(task, "task_folder_path", "")
+        resume_points_allowed = bool(
+            resume_cache_folder
+            and getattr(task, "reuse_existing_results", True)
+            and getattr(task, "last_completed_cwt_signature", None)
+            == _resume_cwt_signature(task)
+        )
+        # Stage-level validity is stricter than CWT validity. Changing extrema
+        # settings must invalidate extrema/envelopes/KNN without recalculating CWT.
+        _stage_states = _stage_statuses(task)
+        reuse_extrema_allowed = resume_points_allowed and _stage_states.get("extrema") == "ready"
+        reuse_envelopes_allowed = resume_points_allowed and _stage_states.get("envelopes") == "ready"
 
         self.progress.update_progress(0.1, "Начало поиска экстремумов...")
         self.progress.log_info(
             "Запущен анализ всех осей признаков для каждого 1D CWT"
         )
 
-        use_gpu_knn = (
-            plan.knn
-            and self.backend.use_gpu
-            and self.knn_processor.is_gpu_available()
-        )
+        use_gpu_knn = bool(plan.knn and self.backend.use_gpu)
         if plan.knn:
             device = "GPU" if use_gpu_knn else "CPU"
             self.progress.log_info(f"Использование {device} для KNN вычислений")
@@ -834,6 +917,7 @@ class ImageProcessor:
         total_operations = len(branches) * len(channels_to_process) * task.num_scale
         current_operation = 0
         extremes = []
+        total_extrema_points = 0
 
         scale_block_sizes = getattr(task, "scale_block_sizes", [5])
         if isinstance(scale_block_sizes, int):
@@ -887,15 +971,87 @@ class ImageProcessor:
                         "max_var": max_var,
                         "min_var": min_var,
                     }
-                    if self.backend.use_gpu:
-                        detected = ExtremesFinder.find_extremes_gpu(
-                            coefs_2d, **detection_kwargs
+                    extrema_stage = (
+                        f"extrema:{cwt_axis}:{channel_code}:{float(scale_value):g}"
+                    )
+
+                    # Incremental execution: reuse raw extrema when every
+                    # requested point kind is already available for this
+                    # CWT/channel/scale.  New runs always write an internal
+                    # cache, while legacy TXT/NPZ exports are also understood.
+                    cached_extrema = {}
+                    extrema_cache_complete = reuse_extrema_allowed
+                    if extrema_cache_complete:
+                        for feature_axis in ("row", "col"):
+                            if max_var:
+                                cached_extrema[(feature_axis, "max")] = _load_point_cache(
+                                    resume_cache_folder, "ext", cwt_axis, feature_axis,
+                                    channel_code, scale_value, "max"
+                                )
+                            if min_var:
+                                cached_extrema[(feature_axis, "min")] = _load_point_cache(
+                                    resume_cache_folder, "ext", cwt_axis, feature_axis,
+                                    channel_code, scale_value, "min"
+                                )
+                        extrema_cache_complete = all(
+                            points is not None for points in cached_extrema.values()
                         )
+
+                    if extrema_cache_complete:
+                        pmaxr = cached_extrema.get(("row", "max"), [])
+                        pmaxc = cached_extrema.get(("col", "max"), [])
+                        pminr = cached_extrema.get(("row", "min"), [])
+                        pminc = cached_extrema.get(("col", "min"), [])
+                        if protocol is not None:
+                            protocol.record_stage(
+                                extrema_stage, actual_backend="disk-cache", dtype="int32",
+                                details={"reused": True},
+                            )
                     else:
-                        detected = self.find_extremes(
-                            coefs=coefs_2d, **detection_kwargs
-                        )
-                    coefs_2d, pmaxr, pmaxc, pminr, pminc = detected
+                        if self.backend.use_gpu:
+                            try:
+                                detected = ExtremesFinder.find_extremes_gpu(
+                                    coefs_2d, **detection_kwargs
+                                )
+                                if protocol is not None:
+                                    protocol.record_stage(
+                                        extrema_stage, actual_backend="gpu", dtype=COMPUTE_DTYPE_NAME
+                                    )
+                            except Exception as exc:
+                                fallback_error_names = {
+                                    "GPUUnavailableError", "GPUOutOfMemoryError",
+                                    "GPUDeviceLostError", "GPUCompatibilityError",
+                                }
+                                if exc.__class__.__name__ not in fallback_error_names:
+                                    raise
+                                if (protocol is not None and protocol.strict_backend) or getattr(self.backend, "strict_backend", False):
+                                    raise
+                                if protocol is not None:
+                                    protocol.record_fallback(
+                                        extrema_stage, reason=exc.__class__.__name__,
+                                        message=str(exc),
+                                    )
+                                self.progress.log_error(
+                                    f"GPU extrema недоступны ({exc.__class__.__name__}), переход на CPU"
+                                )
+                                detected = self.find_extremes(
+                                    coefs=coefs_2d, **detection_kwargs
+                                )
+                                if protocol is not None:
+                                    protocol.record_stage(
+                                        extrema_stage, actual_backend="cpu", dtype=COMPUTE_DTYPE_NAME,
+                                        fallback=True,
+                                        details={"fallback_reason": exc.__class__.__name__},
+                                    )
+                        else:
+                            detected = self.find_extremes(
+                                coefs=coefs_2d, **detection_kwargs
+                            )
+                            if protocol is not None:
+                                protocol.record_stage(
+                                    extrema_stage, actual_backend="cpu", dtype=COMPUTE_DTYPE_NAME
+                                )
+                        coefs_2d, pmaxr, pmaxc, pminr, pminc = detected
                     scale_folder = self.find_scale_folder(task, scale_value)
                     knn_extremes = {
                         "type_data": type_data,
@@ -920,15 +1076,79 @@ class ImageProcessor:
                             f"масштаб {scale_value}, {channel_name}: "
                             f"максимумов={len(raw_max)}, минимумов={len(raw_min)}"
                         )
+                        total_extrema_points += len(raw_max) + len(raw_min)
+
+                        # Persist raw extrema independently of user export
+                        # settings so a later stage can be calculated without
+                        # repeating detection.  Empty results are cached too.
+                        if max_var and resume_cache_folder:
+                            _save_point_cache(
+                                resume_cache_folder, "ext", cwt_axis, feature_axis,
+                                channel_code, scale_value, "max", raw_max
+                            )
+                        if min_var and resume_cache_folder:
+                            _save_point_cache(
+                                resume_cache_folder, "ext", cwt_axis, feature_axis,
+                                channel_code, scale_value, "min", raw_min
+                            )
 
                         upper_points, lower_points = [], []
+                        envelope_stage = (
+                            f"envelopes:{cwt_axis}:{feature_axis}:"
+                            f"{channel_code}:{float(scale_value):g}"
+                        )
                         if plan.envelopes:
-                            upper_points, lower_points = interpolator.get_envelopes(
-                                coefs_2d, raw_max, raw_min,
-                                direction=feature_axis,
-                            )
+                            # Envelope cache may be reused only when this run is
+                            # genuinely resuming a matching point pipeline.  On a
+                            # fresh calculation None is the sentinel for "not
+                            # loaded"; using [] here used to incorrectly mark a
+                            # missing cache as complete and skipped interpolation.
+                            cached_upper = None
+                            cached_lower = None
+                            envelope_cache_complete = False
+                            if reuse_envelopes_allowed and extrema_cache_complete:
+                                if max_var:
+                                    cached_upper = _load_point_cache(
+                                        resume_cache_folder, "env", cwt_axis, feature_axis,
+                                        channel_code, scale_value, "upper"
+                                    )
+                                if min_var:
+                                    cached_lower = _load_point_cache(
+                                        resume_cache_folder, "env", cwt_axis, feature_axis,
+                                        channel_code, scale_value, "lower"
+                                    )
+                                envelope_cache_complete = (
+                                    (not max_var or cached_upper is not None)
+                                    and (not min_var or cached_lower is not None)
+                                )
+
+                            if envelope_cache_complete:
+                                upper_points = cached_upper or []
+                                lower_points = cached_lower or []
+                                if protocol is not None:
+                                    protocol.record_stage(
+                                        envelope_stage, actual_backend="disk-cache", dtype="int32",
+                                        details={"reused": True},
+                                    )
+                            else:
+                                upper_points, lower_points = interpolator.get_envelopes(
+                                    coefs_2d, raw_max, raw_min,
+                                    direction=feature_axis,
+                                    protocol=protocol,
+                                    stage=envelope_stage,
+                                )
                         upper_points = self._valid_point_collection(upper_points)
                         lower_points = self._valid_point_collection(lower_points)
+                        if plan.envelopes and max_var and resume_cache_folder:
+                            _save_point_cache(
+                                resume_cache_folder, "env", cwt_axis, feature_axis,
+                                channel_code, scale_value, "upper", upper_points
+                            )
+                        if plan.envelopes and min_var and resume_cache_folder:
+                            _save_point_cache(
+                                resume_cache_folder, "env", cwt_axis, feature_axis,
+                                channel_code, scale_value, "lower", lower_points
+                            )
 
                         if max_var:
                             knn_extremes[feature["max_key"]] = (
@@ -1015,6 +1235,7 @@ class ImageProcessor:
                             source_direction=cwt_axis,
                             progress_callback=self.progress.update_progress,
                             log_callback=self.progress.log_info,
+                            protocol=protocol,
                         )
                         for point_type, payload in knn_result.items():
                             if payload:
@@ -1067,15 +1288,8 @@ class ImageProcessor:
         self.progress.update_progress(
             0.95, "Завершение поиска экстремумов..."
         )
-        total_points = sum(
-            len(item["max_by_row"])
-            + len(item["max_by_column"])
-            + len(item["min_by_row"])
-            + len(item["min_by_column"])
-            for item in extremes
-        )
         self.progress.log_info(
-            f"Всего найдено точек экстремумов: {total_points}"
+            f"Всего найдено точек экстремумов: {total_extrema_points}"
         )
         self.progress.update_progress(1.0, "Поиск экстремумов завершен")
         return extremes
@@ -2012,6 +2226,30 @@ class ImageProcessor:
                 self.backend.ensure_initialized()
                 self.progress.log_info(
                     f"Вычислительный бэкенд: {self.backend.get_backend_info()['device_name']}")
+            requested_backend = getattr(self.backend, "requested_backend", "gpu" if self.backend.use_gpu else "cpu")
+            task.requested_backend = requested_backend
+            task.strict_backend = bool(getattr(task, "strict_backend", False))
+            self.backend.set_strict_backend(task.strict_backend)
+            task.execution_protocol.reset(
+                requested_backend=requested_backend,
+                strict_backend=task.strict_backend,
+            )
+            if requested_backend == "gpu" and not self.backend.use_gpu:
+                if task.strict_backend:
+                    raise GPUUnavailableError(
+                        "Строгий режим: запрошен GPU, но CUDA backend недоступен"
+                    )
+                task.execution_protocol.record_fallback(
+                    "backend_initialization",
+                    reason="GPUUnavailableError",
+                    message="Requested GPU backend is unavailable; CPU backend selected.",
+                )
+                task.execution_protocol.record_stage(
+                    "backend_initialization", actual_backend="cpu",
+                    dtype=COMPUTE_DTYPE_NAME, fallback=True,
+                    details={"fallback_reason": "GPUUnavailableError"},
+                )
+
             self.progress.begin_stage(f"{task.task_name} · Подготовка данных")
             task_folder = self.create_task_folder(task)
             self.progress.log_info(f"Создана папка для {task.task_name}: {task_folder}")
@@ -2027,8 +2265,19 @@ class ImageProcessor:
             self.progress.update_progress(0.05, "Сохранение исходных каналов...")
             self.save_orig_channels_txt(task, task.save_source_channels)
 
+            current_cwt_signature = cwt_signature(task)
+            can_reuse_pipeline = bool(
+                getattr(task, "reuse_existing_results", True)
+                and getattr(task, "last_completed_cwt_signature", None)
+                == current_cwt_signature
+                and getattr(task, "task_folder_path", "")
+                and os.path.isdir(task.task_folder_path)
+            )
+
             task.result = {}
             pipeline_plan = task.resolve_pipeline()
+            # KNN/statistics are materialized again for the current request,
+            # but their upstream CWT/extrema/envelopes may be restored.
             task.knn_results = {}
             task.statistics_results = {}
             task.synchronization_results = {}
@@ -2041,6 +2290,14 @@ class ImageProcessor:
                 f"статистики={pipeline_plan.statistics}, "
                 f"синхронизации={pipeline_plan.synchronization}"
             )
+            stage_states_before = stage_statuses(task)
+            execution_plan = minimal_execution_plan(task)
+            self.progress.log_info(
+                "Состояние этапов: " + ", ".join(
+                    f"{name}={state}" for name, state in stage_states_before.items()
+                )
+            )
+            self.progress.log_info(format_execution_plan(task))
             info_out = self._get_output_type(
                 task.output_wavelet_image,
                 task.output_wavelet_text
@@ -2052,22 +2309,54 @@ class ImageProcessor:
             if task.analysis_mode == "2d":
                 self.compute_wavelets_2d(task)
             else:
-                self.compute_wavelets(task, info_out)
+                point_execution = [s for s in execution_plan if s in {"extrema", "envelopes", "knn", "statistics"}]
+                need_cwt_in_memory = bool("wavelet" in execution_plan or point_execution)
+                if need_cwt_in_memory:
+                    restored_cwt = None
+                    if can_reuse_pipeline and "wavelet" not in execution_plan:
+                        restored_cwt = load_complete_cwt(task)
+                    if restored_cwt is not None:
+                        task.result = restored_cwt
+                        self.progress.log_info(
+                            "CWT уже рассчитан для этой задачи — коэффициенты "
+                            "загружены из lossless cache, повторный Morlet пропущен"
+                        )
+                        task.execution_protocol.record_stage(
+                            "wavelet:resume", actual_backend="disk-cache",
+                            dtype=COMPUTE_DTYPE_NAME,
+                            details={"reused": True},
+                        )
+                        self.progress.update_progress(1.0, "Готовый CWT восстановлен")
+                    else:
+                        self.compute_wavelets(task, info_out)
+                        mark_stage_ready(task, "wavelet")
+                else:
+                    self.progress.log_info(
+                        "Вейвлеты уже актуальны; загрузка коэффициентов не требуется"
+                    )
+                    self.progress.update_progress(1.0, "Вейвлеты актуальны")
 
-                # Row CWT and Column CWT feed independent point pipelines.
-                self.progress.update_progress(0.7, "Начало поиска экстремумов...")
-                if pipeline_plan.point_pipeline_required:
-                    selected = ["экстремумы"]
-                    if pipeline_plan.envelopes:
+                if point_execution:
+                    # Ready downstream stages are removed from the executable plan.
+                    # Their prerequisites stay enabled so compute_points can restore
+                    # the required cached inputs without recomputing them.
+                    effective_plan = replace(
+                        pipeline_plan,
+                        knn=bool(pipeline_plan.knn and "knn" in execution_plan),
+                        statistics=bool(pipeline_plan.statistics and "statistics" in execution_plan),
+                    )
+                    selected = []
+                    if "extrema" in execution_plan:
+                        selected.append("экстремумы")
+                    if "envelopes" in execution_plan:
                         selected.append("огибающие")
-                    if pipeline_plan.knn:
+                    if "knn" in execution_plan:
                         selected.append("KNN")
-                    if pipeline_plan.statistics:
+                    if "statistics" in execution_plan:
                         selected.append("статистики")
-                    if pipeline_plan.synchronization:
-                        selected.append("синхронизации")
+                    self.progress.update_progress(0.7, "Начало анализа точек...")
                     self.progress.begin_stage(
-                        f"{task.task_name} · Анализ точек: {', '.join(selected)}"
+                        f"{task.task_name} · Досчёт: {', '.join(selected)}"
                     )
                     self.compute_points(
                         task,
@@ -2080,8 +2369,26 @@ class ImageProcessor:
                         task.output_knn_image,
                         task.output_extremes_text,
                         task.output_extremes_image,
-                        pipeline_plan=pipeline_plan
+                        pipeline_plan=effective_plan
                     )
+                    if "extrema" in execution_plan:
+                        mark_stage_ready(task, "extrema")
+                    if "envelopes" in execution_plan:
+                        mark_stage_ready(task, "envelopes")
+                    if "knn" in execution_plan:
+                        mark_stage_ready(task, "knn")
+                    if "statistics" in execution_plan:
+                        mark_stage_ready(task, "statistics")
+                elif pipeline_plan.point_pipeline_required:
+                    self.progress.log_info(
+                        "Все выбранные этапы анализа точек уже актуальны — пересчёт пропущен"
+                    )
+
+            task.last_completed_cwt_signature = current_cwt_signature
+            manifest_path = write_channel_manifest(task, task_folder)
+            self.progress.log_info(
+                f"Протокол вычислительного backend обновлён: {manifest_path}"
+            )
 
             completion = 1.0
             message = f"Вычисления для {task.task_name} завершены успешно"
@@ -2092,6 +2399,11 @@ class ImageProcessor:
             import traceback
             error_msg = f"Ошибка при обработке задачи {task.task_name}: {str(e)}\n{traceback.format_exc()}"
             self.progress.log_error(error_msg)
+            try:
+                if getattr(task, "task_folder_path", ""):
+                    write_channel_manifest(task, task.task_folder_path)
+            except Exception:
+                pass
             raise
         finally:
             # Очищаем тяжёлые временные коэффициенты; KNN/статистики остаются
@@ -2474,6 +2786,7 @@ class App(TkinterApp):
         # Переменная для GPU/CPU переключения
         self.use_gpu_var = tk.BooleanVar(value=True)
         self.compute_device_var = tk.StringVar(value="cpu")
+        self.strict_backend_var = tk.BooleanVar(value=False)
 
         # Обновляем UI после инициализации image_processor
         yield "Завершение подготовки…"
@@ -4789,6 +5102,27 @@ class App(TkinterApp):
             anchor="w", justify="left"
         ).pack(fill="x", padx=(28, 0), pady=(2, 0))
 
+        strict_row = ctk.CTkFrame(
+            self.compute_settings_section.content, fg_color="transparent"
+        )
+        strict_row.pack(fill="x", pady=(10, 0))
+        self.strict_backend_checkbox = ctk.CTkCheckBox(
+            strict_row,
+            text="Строгая воспроизводимость: не переходить GPU → CPU",
+            variable=self.strict_backend_var,
+            command=self._on_strict_backend_changed,
+        )
+        self.strict_backend_checkbox.pack(anchor="w")
+        ctk.CTkLabel(
+            strict_row,
+            text=(
+                "При ошибке CUDA расчёт остановится вместо автоматического "
+                "fallback на CPU."
+            ),
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w", justify="left", wraplength=520,
+        ).pack(fill="x", padx=(28, 0), pady=(2, 0))
+
     @staticmethod
     def _get_cpu_display_info():
         """Короткое человекочитаемое описание CPU без обязательных зависимостей."""
@@ -4828,6 +5162,17 @@ class App(TkinterApp):
         )
         self._update_compute_settings_display()
         self._update_gpu_section()
+
+    def _on_strict_backend_changed(self):
+        enabled = bool(self.strict_backend_var.get())
+        self.image_processor.backend.set_strict_backend(enabled)
+        if self.current_task is not None:
+            self.current_task.strict_backend = enabled
+        self.progress_manager.log_info(
+            "Строгая воспроизводимость включена: GPU fallback запрещён"
+            if enabled else
+            "Строгая воспроизводимость выключена: GPU fallback разрешён"
+        )
 
     def toggle_gpu_backend(self):
         """Обратная совместимость со старым переключателем GPU."""
@@ -5601,6 +5946,12 @@ class App(TkinterApp):
                 else "Все RGB"
             )
             self.rgb_single_channel_var.set(self.current_task.rgb_single_channel)
+            self.strict_backend_var.set(
+                bool(getattr(self.current_task, "strict_backend", False))
+            )
+            self.image_processor.backend.set_strict_backend(
+                self.strict_backend_var.get()
+            )
             self._loading_task_settings = False
             self._update_channel_controls_state()
             # Обновляем информацию о загруженном изображении
@@ -5989,6 +6340,7 @@ class App(TkinterApp):
         task.output_knn_image = bool(self.knn_bool_image_var.get())
         task.save_source_channels = bool(self.print_channels_txt_var.get())
         task.save_centering_means = bool(self.centering_means_var.get())
+        task.strict_backend = bool(self.strict_backend_var.get())
         task.calculate_statistics = bool(self.calculate_statistics_var.get())
         task.statistics_output_image = bool(self.statistics_image_var.get())
         task.statistics_output_csv = bool(self.statistics_csv_var.get())
@@ -6125,6 +6477,17 @@ class App(TkinterApp):
             command=lambda: self._on_pipeline_controls_changed("statistics")
         )
         self.calculate_statistics_switch.grid(row=0, column=4, sticky="w", padx=(10, 0))
+
+        self.pipeline_stage_status_label = ctk.CTkLabel(
+            self.pipeline_section.content, text="", anchor="w", justify="left",
+            font=AppTheme.body_font(),
+        )
+        self.pipeline_section.add_widget(self.pipeline_stage_status_label, pady=(6, 1))
+        self.pipeline_execution_plan_label = ctk.CTkLabel(
+            self.pipeline_section.content, text="", anchor="w", justify="left",
+            font=AppTheme.body_font(),
+        )
+        self.pipeline_section.add_widget(self.pipeline_execution_plan_label, pady=(0, 4))
 
         # Синхронизация пока остаётся частью вычислительной модели, но не входит
         # в набор пользовательских сценариев этой страницы.
@@ -6330,6 +6693,14 @@ class App(TkinterApp):
 
         if self.entry_near_point is not None:
             self.entry_near_point.configure(state="normal" if plan.knn else "disabled")
+
+        if getattr(self, "pipeline_stage_status_label", None) is not None:
+            try:
+                self.pipeline_stage_status_label.configure(text=format_stage_status(task))
+                self.pipeline_execution_plan_label.configure(text=format_execution_plan(task))
+            except Exception:
+                self.pipeline_stage_status_label.configure(text="Состояние этапов: ещё не рассчитано")
+                self.pipeline_execution_plan_label.configure(text="")
 
         self._update_statistics_controls_state()
         self._update_export_rows_visibility()
@@ -7066,11 +7437,26 @@ class App(TkinterApp):
                 task_started = time.time()
                 snapshot = task.settings_snapshot()
                 try:
-                    # Каждый запуск получает собственный каталог, поэтому
-                    # исследования с разными параметрами не смешиваются.
-                    task.task_folder_path = ""
-                    self.image_processor.create_task_folder(task)
-                    save_run_image(task)
+                    # Продолжение той же задачи переиспользует её каталог,
+                    # пока научные входы CWT не изменились. Изменение источника,
+                    # масштабов, каналов или параметров Morlet создаёт новый каталог.
+                    current_signature = cwt_signature(task)
+                    resume_same_task = bool(
+                        getattr(task, "reuse_existing_results", True)
+                        and getattr(task, "last_completed_cwt_signature", None)
+                        == current_signature
+                        and getattr(task, "task_folder_path", "")
+                        and os.path.isdir(task.task_folder_path)
+                    )
+                    if resume_same_task:
+                        self.progress_manager.log_info(
+                            f"Продолжение {task.task_name}: используются готовые "
+                            "результаты предыдущих этапов"
+                        )
+                    else:
+                        task.task_folder_path = ""
+                        self.image_processor.create_task_folder(task)
+                        save_run_image(task)
                     snapshot = task.settings_snapshot()
                     # На странице параметров расчёта выполняется только подготовка
                     # признаков. ML-алгоритмы запускаются исключительно на вкладке «ML».
@@ -7121,6 +7507,7 @@ class App(TkinterApp):
 
             elapsed_time = time.time() - timer
             self.after_safe(0, self._refresh_history_tab)
+            self.after_safe(0, self._update_pipeline_controls_state)
             self.after_safe(0, lambda: self.show_success_message(elapsed_time, total_tasks))
 
         except RunCancelled:

@@ -9,6 +9,8 @@ from matplotlib.collections import LineCollection
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 from result_naming import knn_stem, point_type_parts
+from compute.backend_policy import GPU_FALLBACK_ERRORS, GPUUnavailableError, ExecutionProtocol
+from compute.numerics import COMPUTE_DTYPE, COMPUTE_DTYPE_NAME
 
 logger = logging.getLogger("WaveletApp")
 
@@ -43,39 +45,71 @@ class KNNProcessor:
                 self.gpu_processor = None
 
     def find_k_nearest_neighbors(self, points: np.ndarray, k: int,
-                                 progress_callback=None, log_callback=None) -> Optional[Dict]:
+                                 progress_callback=None, log_callback=None,
+                                 protocol: ExecutionProtocol | None = None,
+                                 stage: str = "knn") -> Optional[Dict]:
         """Унифицированный поиск соседей (GPU или CPU)"""
         if log_callback:
             log_callback(f"Поиск {k}-ближайших соседей для {len(points)} точек")
+
+        points = np.asarray(points, dtype=COMPUTE_DTYPE)
 
         if len(points) < 2:
             if log_callback:
                 log_callback("Недостаточно точек для поиска соседей")
             return {}
 
-        # Пытаемся использовать GPU если доступен
+        # Пытаемся использовать GPU если он был запрошен и доступен.
+        if self.use_gpu and (self.gpu_processor is None or not self.gpu_processor.is_available()):
+            exc = GPUUnavailableError("GPU KNN processor is unavailable")
+            if protocol is not None and protocol.strict_backend:
+                raise exc
+            if protocol is not None:
+                protocol.record_fallback(
+                    stage, reason=exc.__class__.__name__, message=str(exc)
+                )
+            if log_callback:
+                log_callback("GPU KNN недоступен, переход на CPU")
+
         if self.use_gpu and self.gpu_processor and self.gpu_processor.is_available():
             if log_callback:
                 log_callback("Использование GPU для KNN...")
 
-            result = self.gpu_processor.find_k_nearest_neighbors(points, k)
-            if result is not None:
+            try:
+                result = self.gpu_processor.find_k_nearest_neighbors(points, k)
+                if protocol is not None:
+                    protocol.record_stage(stage, actual_backend="gpu", dtype=COMPUTE_DTYPE_NAME)
                 if log_callback:
                     log_callback("KNN вычислен на GPU")
                 return result
-            else:
+            except GPU_FALLBACK_ERRORS as exc:
+                if protocol is not None and protocol.strict_backend:
+                    raise
+                if protocol is not None:
+                    protocol.record_fallback(
+                        stage, reason=exc.__class__.__name__, message=str(exc)
+                    )
                 if log_callback:
-                    log_callback("GPU KNN не удался, переход на CPU")
+                    log_callback(
+                        f"GPU KNN недоступен ({exc.__class__.__name__}), переход на CPU"
+                    )
 
         # Fallback to CPU
         if log_callback:
             log_callback("Использование CPU для KNN...")
-        return self._find_k_nearest_neighbors_cpu(points, k, progress_callback, log_callback)
+        result = self._find_k_nearest_neighbors_cpu(points, k, progress_callback, log_callback)
+        if protocol is not None:
+            protocol.record_stage(
+                stage, actual_backend="cpu", dtype=COMPUTE_DTYPE_NAME,
+                fallback=any(w.stage == stage for w in protocol.warnings),
+            )
+        return result
 
     @staticmethod
     def _find_k_nearest_neighbors_cpu(points: np.ndarray, k: int,
                                       progress_callback=None, log_callback=None) -> Dict:
         """CPU реализация KNN"""
+        points = np.asarray(points, dtype=COMPUTE_DTYPE)
         if len(points) < 2:
             return {}
 
@@ -92,6 +126,7 @@ class KNNProcessor:
                 progress_callback(0.4, "Вычисление расстояний между точками...")
 
             distances, indices = nbrs.kneighbors(points)
+            distances = np.asarray(distances, dtype=COMPUTE_DTYPE)
 
             if progress_callback:
                 progress_callback(0.8, "Формирование словаря соседей...")
@@ -143,7 +178,8 @@ def find_k_nearest_neighbors(points, k, progress_callback=None, log_callback=Non
 def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image,
                               print_text_var, print_image_var, use_gpu=True,
                               source_direction=None,
-                              progress_callback=None, log_callback=None):
+                              progress_callback=None, log_callback=None,
+                              protocol: ExecutionProtocol | None = None):
     processor = get_knn_processor(use_gpu)
 
     if log_callback:
@@ -181,7 +217,9 @@ def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image
         neighbors_dict = processor.find_k_nearest_neighbors(
             points, k,
             progress_callback=lambda p, m: update_progress(p * 0.4, m),
-            log_callback=log_callback)
+            log_callback=log_callback,
+            protocol=protocol,
+            stage=f"knn:{source_direction}:{channel}:{scale}:{extreme_type}")
 
         if not neighbors_dict:
             continue
@@ -222,7 +260,7 @@ def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image
 
 
 def compute_angles_for_neighbors(points: np.ndarray, neighbors_dict: dict, image_coords: bool = True):
-    points = np.asarray(points, dtype=np.float64)
+    points = np.asarray(points, dtype=COMPUTE_DTYPE)
     result = {}
 
     for i, data in neighbors_dict.items():
