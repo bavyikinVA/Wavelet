@@ -356,60 +356,80 @@ class ImageProcessor:
         """Получение информации о бэкенде"""
         return self.backend.get_backend_info()
 
+    def _cpu_flat_chunk_size(self):
+        try:
+            return max(1, int(os.environ.get("WAVELETS_CPU_CHUNK_SIZE", "128")))
+        except ValueError as exc:
+            raise ValueError("WAVELETS_CPU_CHUNK_SIZE должен быть положительным целым") from exc
+
     def process_channel(self, data, scales):
-        """
-        Обработка канала с встроенным симметричным отражением на CPU
-        """
+        """CPU CWT for rows; numba-flat is default, legacy Pool is opt-in."""
         rows = data.shape[0]
         cols = data.shape[1]
         scales_size = len(scales)
-        result = np.zeros((rows, scales_size, cols), dtype=COMPUTE_DTYPE)
+        self.progress.log_info(
+            f"CPU обработка {rows} строк (engine={self.backend.cpu_engine})..."
+        )
 
-        self.progress.log_info(f"CPU обработка {rows} строк...")
-
-        with Pool() as pool:
-            args = [(data[i], scales) for i in range(rows)]
-            pending = pool.map_async(process_row_static, args)
-            while not pending.ready():
+        if self.backend.cpu_engine == "legacy-pool":
+            result = np.zeros((rows, scales_size, cols), dtype=COMPUTE_DTYPE)
+            with Pool() as pool:
+                args = [(data[i], scales) for i in range(rows)]
+                pending = pool.map_async(process_row_static, args)
+                while not pending.ready():
+                    self.progress.run_control.check()
+                    pending.wait(.1)
                 self.progress.run_control.check()
-                pending.wait(.1)
+                results = pending.get()
+            for i, res in enumerate(results):
+                result[i] = res
+            return result
+
+        # Chunking preserves cancellation responsiveness without reintroducing
+        # process-spawn overhead. Each chunk is one flat Numba parallel region.
+        result = np.empty((rows, scales_size, cols), dtype=COMPUTE_DTYPE)
+        chunk_size = self._cpu_flat_chunk_size()
+        for start in range(0, rows, chunk_size):
             self.progress.run_control.check()
-            results = pending.get()
-
-        for i, res in enumerate(results):
-            result[i] = res
-
+            stop = min(rows, start + chunk_size)
+            result[start:stop] = self.backend.compute_cpu_batch(data[start:stop], scales)
+        self.progress.run_control.check()
         return result
 
     def process_channel_columns(self, data, scales):
-        """
-        Параллельная обработка столбцов с использованием multiprocessing на CPU
-        """
+        """CPU CWT for columns with the same engine as row processing."""
         cols = data.shape[1]
-        scales_size = len(scales)
         rows = data.shape[0]
+        scales_size = len(scales)
+        self.progress.log_info(
+            f"CPU обработка {cols} столбцов (engine={self.backend.cpu_engine})..."
+        )
 
-        result_3d = np.zeros((scales_size, cols, rows), dtype=COMPUTE_DTYPE)
-
-        self.progress.log_info(f"CPU обработка {cols} столбцов...")
-
-        # Подготавливаем аргументы для каждого столбца
-        args = [(col_idx, data[:, col_idx], scales) for col_idx in range(cols)]
-
-        # Обрабатываем столбцы параллельно
-        with Pool() as pool:
-            pending = pool.map_async(process_column_static, args)
-            while not pending.ready():
+        if self.backend.cpu_engine == "legacy-pool":
+            result_3d = np.zeros((scales_size, cols, rows), dtype=COMPUTE_DTYPE)
+            args = [(col_idx, data[:, col_idx], scales) for col_idx in range(cols)]
+            with Pool() as pool:
+                pending = pool.map_async(process_column_static, args)
+                while not pending.ready():
+                    self.progress.run_control.check()
+                    pending.wait(.1)
                 self.progress.run_control.check()
-                pending.wait(.1)
+                results = pending.get()
+            for col_idx, column_result in results:
+                result_3d[:, col_idx, :] = column_result
+            return np.transpose(result_3d, (0, 2, 1))
+
+        transposed = np.ascontiguousarray(data.T, dtype=COMPUTE_DTYPE)
+        result = np.empty((cols, scales_size, rows), dtype=COMPUTE_DTYPE)
+        chunk_size = self._cpu_flat_chunk_size()
+        for start in range(0, cols, chunk_size):
             self.progress.run_control.check()
-            results = pending.get()
-
-        # Собираем результаты
-        for col_idx, column_result in results:
-            result_3d[:, col_idx, :] = column_result
-
-        return np.transpose(result_3d, (0, 2, 1))
+            stop = min(cols, start + chunk_size)
+            result[start:stop] = self.backend.compute_cpu_batch(
+                transposed[start:stop], scales
+            )
+        self.progress.run_control.check()
+        return np.transpose(result, (1, 2, 0))
 
     def process_channel_batch_gpu(self, data_channel, scales):
         """Батчевая обработка ВСЕГО канала на GPU (используется для обоих backend)"""
@@ -544,7 +564,10 @@ class ImageProcessor:
                     task.execution_protocol.record_stage(
                         protocol_stage, actual_backend="cpu", dtype=COMPUTE_DTYPE_NAME,
                         fallback=True,
-                        details={"fallback_reason": e.__class__.__name__},
+                        details={
+                            "fallback_reason": e.__class__.__name__,
+                            "cpu_engine": self.backend.cpu_engine,
+                        },
                     )
             else:
                 if type_data == 0:
@@ -558,7 +581,8 @@ class ImageProcessor:
                     data_channel_after_transposed, dtype=COMPUTE_DTYPE
                 )
                 task.execution_protocol.record_stage(
-                    protocol_stage, actual_backend="cpu", dtype=COMPUTE_DTYPE_NAME
+                    protocol_stage, actual_backend="cpu", dtype=COMPUTE_DTYPE_NAME,
+                    details={"cpu_engine": self.backend.cpu_engine},
                 )
             current_operation += 1
             self.progress.update_progress(

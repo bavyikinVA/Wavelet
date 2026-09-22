@@ -1,4 +1,5 @@
 import logging
+import os
 from multiprocessing import Pool
 from typing import Any, Dict
 
@@ -64,9 +65,17 @@ class ComputeBackend:
         }
 
         try:
-            from compute.wavelets.cpu_wavelet import morlet_wavelet_with_padding
+            from compute.wavelets.cpu_wavelet import (
+                morlet_wavelet_with_padding, morlet_wavelet_batch_flat_threaded,
+            )
             self._cpu_processor = morlet_wavelet_with_padding
-            logger.info("CPU backend initialized (%s)", COMPUTE_DTYPE_NAME)
+            self._cpu_batch_processor = morlet_wavelet_batch_flat_threaded
+            self.cpu_engine = os.environ.get("WAVELETS_CPU_ENGINE", "numba-flat").strip().lower()
+            if self.cpu_engine not in {"numba-flat", "legacy-pool"}:
+                raise ValueError(
+                    "WAVELETS_CPU_ENGINE должен быть 'numba-flat' или 'legacy-pool'"
+                )
+            logger.info("CPU backend initialized (%s, engine=%s)", COMPUTE_DTYPE_NAME, self.cpu_engine)
         except Exception as exc:
             logger.error("CPU backend initialization failed: %s", exc)
             self.backend_info["available"] = False
@@ -144,17 +153,29 @@ class ComputeBackend:
         return result
 
     def _compute_cpu_fallback(self, data: np.ndarray, scales: np.ndarray) -> np.ndarray:
-        logger.info("CPU processing: %s signals with %s scales", data.shape, len(scales))
+        logger.info(
+            "CPU processing: %s signals with %s scales (engine=%s)",
+            data.shape, len(scales), self.cpu_engine,
+        )
         data = np.asarray(data, dtype=COMPUTE_DTYPE)
         scales = np.asarray(scales, dtype=COMPUTE_DTYPE)
-        try:
-            with Pool() as pool:
-                args = [(data[i], scales) for i in range(data.shape[0])]
-                results = pool.map(_process_row_wrapper, args)
-            return np.asarray(results, dtype=COMPUTE_DTYPE)
-        except Exception as exc:
-            logger.error("CPU multiprocessing failed: %s", exc)
-            return self._compute_cpu_sequential(data, scales)
+        if self.cpu_engine == "legacy-pool":
+            return self._compute_cpu_legacy_pool(data, scales)
+        # Do not silently fall back on arbitrary algorithm errors: if the new
+        # engine fails, surface the defect. Legacy mode remains explicitly
+        # selectable with WAVELETS_CPU_ENGINE=legacy-pool.
+        return np.asarray(self._cpu_batch_processor(data, scales), dtype=COMPUTE_DTYPE)
+
+    def compute_cpu_batch(self, data: np.ndarray, scales: np.ndarray) -> np.ndarray:
+        """Public CPU batch entry point used by the application and tests."""
+        self.ensure_initialized()
+        return self._compute_cpu_fallback(data, scales)
+
+    def _compute_cpu_legacy_pool(self, data: np.ndarray, scales: np.ndarray) -> np.ndarray:
+        with Pool() as pool:
+            args = [(data[i], scales) for i in range(data.shape[0])]
+            results = pool.map(_process_row_wrapper, args)
+        return np.asarray(results, dtype=COMPUTE_DTYPE)
 
     def _compute_cpu_sequential(self, data: np.ndarray, scales: np.ndarray) -> np.ndarray:
         logger.warning("Using sequential CPU computation")
@@ -173,6 +194,7 @@ class ComputeBackend:
             "requested_backend": self.requested_backend,
             "dtype": COMPUTE_DTYPE_NAME,
             "strict_backend": self.strict_backend,
+            "cpu_engine": getattr(self, "cpu_engine", "numba-flat"),
         })
         return dict(self.backend_info, gpu_checked=self._gpu_checked)
 

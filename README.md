@@ -693,3 +693,47 @@ python -m compileall -q .
 8. Полный последующий 2D-анализ пока не реализован.
 9. Синхронизация не включена как обычный пользовательский этап.
 10. Количественное сравнение нескольких запусков пока ограничено.
+
+## CPU CWT engine (2026-09-22)
+
+The default CPU engine for 1-D Morlet CWT is now `numba-flat`: one Numba
+parallel region over the signal×scale grid, using float32 and the same Morlet
+kernel as the legacy implementation. The application processes large channels
+in chunks (default 128 signals) so cancellation remains responsive.
+
+Rollback / A-B switch:
+
+```powershell
+$env:WAVELETS_CPU_ENGINE="legacy-pool"
+python main.py
+```
+
+Optional tuning:
+
+```powershell
+$env:WAVELETS_NUMBA_THREADS="6"
+$env:WAVELETS_CPU_CHUNK_SIZE="128"
+```
+
+Before accepting the optimization on a target machine, run:
+
+```powershell
+python benchmarks/cpu_production_ab.py
+```
+
+or with a real image:
+
+```powershell
+python benchmarks/cpu_production_ab.py --image "C:\path\to\image.png"
+```
+
+Keep the new default when `summary.integration_pass` is `true`.
+
+
+## CPU CWT production decision (2026-09-22)
+
+`numba-flat` is the production default CPU engine for 1-D Morlet CWT.
+On the accepted 500x700 RGB real-image A/B run (rows + columns, scales 1..10),
+it reduced total CWT wall time from 66.39 s to 53.89 s (18.81%) while
+remaining bitwise identical to `legacy-pool`. See
+`benchmarks/CPU_BACKEND_DECISION.md`.
