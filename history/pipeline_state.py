@@ -31,11 +31,14 @@ def stage_signatures(task) -> Dict[str, str]:
         "upstream": wavelet,
         "find_maxima": bool(getattr(task, "find_maxima", True)),
         "find_minima": bool(getattr(task, "find_minima", True)),
-        "algorithm": "local-extrema-v1",
+        "distance": int(getattr(task, "extrema_distance", 1)),
+        "prominence": float(getattr(task, "extrema_prominence", 0.0)),
+        "algorithm": "strict-local-extrema-distance-prominence-v2",
     })
     envelopes = _hash({
         "upstream": extrema,
-        "algorithm": "envelope-interpolation-v1",
+        "algorithm": "pchip-grouped-v2",
+        "boundary_policy": "constant-nearest-support",
     })
     knn = _hash({
         "upstream": envelopes,

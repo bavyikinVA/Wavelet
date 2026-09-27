@@ -24,6 +24,7 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
 from result_naming import dated_folder_name, ml_dataset_slug
+from compute.knn.result_format import neighbor_arrays
 
 from .errors import ClusteringError
 
@@ -156,17 +157,50 @@ def extract_knn_features(
         neighbors = payload.get("neighbors", {})
         if points.ndim != 2 or points.shape[1] < 2:
             continue
+
+        indices, distances, angles = neighbor_arrays(
+            neighbors, point_count=len(points)
+        )
+        valid_dist = (indices >= 0) & np.isfinite(distances)
+        dist_count = valid_dist.sum(axis=1)
+        dist_sum = np.where(valid_dist, distances, 0.0).sum(axis=1)
+        distance_mean = np.divide(
+            dist_sum, dist_count, out=np.zeros(len(points), dtype=float),
+            where=dist_count > 0,
+        )
+        centered = np.where(
+            valid_dist, distances - distance_mean[:, None], 0.0
+        )
+        distance_std = np.sqrt(np.divide(
+            np.sum(centered * centered, axis=1),
+            dist_count,
+            out=np.zeros(len(points), dtype=float),
+            where=dist_count > 0,
+        ))
+
+        if angles is None:
+            mean_sin = np.zeros(len(points), dtype=float)
+            mean_cos = np.zeros(len(points), dtype=float)
+        else:
+            valid_angles = (indices >= 0) & np.isfinite(angles)
+            angle_count = valid_angles.sum(axis=1)
+            radians = np.deg2rad(angles)
+            sin_sum = np.where(valid_angles, np.sin(radians), 0.0).sum(axis=1)
+            cos_sum = np.where(valid_angles, np.cos(radians), 0.0).sum(axis=1)
+            mean_sin = np.divide(
+                sin_sum, angle_count, out=np.zeros(len(points), dtype=float),
+                where=angle_count > 0,
+            )
+            mean_cos = np.divide(
+                cos_sum, angle_count, out=np.zeros(len(points), dtype=float),
+                where=angle_count > 0,
+            )
+
         for point_id, point in enumerate(points):
             if point_id % 1000 == 0:
                 _check_cancel(cancel_callback)
-            neighbor = neighbors.get(point_id, neighbors.get(str(point_id), {}))
-            distances = np.asarray(neighbor.get("distances", []), dtype=float)
-            angles = np.asarray(neighbor.get("angles", []), dtype=float)
-            distances = distances[np.isfinite(distances)]
-            angles = angles[np.isfinite(angles)]
-            radians = np.deg2rad(angles)
-            mean_sin = float(np.mean(np.sin(radians))) if angles.size else 0.0
-            mean_cos = float(np.mean(np.cos(radians))) if angles.size else 0.0
+            sin_value = float(mean_sin[point_id])
+            cos_value = float(mean_cos[point_id])
             records.append({
                 "direction": direction,
                 "channel": str(channel),
@@ -177,11 +211,11 @@ def extract_knn_features(
                 "point_id": int(point_id),
                 "x": _safe_number(point[0]),
                 "y": _safe_number(point[1]),
-                "distance_mean": float(np.mean(distances)) if distances.size else 0.0,
-                "distance_std": float(np.std(distances)) if distances.size else 0.0,
-                "angle_sin_mean": mean_sin,
-                "angle_cos_mean": mean_cos,
-                "angle_concentration": float(np.hypot(mean_sin, mean_cos)),
+                "distance_mean": float(distance_mean[point_id]),
+                "distance_std": float(distance_std[point_id]),
+                "angle_sin_mean": sin_value,
+                "angle_cos_mean": cos_value,
+                "angle_concentration": float(np.hypot(sin_value, cos_value)),
             })
         _notify(progress_callback, "features", group_index / total_groups,
                 f"Подготовка признаков: {len(records):,} точек")

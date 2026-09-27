@@ -74,9 +74,44 @@ def _read(filename, modified, size, category, shape):
                 return dict(kind='series', array=payload['series'].copy(),
                             labels=payload['labels'].tolist(),
                             ticks=payload['ticks'].tolist() if 'ticks' in payload else None, spatial=False)
+
+            # Native KNN NPZ: the numerical result is complete, while the
+            # viewer materializes only a bounded deterministic subset of graph
+            # segments so opening a multi-million-point run does not recreate
+            # the old rendering/memory bottleneck.
+            if category == 'KNN' and 'points' in payload and 'indices' in payload:
+                points = np.asarray(payload['points'], dtype=np.float32).copy()
+                indices = np.asarray(payload['indices'], dtype=np.int32)
+                n = len(points)
+                limit = min(n, 50000)
+                if n and limit:
+                    sources = (
+                        np.arange(limit, dtype=np.int64) * n // limit
+                    ).astype(np.int32)
+                    k = indices.shape[1] if indices.ndim == 2 else 0
+                    src = np.repeat(sources, k)
+                    dst = indices[sources].reshape(-1) if k else np.empty(0, dtype=np.int32)
+                    valid = (dst >= 0) & (dst < n) & (src != dst)
+                    src = src[valid]
+                    dst = dst[valid]
+                    edges = np.stack((points[src], points[dst]), axis=1) if len(src) else np.empty((0, 2, 2), dtype=np.float32)
+                else:
+                    edges = np.empty((0, 2, 2), dtype=np.float32)
+
+                stored_shape = tuple(int(v) for v in np.asarray(payload.get('shape', [0, 0])).reshape(-1)[:2])
+                if len(stored_shape) != 2 or not all(stored_shape):
+                    stored_shape = shape or (
+                        (int(points[:, 1].max()) + 1) if n else 0,
+                        (int(points[:, 0].max()) + 1) if n else 0,
+                    )
+                return dict(
+                    kind='points', points=points, edges=edges,
+                    shape=stored_shape, spatial=True,
+                )
+
             points = payload['points'].copy()
-            shape = tuple(payload['shape'])
-            return dict(kind='points', points=points, shape=shape, spatial=True)
+            stored_shape = tuple(payload['shape'])
+            return dict(kind='points', points=points, shape=stored_shape, spatial=True)
     if suffix == '.npy':
         mapped = np.load(path, mmap_mode='r', allow_pickle=False)
         try:

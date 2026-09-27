@@ -10,10 +10,18 @@ class GPUEnvelopeProcessor:
         print(f"Доступно GPU памяти: {self.device_memory[0] / 1e9:.2f} GB")
 
     def get_row_envelopes_gpu(self, coefs, max_points, min_points):
+        """Compatibility entry point for the new grouped PCHIP policy.
+
+        Production envelopes are CPU/grouped because PCHIP has no equivalent
+        CuPy path here and thousands of tiny GPU launches are slower at the
+        project's 2500x2000 target.  Keep this method algorithmically identical
+        if older code calls it directly.
         """
-        GPU-реализация построения огибающих для строк
-        с batch-обработкой для избежания переполнения памяти
-        """
+        from compute.extremes.interpol import get_row_envelopes
+        return get_row_envelopes(cp.asnumpy(coefs), max_points, min_points)
+
+        # Legacy linear GPU implementation retained below temporarily for A/B
+        # reference; it is intentionally unreachable from the public method.
         # Преобразуем ВСЕ входные данные на GPU единовременно
         coefs_gpu = cp.asarray(coefs, dtype=cp.float32)  # Используем float32 для экономии памяти
         rows, cols = coefs_gpu.shape
@@ -144,10 +152,12 @@ class GPUEnvelopeProcessor:
         return all_peaks
 
     def get_col_envelopes_gpu(self, coefs, max_points, min_points):
-        """
-        GPU-реализация построения огибающих для столбцов
-        с batch-обработкой для избежания переполнения памяти
-        """
+        """Compatibility entry point for the grouped CPU PCHIP policy."""
+        from compute.extremes.interpol import get_column_envelopes
+        return get_column_envelopes(cp.asnumpy(coefs), max_points, min_points)
+
+        # Legacy linear GPU implementation retained below temporarily for A/B
+        # reference; it is intentionally unreachable from the public method.
         # Преобразуем ВСЕ входные данные на GPU единовременно
         coefs_gpu = cp.asarray(coefs, dtype=cp.float32)  # Используем float32 для экономии памяти
         rows, cols = coefs_gpu.shape

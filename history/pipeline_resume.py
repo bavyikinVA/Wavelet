@@ -78,30 +78,34 @@ def save_point_cache(task_folder, artifact, cwt_axis, feature_axis, channel, sca
     return path
 
 
-def _load_txt_points(path: Path):
+def _load_txt_points(path: Path, *, as_array: bool = False):
     if not path.is_file():
         return None
     if path.stat().st_size == 0:
-        return []
+        empty = np.empty((0, 2), dtype=np.int32)
+        return empty if as_array else []
     try:
         data = np.loadtxt(path, delimiter=",", ndmin=2)
     except ValueError:
-        return []
+        empty = np.empty((0, 2), dtype=np.int32)
+        return empty if as_array else []
     if data.size == 0:
-        return []
-    return np.asarray(data[:, :2], dtype=np.int32).tolist()
+        empty = np.empty((0, 2), dtype=np.int32)
+        return empty if as_array else []
+    array = np.asarray(data[:, :2], dtype=np.int32).reshape(-1, 2)
+    return array if as_array else array.tolist()
 
 
-def load_point_cache(task_folder, artifact, cwt_axis, feature_axis, channel, scale, kind):
+def load_point_cache(task_folder, artifact, cwt_axis, feature_axis, channel, scale, kind, *, as_array=False):
     """Load a point artifact; supports new cache plus legacy TXT/NPZ exports."""
     cache = point_cache_path(task_folder, artifact, cwt_axis, feature_axis, channel, scale, kind)
     if cache.is_file():
-        data = np.load(cache, allow_pickle=False)
-        return np.asarray(data, dtype=np.int32).reshape(-1, 2).tolist()
+        data = np.asarray(np.load(cache, allow_pickle=False), dtype=np.int32).reshape(-1, 2)
+        return data if as_array else data.tolist()
 
     stem = point_stem(artifact, cwt_axis, feature_axis, channel, scale, kind)
     scale_dir = Path(task_folder) / "scales" / scale_folder_name(scale)
-    txt_points = _load_txt_points(scale_dir / f"{stem}.txt")
+    txt_points = _load_txt_points(scale_dir / f"{stem}.txt", as_array=as_array)
     if txt_points is not None:
         return txt_points
 
@@ -110,7 +114,8 @@ def load_point_cache(task_folder, artifact, cwt_axis, feature_axis, channel, sca
         with np.load(npz_path, allow_pickle=False) as payload:
             points = payload.get("points")
             if points is not None:
-                return np.asarray(points, dtype=np.int32).reshape(-1, 2).tolist()
+                array = np.asarray(points, dtype=np.int32).reshape(-1, 2)
+                return array if as_array else array.tolist()
     return None
 
 

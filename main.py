@@ -812,45 +812,26 @@ class ImageProcessor:
                         array_2d
                     )
     @staticmethod
-    def find_extremes(coefs, row_var, col_var, max_var, min_var):
-        points_max_by_row = []
-        points_min_by_row = []
-        points_max_by_column = []
-        points_min_by_column = []
+    def find_extremes(coefs, row_var, col_var, max_var, min_var,
+                      distance=1, prominence=0.0):
+        """Find strict local extrema with optional peak filtering.
 
-        # Экстремумы построчно
-        if row_var and (max_var or min_var):
-            left = coefs[:, :-2]
-            center = coefs[:, 1:-1]
-            right = coefs[:, 2:]
+        ``distance`` is the minimum separation in samples/pixels along the
+        analysed line. ``prominence`` is measured in CWT coefficient units.
+        Defaults (1, 0) preserve the historical strict-neighbour rule.
+        """
+        from compute.extremes.detection import find_extrema_2d
 
-            if max_var:
-                max_mask = (center > left) & (center > right)
-                max_coords = np.where(max_mask)
-                points_max_by_row = [[x + 1, y] for y, x in zip(max_coords[0], max_coords[1])]
-
-            if min_var:
-                min_mask = (center < left) & (center < right)
-                min_coords = np.where(min_mask)
-                points_min_by_row = [[x + 1, y] for y, x in zip(min_coords[0], min_coords[1])]
-
-        # Экстремумы по столбцам
-        if col_var and (max_var or min_var):
-            up = coefs[:-2, :]
-            center = coefs[1:-1, :]
-            down = coefs[2:, :]
-
-            if max_var:
-                max_mask = (center > up) & (center > down)
-                max_coords = np.where(max_mask)
-                points_max_by_column = [[x, y + 1] for y, x in zip(max_coords[0], max_coords[1])]
-
-            if min_var:
-                min_mask = (center < up) & (center < down)
-                min_coords = np.where(min_mask)
-                points_min_by_column = [[x, y + 1] for y, x in zip(min_coords[0], min_coords[1])]
-
-        return coefs, points_max_by_row, points_max_by_column, points_min_by_row, points_min_by_column
+        pmaxr, pmaxc, pminr, pminc = find_extrema_2d(
+            coefs,
+            row_var=row_var,
+            col_var=col_var,
+            max_var=max_var,
+            min_var=min_var,
+            distance=distance,
+            prominence=prominence,
+        )
+        return coefs, pmaxr, pmaxc, pminr, pminc
 
     def compute_points(self, task, row_var, col_var, max_var, min_var,
                        knn_var, knn_bool_text_var, knn_bool_image_var,
@@ -886,15 +867,127 @@ class ImageProcessor:
         reuse_extrema_allowed = resume_points_allowed and _stage_states.get("extrema") == "ready"
         reuse_envelopes_allowed = resume_points_allowed and _stage_states.get("envelopes") == "ready"
 
+        # Production profiling is deliberately local to the point pipeline so
+        # tests that rebind this method do not depend on GUI/module globals.
+        import os as _profile_os
+        import time as _profile_time
+        from compute.stage_profiling import StageProfile, current_rss_bytes, format_mib
+
+        point_pipeline_started = _profile_time.perf_counter()
+        point_pipeline_rss_start = current_rss_bytes()
+        extrema_profile = StageProfile("Extrema")
+        envelope_profile = StageProfile("Envelopes")
+        # KNN is profiled both as an end-to-end block and as non-overlapping
+        # internal phases. The detailed CPU profiles are nested inside
+        # ``search_total`` and are reported only as a breakdown, never added to
+        # the total a second time.
+        knn_total_profile = StageProfile("KNN total")
+        knn_profiles = {
+            "points_prepare": StageProfile("KNN points prepare"),
+            "search_total": StageProfile("KNN neighbor search"),
+            "cpu_fit": StageProfile("KNN CPU kd-tree fit"),
+            "cpu_kneighbors": StageProfile("KNN CPU kneighbors"),
+            "cpu_compact_result": StageProfile("KNN CPU compact result"),
+            "angles": StageProfile("KNN angles (vectorized)"),
+            "npz_export": StageProfile("KNN NPZ export"),
+            "image_export": StageProfile("KNN PNG export"),
+            "image_edges": StageProfile("KNN PNG edge preparation"),
+            "text_export": StageProfile("KNN TXT export"),
+            "gc": StageProfile("KNN garbage collection"),
+        }
+        knn_profile_stats = {
+            "groups": 0,
+            "points": 0,
+            "links": 0,
+            "stored_bytes": 0,
+            "image_files": 0,
+            "image_sampled_files": 0,
+            "image_source_points": 0,
+            "image_full_points": 0,
+            "image_edges_rendered": 0,
+            "npz_files": 0,
+            "npz_bytes": 0,
+            "text_files": 0,
+            "text_rows": 0,
+        }
+        # The remaining point-stage overhead is profiled separately from the
+        # scientific Extrema / Envelopes / KNN computations.  These profiles
+        # are intentionally non-overlapping so their sum can explain the full
+        # point-pipeline wall time.
+        point_profiles = {
+            "compact": StageProfile("Point arrays compact"),
+            "cache_read": StageProfile("Point cache read"),
+            "cache_write_extrema": StageProfile("Extrema cache write"),
+            "cache_write_envelopes": StageProfile("Envelopes cache write"),
+            "text_export_extrema": StageProfile("Extrema TXT export"),
+            "text_export_envelopes": StageProfile("Envelopes TXT export"),
+            "image_export_extrema": StageProfile("Extrema PNG export"),
+            "image_export_envelopes": StageProfile("Envelopes PNG export"),
+            "knn_result_store": StageProfile("KNN result store"),
+        }
+        point_profile_stats = {
+            "cache_files_written": 0,
+            "cache_bytes_written": 0,
+            "cache_files_read": 0,
+            "extrema_text_files": 0,
+            "extrema_text_points": 0,
+            "envelope_text_files": 0,
+            "envelope_text_points": 0,
+            "extrema_image_files": 0,
+            "envelope_image_files": 0,
+        }
+
+        def _read_point_cache(*args):
+            with point_profiles["cache_read"].measure():
+                result = _read_point_cache(*args, as_array=True)
+            if result is not None:
+                point_profile_stats["cache_files_read"] += 1
+            return result
+
+        def _write_point_cache(profile_key, *args):
+            with point_profiles[profile_key].measure():
+                path = _save_point_cache(*args)
+            point_profile_stats["cache_files_written"] += 1
+            try:
+                point_profile_stats["cache_bytes_written"] += _profile_os.path.getsize(path)
+            except OSError:
+                pass
+            return path
+
+        total_envelope_input_points = 0
+        total_envelope_points = 0
+
         self.progress.update_progress(0.1, "Начало поиска экстремумов...")
         self.progress.log_info(
             "Запущен анализ всех осей признаков для каждого 1D CWT"
+        )
+        self.progress.log_info(
+            "Параметры экстремумов: "
+            f"distance={int(getattr(task, 'extrema_distance', 1))}, "
+            f"prominence={float(getattr(task, 'extrema_prominence', 0.0)):g}"
+        )
+        self.progress.log_info(
+            "Профилирование Extrema/Envelopes: perf_counter + process RSS "
+            "(пиковая память, шаг выборки 20 мс)"
         )
 
         use_gpu_knn = bool(plan.knn and self.backend.use_gpu)
         if plan.knn:
             device = "GPU" if use_gpu_knn else "CPU"
             self.progress.log_info(f"Использование {device} для KNN вычислений")
+            self.progress.log_info(
+                "Профилирование KNN: total + подготовка точек + поиск соседей "
+                "+ векторные углы + NPZ/TXT/PNG + GC; CPU search дополнительно разбит на "
+                "kd-tree fit / kneighbors / compact result; PNG — на подготовку "
+                "рёбер и рендер; RSS шаг 20 мс"
+            )
+            self.progress.log_info(
+                "Экспорт KNN: "
+                f"NPZ={'вкл' if bool(getattr(task, 'output_knn_npz', True)) else 'выкл'}, "
+                f"TXT={'вкл' if bool(getattr(task, 'output_knn_text', False)) else 'выкл'}, "
+                f"PNG={'вкл' if bool(getattr(task, 'output_knn_image', False)) else 'выкл'}, "
+                f"лимит PNG={int(getattr(task, 'knn_png_max_points', 50000))}"
+            )
 
         branches = []
         if row_var:
@@ -955,6 +1048,11 @@ class ImageProcessor:
 
         from compute.extremes.interpolator import Interpolator
         interpolator = Interpolator(self.backend) if plan.envelopes else None
+        if plan.envelopes:
+            self.progress.log_info(
+                "Огибающие: grouped PCHIP, sparse CPU path "
+                "(без плотной H×W матрицы огибающей)"
+            )
 
         for branch in branches:
             type_data = branch["type_data"]
@@ -989,12 +1087,19 @@ class ImageProcessor:
                     # Every source branch reads only its own coefficient tensor.
                     coefs_2d = task.result[type_data][channel][scale_index]
 
+                    extrema_distance = int(getattr(task, "extrema_distance", 1))
+                    extrema_prominence = float(getattr(task, "extrema_prominence", 0.0))
                     detection_kwargs = {
                         "row_var": True,
                         "col_var": True,
                         "max_var": max_var,
                         "min_var": min_var,
+                        "distance": extrema_distance,
+                        "prominence": extrema_prominence,
                     }
+                    filtered_extrema = (
+                        extrema_distance > 1 or extrema_prominence > 0.0
+                    )
                     extrema_stage = (
                         f"extrema:{cwt_axis}:{channel_code}:{float(scale_value):g}"
                     )
@@ -1008,12 +1113,12 @@ class ImageProcessor:
                     if extrema_cache_complete:
                         for feature_axis in ("row", "col"):
                             if max_var:
-                                cached_extrema[(feature_axis, "max")] = _load_point_cache(
+                                cached_extrema[(feature_axis, "max")] = _read_point_cache(
                                     resume_cache_folder, "ext", cwt_axis, feature_axis,
                                     channel_code, scale_value, "max"
                                 )
                             if min_var:
-                                cached_extrema[(feature_axis, "min")] = _load_point_cache(
+                                cached_extrema[(feature_axis, "min")] = _read_point_cache(
                                     resume_cache_folder, "ext", cwt_axis, feature_axis,
                                     channel_code, scale_value, "min"
                                 )
@@ -1022,6 +1127,7 @@ class ImageProcessor:
                         )
 
                     if extrema_cache_complete:
+                        extrema_profile.record_cache_hit()
                         pmaxr = cached_extrema.get(("row", "max"), [])
                         pmaxc = cached_extrema.get(("col", "max"), [])
                         pminr = cached_extrema.get(("row", "min"), [])
@@ -1032,50 +1138,77 @@ class ImageProcessor:
                                 details={"reused": True},
                             )
                     else:
-                        if self.backend.use_gpu:
-                            try:
-                                detected = ExtremesFinder.find_extremes_gpu(
-                                    coefs_2d, **detection_kwargs
-                                )
-                                if protocol is not None:
-                                    protocol.record_stage(
-                                        extrema_stage, actual_backend="gpu", dtype=COMPUTE_DTYPE_NAME
+                        # ``distance``/``prominence`` use SciPy's 1-D peak
+                        # properties. For large 2500x2000 maps this CPU path is
+                        # deliberately preferred over thousands of tiny GPU
+                        # find_peaks launches; the unfiltered legacy-equivalent
+                        # case keeps the existing vectorized GPU detector.
+                        with extrema_profile.measure():
+                            if self.backend.use_gpu and not filtered_extrema:
+                                try:
+                                    gpu_detection_kwargs = {
+                                        key: value for key, value in detection_kwargs.items()
+                                        if key not in {"distance", "prominence"}
+                                    }
+                                    detected = ExtremesFinder.find_extremes_gpu(
+                                        coefs_2d, **gpu_detection_kwargs
                                     )
-                            except Exception as exc:
-                                fallback_error_names = {
-                                    "GPUUnavailableError", "GPUOutOfMemoryError",
-                                    "GPUDeviceLostError", "GPUCompatibilityError",
-                                }
-                                if exc.__class__.__name__ not in fallback_error_names:
-                                    raise
-                                if (protocol is not None and protocol.strict_backend) or getattr(self.backend, "strict_backend", False):
-                                    raise
-                                if protocol is not None:
-                                    protocol.record_fallback(
-                                        extrema_stage, reason=exc.__class__.__name__,
-                                        message=str(exc),
+                                    if protocol is not None:
+                                        protocol.record_stage(
+                                            extrema_stage, actual_backend="gpu", dtype=COMPUTE_DTYPE_NAME
+                                        )
+                                except Exception as exc:
+                                    fallback_error_names = {
+                                        "GPUUnavailableError", "GPUOutOfMemoryError",
+                                        "GPUDeviceLostError", "GPUCompatibilityError",
+                                    }
+                                    if exc.__class__.__name__ not in fallback_error_names:
+                                        raise
+                                    if (protocol is not None and protocol.strict_backend) or getattr(self.backend, "strict_backend", False):
+                                        raise
+                                    if protocol is not None:
+                                        protocol.record_fallback(
+                                            extrema_stage, reason=exc.__class__.__name__,
+                                            message=str(exc),
+                                        )
+                                    self.progress.log_error(
+                                        f"GPU extrema недоступны ({exc.__class__.__name__}), переход на CPU"
                                     )
-                                self.progress.log_error(
-                                    f"GPU extrema недоступны ({exc.__class__.__name__}), переход на CPU"
-                                )
+                                    detected = self.find_extremes(
+                                        coefs=coefs_2d, **detection_kwargs
+                                    )
+                                    if protocol is not None:
+                                        protocol.record_stage(
+                                            extrema_stage, actual_backend="cpu", dtype=COMPUTE_DTYPE_NAME,
+                                            fallback=True,
+                                            details={"fallback_reason": exc.__class__.__name__},
+                                        )
+                            else:
                                 detected = self.find_extremes(
                                     coefs=coefs_2d, **detection_kwargs
                                 )
                                 if protocol is not None:
+                                    details = {
+                                        "distance": extrema_distance,
+                                        "prominence": extrema_prominence,
+                                    }
+                                    if self.backend.use_gpu and filtered_extrema:
+                                        details["policy"] = "scipy-filtered-extrema-on-cpu"
                                     protocol.record_stage(
-                                        extrema_stage, actual_backend="cpu", dtype=COMPUTE_DTYPE_NAME,
-                                        fallback=True,
-                                        details={"fallback_reason": exc.__class__.__name__},
+                                        extrema_stage, actual_backend="cpu",
+                                        dtype=COMPUTE_DTYPE_NAME, details=details
                                     )
-                        else:
-                            detected = self.find_extremes(
-                                coefs=coefs_2d, **detection_kwargs
-                            )
-                            if protocol is not None:
-                                protocol.record_stage(
-                                    extrema_stage, actual_backend="cpu", dtype=COMPUTE_DTYPE_NAME
-                                )
                         coefs_2d, pmaxr, pmaxc, pminr, pminc = detected
+
+                    # From this point onward all point clouds use one compact
+                    # Nx2 int32 representation.  This avoids carrying millions
+                    # of Python lists/integers through cache, export and KNN.
+                    with point_profiles["compact"].measure():
+                        pmaxr = self._valid_point_collection(pmaxr)
+                        pmaxc = self._valid_point_collection(pmaxc)
+                        pminr = self._valid_point_collection(pminr)
+                        pminc = self._valid_point_collection(pminc)
+
                     scale_folder = self.find_scale_folder(task, scale_value)
                     knn_extremes = {
                         "type_data": type_data,
@@ -1105,13 +1238,15 @@ class ImageProcessor:
                         # Persist raw extrema independently of user export
                         # settings so a later stage can be calculated without
                         # repeating detection.  Empty results are cached too.
-                        if max_var and resume_cache_folder:
-                            _save_point_cache(
+                        if max_var and resume_cache_folder and not extrema_cache_complete:
+                            _write_point_cache(
+                                "cache_write_extrema",
                                 resume_cache_folder, "ext", cwt_axis, feature_axis,
                                 channel_code, scale_value, "max", raw_max
                             )
-                        if min_var and resume_cache_folder:
-                            _save_point_cache(
+                        if min_var and resume_cache_folder and not extrema_cache_complete:
+                            _write_point_cache(
+                                "cache_write_extrema",
                                 resume_cache_folder, "ext", cwt_axis, feature_axis,
                                 channel_code, scale_value, "min", raw_min
                             )
@@ -1132,12 +1267,12 @@ class ImageProcessor:
                             envelope_cache_complete = False
                             if reuse_envelopes_allowed and extrema_cache_complete:
                                 if max_var:
-                                    cached_upper = _load_point_cache(
+                                    cached_upper = _read_point_cache(
                                         resume_cache_folder, "env", cwt_axis, feature_axis,
                                         channel_code, scale_value, "upper"
                                     )
                                 if min_var:
-                                    cached_lower = _load_point_cache(
+                                    cached_lower = _read_point_cache(
                                         resume_cache_folder, "env", cwt_axis, feature_axis,
                                         channel_code, scale_value, "lower"
                                     )
@@ -1146,30 +1281,50 @@ class ImageProcessor:
                                     and (not min_var or cached_lower is not None)
                                 )
 
+                            total_envelope_input_points += len(raw_max) + len(raw_min)
                             if envelope_cache_complete:
-                                upper_points = cached_upper or []
-                                lower_points = cached_lower or []
+                                envelope_profile.record_cache_hit()
+                                upper_points = (
+                                    cached_upper if cached_upper is not None
+                                    else np.empty((0, 2), dtype=np.int32)
+                                )
+                                lower_points = (
+                                    cached_lower if cached_lower is not None
+                                    else np.empty((0, 2), dtype=np.int32)
+                                )
                                 if protocol is not None:
                                     protocol.record_stage(
                                         envelope_stage, actual_backend="disk-cache", dtype="int32",
                                         details={"reused": True},
                                     )
                             else:
-                                upper_points, lower_points = interpolator.get_envelopes(
-                                    coefs_2d, raw_max, raw_min,
-                                    direction=feature_axis,
-                                    protocol=protocol,
-                                    stage=envelope_stage,
-                                )
-                        upper_points = self._valid_point_collection(upper_points)
-                        lower_points = self._valid_point_collection(lower_points)
-                        if plan.envelopes and max_var and resume_cache_folder:
-                            _save_point_cache(
+                                with envelope_profile.measure():
+                                    upper_points, lower_points = interpolator.get_envelopes(
+                                        coefs_2d, raw_max, raw_min,
+                                        direction=feature_axis,
+                                        protocol=protocol,
+                                        stage=envelope_stage,
+                                    )
+                        with point_profiles["compact"].measure():
+                            upper_points = self._valid_point_collection(upper_points)
+                            lower_points = self._valid_point_collection(lower_points)
+                        if plan.envelopes:
+                            total_envelope_points += len(upper_points) + len(lower_points)
+                        if (
+                            plan.envelopes and max_var and resume_cache_folder
+                            and not envelope_cache_complete
+                        ):
+                            _write_point_cache(
+                                "cache_write_envelopes",
                                 resume_cache_folder, "env", cwt_axis, feature_axis,
                                 channel_code, scale_value, "upper", upper_points
                             )
-                        if plan.envelopes and min_var and resume_cache_folder:
-                            _save_point_cache(
+                        if (
+                            plan.envelopes and min_var and resume_cache_folder
+                            and not envelope_cache_complete
+                        ):
+                            _write_point_cache(
+                                "cache_write_envelopes",
                                 resume_cache_folder, "env", cwt_axis, feature_axis,
                                 channel_code, scale_value, "lower", lower_points
                             )
@@ -1223,21 +1378,34 @@ class ImageProcessor:
                              task.output_envelopes_image),
                         )
                         for artifact, kind, points, enabled, save_text, save_image in exports:
-                            if not enabled or not points:
+                            if not enabled or len(points) == 0:
                                 continue
                             title = point_stem(
                                 artifact, cwt_axis, feature_axis,
                                 channel_code, scale_value, kind,
                             )
+                            profile_suffix = "extrema" if artifact == "ext" else "envelopes"
                             if save_text:
-                                self.save_extremes_to_file(
-                                    scale_folder, title, points
-                                )
+                                with point_profiles[f"text_export_{profile_suffix}"].measure():
+                                    self.save_extremes_to_file(
+                                        scale_folder, title, points
+                                    )
+                                if artifact == "ext":
+                                    point_profile_stats["extrema_text_files"] += 1
+                                    point_profile_stats["extrema_text_points"] += len(points)
+                                else:
+                                    point_profile_stats["envelope_text_files"] += 1
+                                    point_profile_stats["envelope_text_points"] += len(points)
                             if save_image:
-                                self.save_extremes_graphic(
-                                    scale_folder, title, points,
-                                    coefs_2d=coefs_2d,
-                                )
+                                with point_profiles[f"image_export_{profile_suffix}"].measure():
+                                    self.save_extremes_graphic(
+                                        scale_folder, title, points,
+                                        coefs_2d=coefs_2d,
+                                    )
+                                if artifact == "ext":
+                                    point_profile_stats["extrema_image_files"] += 1
+                                else:
+                                    point_profile_stats["envelope_image_files"] += 1
 
                     extremes.append(knn_extremes)
 
@@ -1248,29 +1416,39 @@ class ImageProcessor:
                         from compute.knn.knn_cpu import (
                             process_extremes_with_knn,
                         )
-                        knn_result = process_extremes_with_knn(
-                            knn_extremes,
-                            scale_folder,
-                            knn_var,
-                            task.original_image,
-                            knn_bool_text_var,
-                            knn_bool_image_var,
-                            use_gpu=use_gpu_knn,
-                            source_direction=cwt_axis,
-                            progress_callback=self.progress.update_progress,
-                            log_callback=self.progress.log_info,
-                            protocol=protocol,
-                        )
-                        for point_type, payload in knn_result.items():
-                            if payload:
-                                task.knn_results[
-                                    (
-                                        cwt_axis,
-                                        channel_code,
-                                        float(scale_value),
-                                        point_type,
-                                    )
-                                ] = payload
+                        with knn_total_profile.measure():
+                            knn_result = process_extremes_with_knn(
+                                knn_extremes,
+                                scale_folder,
+                                knn_var,
+                                task.original_image,
+                                knn_bool_text_var,
+                                knn_bool_image_var,
+                                use_gpu=use_gpu_knn,
+                                source_direction=cwt_axis,
+                                progress_callback=self.progress.update_progress,
+                                log_callback=self.progress.log_info,
+                                protocol=protocol,
+                                profiling=knn_profiles,
+                                profiling_stats=knn_profile_stats,
+                                print_npz_var=bool(
+                                    getattr(task, "output_knn_npz", True)
+                                ),
+                                png_max_points=int(
+                                    getattr(task, "knn_png_max_points", 50000)
+                                ),
+                            )
+                        with point_profiles["knn_result_store"].measure():
+                            for point_type, payload in knn_result.items():
+                                if payload:
+                                    task.knn_results[
+                                        (
+                                            cwt_axis,
+                                            channel_code,
+                                            float(scale_value),
+                                            point_type,
+                                        )
+                                    ] = payload
 
                 if plan.statistics:
                     for feature in feature_axes:
@@ -1309,20 +1487,185 @@ class ImageProcessor:
                         row_sync_metrics=row_sync_metrics,
                     )
 
+        point_pipeline_seconds = _profile_time.perf_counter() - point_pipeline_started
+        point_pipeline_rss_end = current_rss_bytes()
+        scientific_stage_seconds = (
+            extrema_profile.compute_seconds
+            + envelope_profile.compute_seconds
+            + (knn_total_profile.compute_seconds if plan.knn else 0.0)
+        )
+        point_overhead_seconds = sum(
+            profile.compute_seconds for profile in point_profiles.values()
+        )
+        measured_stage_seconds = scientific_stage_seconds + point_overhead_seconds
+        other_seconds = max(0.0, point_pipeline_seconds - measured_stage_seconds)
+
         self.progress.update_progress(
-            0.95, "Завершение поиска экстремумов..."
+            0.95, "Завершение поиска экстремумов и огибающих..."
         )
         self.progress.log_info(
             f"Всего найдено точек экстремумов: {total_extrema_points}"
         )
-        self.progress.update_progress(1.0, "Поиск экстремумов завершен")
+        self.progress.log_info(
+            "Профиль Extrema — " + extrema_profile.summary()
+        )
+        if plan.envelopes:
+            self.progress.log_info(
+                f"Точки Envelopes: input={total_envelope_input_points}, "
+                f"output={total_envelope_points}"
+            )
+            self.progress.log_info(
+                "Профиль Envelopes — " + envelope_profile.summary()
+            )
+
+        self.progress.log_info(
+            "Point I/O workload — "
+            f"cache reads={point_profile_stats['cache_files_read']}, "
+            f"cache writes={point_profile_stats['cache_files_written']}, "
+            f"cache size={point_profile_stats['cache_bytes_written'] / (1024 ** 2):.1f} MiB, "
+            f"Extrema TXT={point_profile_stats['extrema_text_files']} files/"
+            f"{point_profile_stats['extrema_text_points']} points, "
+            f"Envelopes TXT={point_profile_stats['envelope_text_files']} files/"
+            f"{point_profile_stats['envelope_text_points']} points, "
+            f"Extrema PNG={point_profile_stats['extrema_image_files']}, "
+            f"Envelopes PNG={point_profile_stats['envelope_image_files']}"
+        )
+        point_profile_labels = (
+            ("compact arrays", "compact"),
+            ("cache read", "cache_read"),
+            ("Extrema cache write", "cache_write_extrema"),
+            ("Envelopes cache write", "cache_write_envelopes"),
+            ("Extrema TXT export", "text_export_extrema"),
+            ("Envelopes TXT export", "text_export_envelopes"),
+            ("Extrema PNG export", "image_export_extrema"),
+            ("Envelopes PNG export", "image_export_envelopes"),
+            ("KNN result store", "knn_result_store"),
+        )
+        for label, key in point_profile_labels:
+            if point_profiles[key].computed_calls:
+                self.progress.log_info(
+                    f"Профиль Point {label} — " + point_profiles[key].summary()
+                )
+
+        if plan.knn:
+            self.progress.log_info(
+                "KNN workload — "
+                f"groups={knn_profile_stats['groups']}, "
+                f"points={knn_profile_stats['points']}, "
+                f"links={knn_profile_stats['links']}, "
+                f"compact stored={knn_profile_stats['stored_bytes'] / (1024 ** 2):.1f} MiB, "
+                f"NPZ files={knn_profile_stats['npz_files']}, "
+                f"NPZ size={knn_profile_stats['npz_bytes'] / (1024 ** 2):.1f} MiB, "
+                f"TXT files={knn_profile_stats['text_files']}, "
+                f"TXT rows={knn_profile_stats['text_rows']}, "
+                f"PNG files={knn_profile_stats['image_files']}, "
+                f"PNG sampled={knn_profile_stats['image_sampled_files']}, "
+                f"PNG source points={knn_profile_stats['image_source_points']}/"
+                f"{knn_profile_stats['image_full_points']}, "
+                f"PNG edges={knn_profile_stats['image_edges_rendered']}"
+            )
+            self.progress.log_info(
+                "Профиль KNN total — " + knn_total_profile.summary()
+            )
+            self.progress.log_info(
+                "Профиль KNN prepare — " + knn_profiles["points_prepare"].summary()
+            )
+            self.progress.log_info(
+                "Профиль KNN search — " + knn_profiles["search_total"].summary()
+            )
+
+            # CPU-only detail. On a GPU run these profiles remain at zero while
+            # ``KNN search`` still captures the complete GPU search time.
+            cpu_search_profiles = (
+                ("fit", "cpu_fit"),
+                ("kneighbors", "cpu_kneighbors"),
+                ("compact result", "cpu_compact_result"),
+            )
+            for label, key in cpu_search_profiles:
+                if knn_profiles[key].computed_calls:
+                    self.progress.log_info(
+                        f"Профиль KNN CPU {label} — " + knn_profiles[key].summary()
+                    )
+
+            self.progress.log_info(
+                "Профиль KNN angles — " + knn_profiles["angles"].summary()
+            )
+            if knn_profiles["npz_export"].computed_calls:
+                self.progress.log_info(
+                    "Профиль KNN NPZ export — "
+                    + knn_profiles["npz_export"].summary()
+                )
+            if knn_profiles["text_export"].computed_calls:
+                self.progress.log_info(
+                    "Профиль KNN TXT export — "
+                    + knn_profiles["text_export"].summary()
+                )
+            if knn_profiles["image_export"].computed_calls:
+                self.progress.log_info(
+                    "Профиль KNN PNG export — "
+                    + knn_profiles["image_export"].summary()
+                )
+            if knn_profiles["image_edges"].computed_calls:
+                self.progress.log_info(
+                    "Профиль KNN PNG edges — "
+                    + knn_profiles["image_edges"].summary()
+                )
+            if knn_profiles["gc"].computed_calls:
+                self.progress.log_info(
+                    "Профиль KNN GC — " + knn_profiles["gc"].summary()
+                )
+
+            # These phases do not overlap with each other. ``search_total``
+            # already contains the CPU fit/query/compact-result detail; PNG
+            # edge preparation is nested in image_export, so both nested
+            # profiles are intentionally excluded from the component sum.
+            knn_component_seconds = sum(
+                knn_profiles[key].compute_seconds
+                for key in (
+                    "points_prepare",
+                    "search_total",
+                    "angles",
+                    "npz_export",
+                    "text_export",
+                    "image_export",
+                    "gc",
+                )
+            )
+            knn_unprofiled_seconds = max(
+                0.0, knn_total_profile.compute_seconds - knn_component_seconds
+            )
+            self.progress.log_info(
+                "Профиль KNN breakdown — "
+                f"components={knn_component_seconds:.3f} s, "
+                f"residual/bookkeeping={knn_unprofiled_seconds:.3f} s"
+            )
+
+        self.progress.log_info(
+            "Профиль point pipeline — "
+            f"wall={point_pipeline_seconds:.3f} s, "
+            f"scientific stages={scientific_stage_seconds:.3f} s, "
+            f"profiled point I/O/representation={point_overhead_seconds:.3f} s, "
+            f"unprofiled residual={other_seconds:.3f} s, "
+            f"RSS start={format_mib(point_pipeline_rss_start)}, "
+            f"end={format_mib(point_pipeline_rss_end)}"
+        )
+        self.progress.update_progress(1.0, "Экстремумы и огибающие завершены")
         return extremes
 
     @staticmethod
     def _valid_point_collection(points):
-        if not isinstance(points, (list, np.ndarray)) or len(points) == 0:
-            return []
-        return points.tolist() if isinstance(points, np.ndarray) else points
+        """Normalize a point cloud to compact contiguous Nx2 int32 storage.
+
+        Scientific coordinates are unchanged; only their in-memory
+        representation changes from Python nested lists to a NumPy matrix.
+        """
+        if points is None:
+            return np.empty((0, 2), dtype=np.int32)
+        array = np.asarray(points, dtype=np.int32)
+        if array.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        array = array.reshape(-1, 2)
+        return np.ascontiguousarray(array, dtype=np.int32)
 
     def _save_direction_statistics(
             self, *, task, branch, feature, channel_name, channel_code, scales,
@@ -1471,16 +1814,20 @@ class ImageProcessor:
 
     @staticmethod
     def save_extremes_to_file(path, title, local_points):
-        """Сохранение точек экстремумов в файл"""
+        """Сохранить Nx2 координаты точек в прежнем TXT-формате.
+
+        ``numpy.savetxt`` пишет непосредственно из компактной int32-матрицы и
+        не требует создавать Python-строку для каждой точки в коде проекта.
+        Формат файла остаётся ``x, y`` и совместим со старыми результатами.
+        """
         if local_points is None or len(local_points) == 0:
             print(f"Нет точек для сохранения в {title}")
             return
 
         file_path = os.path.join(path, f"{title}.txt")
         try:
-            with open(file_path, 'w', encoding='utf-8') as file:
-                for point in local_points:
-                    file.write(f"{point[0]}, {point[1]}\n")
+            points = np.asarray(local_points, dtype=np.int32).reshape(-1, 2)
+            np.savetxt(file_path, points, fmt="%d, %d")
             print(f"Файл сохранён: {file_path}")
         except Exception as e:
             print(f"Ошибка при сохранении файла {file_path}: {str(e)}")
@@ -2783,9 +3130,11 @@ class App(TkinterApp):
         self.knn_text_var.trace('w', self.update_knn_for_current_task)
         for variable in (
                 self.row_var, self.col_var, self.max_var, self.min_var,
+                self.extrema_distance_var, self.extrema_prominence_var,
                 self.wp_var1, self.wp_var2, self.p_ex_var1, self.p_ex_var2,
                 self.envelope_text_var, self.envelope_image_var,
-                self.knn_bool_text_var, self.knn_bool_image_var,
+                self.knn_bool_npz_var, self.knn_bool_text_var, self.knn_bool_image_var,
+                self.knn_png_max_points_var,
                 self.calculate_extrema_var, self.calculate_envelopes_var,
                 self.calculate_knn_var,
                 self.print_channels_txt_var, self.centering_means_var,
@@ -3236,6 +3585,8 @@ class App(TkinterApp):
         self.col_var = tk.BooleanVar(value=True)
         self.max_var = tk.BooleanVar(value=True)
         self.min_var = tk.BooleanVar(value=True)
+        self.extrema_distance_var = tk.StringVar(value="1")
+        self.extrema_prominence_var = tk.StringVar(value="0.0")
         self.wp_var1 = tk.BooleanVar(value=False)
         self.wp_var2 = tk.BooleanVar(value=True)
         self.wavelet_numpy_var = tk.BooleanVar(value=False)
@@ -3243,8 +3594,10 @@ class App(TkinterApp):
         self.p_ex_var2 = tk.BooleanVar(value=False)
         self.envelope_text_var = tk.BooleanVar(value=True)
         self.envelope_image_var = tk.BooleanVar(value=False)
-        self.knn_bool_text_var = tk.BooleanVar(value=True)
+        self.knn_bool_npz_var = tk.BooleanVar(value=True)
+        self.knn_bool_text_var = tk.BooleanVar(value=False)
         self.knn_bool_image_var = tk.BooleanVar(value=False)
+        self.knn_png_max_points_var = tk.StringVar(value="50000")
         self.print_channels_txt_var = tk.BooleanVar(value=False)
         self.centering_means_var = tk.BooleanVar(value=False)
         self.calculate_statistics_var = tk.BooleanVar(value=False)
@@ -5546,6 +5899,48 @@ class App(TkinterApp):
         )
         self.min_checkbox.pack(anchor="w", pady=3)
 
+        filter_frame = ctk.CTkFrame(grid, fg_color="transparent")
+        filter_frame.grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0)
+        )
+        filter_frame.grid_columnconfigure((0, 1), weight=1, uniform="extrema_filters")
+
+        distance_box = ctk.CTkFrame(filter_frame, fg_color="transparent")
+        distance_box.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        ctk.CTkLabel(
+            distance_box, text="Минимальное расстояние (distance), пикс.:",
+            font=AppTheme.body_font(), anchor="w"
+        ).pack(fill="x", pady=(0, 4))
+        self.extrema_distance_entry = ctk.CTkEntry(
+            distance_box, textvariable=self.extrema_distance_var,
+            placeholder_text="1"
+        )
+        self.extrema_distance_entry.pack(fill="x")
+        self.extrema_distance_tooltip = HoverTooltip(
+            self.extrema_distance_entry,
+            text=("Минимальное расстояние между соседними экстремумами "
+                  "вдоль строки/столбца. 1 — без дополнительного фильтра."),
+            delay_ms=350, wraplength=360,
+        )
+
+        prominence_box = ctk.CTkFrame(filter_frame, fg_color="transparent")
+        prominence_box.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+        ctk.CTkLabel(
+            prominence_box, text="Проминентность (prominence):",
+            font=AppTheme.body_font(), anchor="w"
+        ).pack(fill="x", pady=(0, 4))
+        self.extrema_prominence_entry = ctk.CTkEntry(
+            prominence_box, textvariable=self.extrema_prominence_var,
+            placeholder_text="0.0"
+        )
+        self.extrema_prominence_entry.pack(fill="x")
+        self.extrema_prominence_tooltip = HoverTooltip(
+            self.extrema_prominence_entry,
+            text=("Минимальная выраженность экстремума в единицах "
+                  "коэффициентов CWT. 0 — без дополнительного фильтра."),
+            delay_ms=350, wraplength=360,
+        )
+
         self.extremes_hint_label = ctk.CTkLabel(
             self.extremes_section.content,
             text=("Для каждого выбранного CWT экстремумы ищутся "
@@ -5894,6 +6289,12 @@ class App(TkinterApp):
             self.col_var.set(self.current_task.process_columns)
             self.max_var.set(self.current_task.find_maxima)
             self.min_var.set(self.current_task.find_minima)
+            self.extrema_distance_var.set(
+                str(int(getattr(self.current_task, "extrema_distance", 1)))
+            )
+            self.extrema_prominence_var.set(
+                f"{float(getattr(self.current_task, 'extrema_prominence', 0.0)):g}"
+            )
             self.pipeline_preset_var.set(self.current_task.pipeline_preset)
             self.calculate_extrema_var.set(
                 self.current_task.calculate_extrema
@@ -5913,8 +6314,14 @@ class App(TkinterApp):
             self.envelope_image_var.set(
                 self.current_task.output_envelopes_image
             )
+            self.knn_bool_npz_var.set(
+                bool(getattr(self.current_task, "output_knn_npz", True))
+            )
             self.knn_bool_text_var.set(self.current_task.output_knn_text)
             self.knn_bool_image_var.set(self.current_task.output_knn_image)
+            self.knn_png_max_points_var.set(
+                str(int(getattr(self.current_task, "knn_png_max_points", 50000)))
+            )
             self.print_channels_txt_var.set(self.current_task.save_source_channels)
             self.centering_means_var.set(
                 self.current_task.save_centering_means
@@ -6145,7 +6552,10 @@ class App(TkinterApp):
         """Enable point stages when either independent 1D branch exists."""
         state = "normal" if enabled else "disabled"
         for widget in (
-                self.max_checkbox, self.min_checkbox, self.entry_near_point,
+                self.max_checkbox, self.min_checkbox,
+                getattr(self, "extrema_distance_entry", None),
+                getattr(self, "extrema_prominence_entry", None),
+                self.entry_near_point,
         ):
             if widget is not None:
                 widget.configure(state=state)
@@ -6350,6 +6760,20 @@ class App(TkinterApp):
         task.process_columns = bool(self.col_var.get())
         task.find_maxima = bool(self.max_var.get())
         task.find_minima = bool(self.min_var.get())
+        try:
+            distance = int(self.extrema_distance_var.get().strip())
+            if distance >= 1:
+                task.extrema_distance = distance
+        except (TypeError, ValueError):
+            pass
+        try:
+            prominence = float(
+                self.extrema_prominence_var.get().strip().replace(',', '.')
+            )
+            if np.isfinite(prominence) and prominence >= 0.0:
+                task.extrema_prominence = prominence
+        except (TypeError, ValueError):
+            pass
         task.calculate_extrema = bool(self.calculate_extrema_var.get())
         task.calculate_envelopes = bool(self.calculate_envelopes_var.get())
         task.calculate_knn = bool(self.calculate_knn_var.get())
@@ -6360,8 +6784,15 @@ class App(TkinterApp):
         task.output_extremes_image = bool(self.p_ex_var2.get())
         task.output_envelopes_text = bool(self.envelope_text_var.get())
         task.output_envelopes_image = bool(self.envelope_image_var.get())
+        task.output_knn_npz = bool(self.knn_bool_npz_var.get())
         task.output_knn_text = bool(self.knn_bool_text_var.get())
         task.output_knn_image = bool(self.knn_bool_image_var.get())
+        try:
+            png_limit = int(self.knn_png_max_points_var.get().strip())
+            if png_limit >= 0:
+                task.knn_png_max_points = png_limit
+        except (TypeError, ValueError):
+            pass
         task.save_source_channels = bool(self.print_channels_txt_var.get())
         task.save_centering_means = bool(self.centering_means_var.get())
         task.strict_backend = bool(self.strict_backend_var.get())
@@ -6711,12 +7142,20 @@ class App(TkinterApp):
             widget.configure(state="normal" if plan.knn else "disabled")
 
         point_state = "normal" if plan.extrema else "disabled"
-        for widget in (self.max_checkbox, self.min_checkbox):
+        for widget in (
+                self.max_checkbox, self.min_checkbox,
+                getattr(self, "extrema_distance_entry", None),
+                getattr(self, "extrema_prominence_entry", None),
+        ):
             if widget is not None:
                 widget.configure(state=point_state)
 
         if self.entry_near_point is not None:
             self.entry_near_point.configure(state="normal" if plan.knn else "disabled")
+        if getattr(self, "knn_png_max_points_entry", None) is not None:
+            self.knn_png_max_points_entry.configure(
+                state="normal" if plan.knn else "disabled"
+            )
 
         if getattr(self, "pipeline_stage_status_label", None) is not None:
             try:
@@ -6777,13 +7216,13 @@ class App(TkinterApp):
         self.synchronization_output_widgets = []
 
     def _setup_export_results_section(self):
-        """Единая таблица экспорта: текстовый файл и PNG."""
+        """Единая таблица экспорта; KNN имеет быстрый полный формат NPZ."""
         table = ctk.CTkFrame(self.export_section.content, fg_color="transparent")
         self.export_section.add_widget(table, pady=0)
         table.grid_columnconfigure(0, weight=2)
-        table.grid_columnconfigure((1, 2), weight=1, uniform="export_formats")
+        table.grid_columnconfigure((1, 2, 3), weight=1, uniform="export_formats")
 
-        headers = ("Результат", "Текстовый файл", "PNG")
+        headers = ("Результат", "TXT/CSV", "NPZ", "PNG")
         for column, title in enumerate(headers):
             ctk.CTkLabel(
                 table, text=title, font=AppTheme.section_title_font(),
@@ -6791,11 +7230,11 @@ class App(TkinterApp):
             ).grid(row=0, column=column, sticky="ew", padx=8, pady=(4, 7))
 
         rows = [
-            ("Вейвлеты", self.wp_var2, self.wp_var1, "wavelet"),
-            ("Экстремумы", self.p_ex_var1, self.p_ex_var2, "extrema"),
-            ("Огибающие", self.envelope_text_var, self.envelope_image_var, "envelopes"),
-            ("KNN и углы", self.knn_bool_text_var, self.knn_bool_image_var, "knn"),
-            ("Статистики", self.statistics_csv_var, self.statistics_image_var, "statistics"),
+            ("Вейвлеты", self.wp_var2, None, self.wp_var1, "wavelet"),
+            ("Экстремумы", self.p_ex_var1, None, self.p_ex_var2, "extrema"),
+            ("Огибающие", self.envelope_text_var, None, self.envelope_image_var, "envelopes"),
+            ("KNN и углы", self.knn_bool_text_var, self.knn_bool_npz_var, self.knn_bool_image_var, "knn"),
+            ("Статистики", self.statistics_csv_var, None, self.statistics_image_var, "statistics"),
         ]
         self.extremes_output_widgets = []
         self.envelopes_output_widgets = []
@@ -6803,7 +7242,7 @@ class App(TkinterApp):
         self.statistics_output_widgets = []
         self.export_result_rows = {}
 
-        for row_index, (label, text_var, png_var, kind) in enumerate(rows, start=1):
+        for row_index, (label, text_var, npz_var, png_var, kind) in enumerate(rows, start=1):
             label_widget = ctk.CTkLabel(table, text=label, anchor="w")
             label_widget.grid(
                 row=row_index, column=0, sticky="ew", padx=8, pady=3
@@ -6814,15 +7253,23 @@ class App(TkinterApp):
             )
             text_cb.grid(row=row_index, column=1, pady=3)
 
+            if npz_var is None:
+                npz_widget = ctk.CTkLabel(
+                    table, text="—", text_color=AppTheme.TEXT_SECONDARY
+                )
+            else:
+                npz_widget = ctk.CTkCheckBox(
+                    table, text="", variable=npz_var, width=24
+                )
+            npz_widget.grid(row=row_index, column=2, pady=3)
+
             png_cb = ctk.CTkCheckBox(
                 table, text="", variable=png_var, width=24
             )
-            png_cb.grid(row=row_index, column=2, pady=3)
+            png_cb.grid(row=row_index, column=3, pady=3)
 
             self.export_result_rows[kind] = (
-                label_widget,
-                text_cb,
-                png_cb,
+                label_widget, text_cb, npz_widget, png_cb,
             )
 
             if kind == "extrema":
@@ -6830,7 +7277,7 @@ class App(TkinterApp):
             elif kind == "envelopes":
                 self.envelopes_output_widgets.extend([text_cb, png_cb])
             elif kind == "knn":
-                self.knn_output_widgets.extend([text_cb, png_cb])
+                self.knn_output_widgets.extend([text_cb, npz_widget, png_cb])
             elif kind == "statistics":
                 self.statistics_output_widgets.extend([text_cb, png_cb])
 
@@ -6838,7 +7285,7 @@ class App(TkinterApp):
         # Остальные строки покажет _update_export_rows_visibility().
         self._update_export_rows_visibility()
 
-        # NPY больше не является пользовательским форматом экспорта.
+        # NPY больше не является пользовательским форматом экспорта CWT.
         self.wavelet_numpy_var.set(False)
 
     def _update_export_rows_visibility(self):
@@ -7086,7 +7533,7 @@ class App(TkinterApp):
             widget.configure(state=state)
 
     def _setup_knn_section(self):
-        """Параметры KNN и форматы экспорта."""
+        """Параметры KNN, lossless NPZ и ограниченная PNG-визуализация."""
         ctk.CTkLabel(
             self.knn_section.content, text="Количество ближайших точек:",
             font=AppTheme.body_font(), anchor="w"
@@ -7104,17 +7551,47 @@ class App(TkinterApp):
             self.knn_section.content, text="Экспорт результатов KNN и углов:",
             font=AppTheme.body_font(), anchor="w"
         ).pack(fill="x", padx=5, pady=(0, 6))
+
+        self.knn_npz_checkbox = ctk.CTkCheckBox(
+            self.knn_section.content,
+            text="Данные NPZ — полный быстрый формат (рекомендуется)",
+            variable=self.knn_bool_npz_var
+        )
+        self.knn_section.add_widget(self.knn_npz_checkbox, fill="x")
+
         self.knn_text_checkbox = ctk.CTkCheckBox(
-            self.knn_section.content, text="Данные TXT",
+            self.knn_section.content,
+            text="Данные TXT — человекочитаемый экспорт",
             variable=self.knn_bool_text_var
         )
         self.knn_section.add_widget(self.knn_text_checkbox, fill="x")
+
         self.knn_image_checkbox = ctk.CTkCheckBox(
             self.knn_section.content, text="Изображение PNG",
             variable=self.knn_bool_image_var
         )
         self.knn_section.add_widget(self.knn_image_checkbox, fill="x")
-        self.knn_output_widgets = [self.knn_text_checkbox, self.knn_image_checkbox]
+
+        ctk.CTkLabel(
+            self.knn_section.content,
+            text=(
+                "Максимум исходных точек для PNG. "
+                "0 = отрисовать все; на численные KNN/NPZ это не влияет:"
+            ),
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w", justify="left", wraplength=600
+        ).pack(fill="x", padx=5, pady=(10, 4))
+        self.knn_png_max_points_entry = ctk.CTkEntry(
+            self.knn_section.content,
+            textvariable=self.knn_png_max_points_var,
+            placeholder_text="50000"
+        )
+        self.knn_section.add_widget(self.knn_png_max_points_entry, pady=(0, 8))
+
+        existing_knn_widgets = list(getattr(self, "knn_output_widgets", []))
+        self.knn_output_widgets = existing_knn_widgets + [
+            self.knn_npz_checkbox, self.knn_text_checkbox, self.knn_image_checkbox
+        ]
 
     def _setup_intermediate_section(self):
         """Настройка секции промежуточных вычислений"""
@@ -7219,6 +7696,18 @@ class App(TkinterApp):
         if task is None or task not in self.image_processor.tasks:
             mb.showwarning('Выполнение', 'Выберите задачу для расчёта')
             return
+        if task.analysis_mode == "1d":
+            from compute.extremes.detection import normalize_peak_parameters
+            try:
+                distance, prominence = normalize_peak_parameters(
+                    self.extrema_distance_var.get().strip(),
+                    self.extrema_prominence_var.get().strip().replace(',', '.'),
+                )
+            except ValueError as error:
+                mb.showerror("Параметры экстремумов", str(error))
+                return
+            task.extrema_distance = distance
+            task.extrema_prominence = prominence
         self._store_settings_for_current_task()
         self._refresh_memory_estimate()
         self.progress_manager.run_control.reset()
@@ -7432,6 +7921,19 @@ class App(TkinterApp):
                     f"Задача {i + 1}: не выбран источник 1D CWT"
                 )
                 return
+            if task.analysis_mode == "1d":
+                from compute.extremes.detection import normalize_peak_parameters
+                try:
+                    normalize_peak_parameters(
+                        getattr(task, "extrema_distance", 1),
+                        getattr(task, "extrema_prominence", 0.0),
+                    )
+                except ValueError as error:
+                    mb.showerror(
+                        "Параметры экстремумов",
+                        f"Задача {i + 1}: {error}"
+                    )
+                    return
             if task.analysis_mode == "2d" and not task.orientations:
                 mb.showerror(
                     "Ошибка",

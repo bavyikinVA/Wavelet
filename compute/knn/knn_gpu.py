@@ -3,6 +3,7 @@ import time
 import cupy as cp
 import numpy as np
 from compute.backend_policy import GPUUnavailableError, classify_gpu_exception
+from compute.knn.result_format import make_compact_neighbors
 
 logger = logging.getLogger("WaveletApp")
 
@@ -221,16 +222,13 @@ class KNN_GPU:
                     peak_used_pool_mb = max(peak_used_pool_mb, mem_info["used_pool_mb"])
 
             # -------------------------------
-            # Формирование результата на CPU
+            # Компактный результат на CPU
             # -------------------------------
+            # all_indices/all_distances already have the target dtypes and
+            # shape (N, k); keep them as arrays instead of expanding them into
+            # millions of Python dictionaries/lists/scalars.
             t0 = time.perf_counter()
-            neighbors_dict = {
-                i: {
-                    "indices": all_indices[i].tolist(),
-                    "distances": all_distances[i].tolist(),
-                }
-                for i in range(n)
-            }
+            compact = make_compact_neighbors(all_indices, all_distances)
             finalize_time += time.perf_counter() - t0
 
             self.clear_cache()
@@ -252,7 +250,7 @@ class KNN_GPU:
                     f"peak_reserved_pool={peak_reserved_pool_mb:.1f} MB"
                 )
 
-            return neighbors_dict
+            return compact
 
         except Exception as e:
             self.clear_cache()

@@ -178,6 +178,10 @@ class ProcessingTask:
         self.process_columns = True
         self.find_maxima = True
         self.find_minima = True
+        # Peak filtering along each 1-D row/column.  Defaults preserve the
+        # historical strict-neighbour extrema detector.
+        self.extrema_distance = 1
+        self.extrema_prominence = 0.0
 
         # Параметры 2D Morlet
         self.orientations = [0.0, 45.0, 90.0, 135.0]
@@ -196,8 +200,13 @@ class ProcessingTask:
         self.output_extremes_image = False
         self.output_envelopes_text = True
         self.output_envelopes_image = False
-        self.output_knn_text = True
+        # KNN: NPZ is the primary lossless machine-readable export.
+        # TXT remains an optional human-readable export; PNG is a sampled
+        # visualization and never changes the full numerical KNN result.
+        self.output_knn_npz = True
+        self.output_knn_text = False
         self.output_knn_image = False
+        self.knn_png_max_points = 50000
         self.save_source_channels = False
         self.save_centering_means = False
 
@@ -465,7 +474,8 @@ class ProcessingTask:
         """Return only reproducible settings; image arrays and results are excluded."""
         fields = (
             "analysis_mode", "image_path", "process_rows", "process_columns",
-            "find_maxima", "find_minima", "gram_schmidt_applied",
+            "find_maxima", "find_minima", "extrema_distance",
+            "extrema_prominence", "gram_schmidt_applied",
             "detected_color_type", "grayscale_similarity",
             "channel_representation", "rgb_channel_mode",
             "rgb_single_channel", "grayscale_method",
@@ -475,7 +485,8 @@ class ProcessingTask:
             "calculate_synchronization", "output_wavelet_image",
             "output_wavelet_text", "output_wavelet_numpy", "output_extremes_text",
             "output_extremes_image", "output_envelopes_text",
-            "output_envelopes_image", "output_knn_text", "output_knn_image",
+            "output_envelopes_image", "output_knn_npz", "output_knn_text",
+            "output_knn_image", "knn_png_max_points",
             "statistics_output_image", "statistics_output_csv",
             "synchronization_output_heatmap", "synchronization_output_matrix_csv",
             "synchronization_output_pairs_csv", "scale_block_sizes",
@@ -554,6 +565,10 @@ class ProcessingTask:
             point_types.append("минимумы")
         if self.resolve_pipeline().extrema and point_types:
             details.append(" + ".join(point_types))
+            details.append(
+                f"distance={int(self.extrema_distance)}, "
+                f"prominence={float(self.extrema_prominence):g}"
+            )
         if self.resolve_pipeline().statistics or self.resolve_pipeline().synchronization:
             details.append("блоки масштабов: " + ", ".join(map(str, self.scale_block_sizes)))
         if self.resolve_pipeline().synchronization:

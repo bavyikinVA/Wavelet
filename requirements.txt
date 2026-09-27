@@ -6,3 +6,5 @@ opencv-python==4.9.0.80
 pillow==10.3.0
 scikit-learn==1.6.1
 scipy==1.14.1
+
+psutil==7.0.0
