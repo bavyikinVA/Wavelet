@@ -301,8 +301,8 @@ class ProcessingTask:
         self.channel_representation = representation
         self.rgb_channel_mode = new_mode
         self.rgb_single_channel = new_single
-        self.gram_schmidt_applied = representation == "gram_schmidt"
         if changed:
+            self.gram_schmidt_applied = False
             self.invalidate_analysis_results()
 
     def analysis_channel_codes_for_settings(self):
@@ -598,7 +598,7 @@ class ProcessingTask:
                 self.channel_representation = "rgb"
                 self.rgb_channel_mode = "all"
                 self.rgb_single_channel = "R"
-        self.gram_schmidt_applied = self.channel_representation == "gram_schmidt"
+        self.gram_schmidt_applied = bool(snapshot.get("gram_schmidt_applied", False))
         self.analysis_data = []
         self.analysis_channel_keys = []
         self.analysis_channel_codes = []

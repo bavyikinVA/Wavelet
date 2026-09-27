@@ -97,7 +97,6 @@ class KNN_GPU:
             # Загрузка точек на GPU
             t0 = time.perf_counter()
             points_gpu = self.cp.asarray(points, dtype=self.cp.float32)
-            points_sq = self.cp.sum(points_gpu * points_gpu, axis=1)
             self._sync()
             upload_time += time.perf_counter() - t0
 
@@ -115,7 +114,6 @@ class KNN_GPU:
 
                 t0 = time.perf_counter()
                 query = points_gpu[q_start:q_end]
-                query_sq = self.cp.sum(query * query, axis=1)
                 self._sync()
                 compute_time += time.perf_counter() - t0
 
@@ -140,15 +138,25 @@ class KNN_GPU:
                     t0 = time.perf_counter()
 
                     ref = points_gpu[r_start:r_end]
-                    ref_sq = points_sq[r_start:r_end]
 
-                    dist = (
-                        query_sq[:, None]
-                        + ref_sq[None, :]
-                        - 2.0 * query @ ref.T
-                    )
-
-                    self.cp.maximum(dist, 0.0, out=dist)
+                    # Численно устойчивое квадратное евклидово расстояние.
+                    #
+                    # Не используем тождество
+                    #   ||q||^2 + ||r||^2 - 2 q·r,
+                    # потому что в float32 для близких точек с большими
+                    # абсолютными координатами оно приводит к катастрофической
+                    # потере точности. В аппаратной диагностике это давало
+                    # ошибки расстояния до ~1.18e-1 и даже меняло соседей.
+                    #
+                    # KNN-признаки проекта двумерны: point = (x, y).
+                    # Покомпонентная запись не создаёт временный 3-D массив
+                    # [query, ref, 2] и сохраняет пакетную модель использования
+                    # GPU-памяти.
+                    dx = query[:, 0, None] - ref[None, :, 0]
+                    dy = query[:, 1, None] - ref[None, :, 1]
+                    dist = dx * dx
+                    dist += dy * dy
+                    del dx, dy
 
                     # Явно исключаем self-neighbor. Раньше код выбирал k+1
                     # кандидатов и затем удалял первый после сортировки,
@@ -180,7 +188,7 @@ class KNN_GPU:
                     self._sync()
                     compute_time += time.perf_counter() - t0
 
-                    del ref, ref_sq, dist, global_idx, expanded_idx, combined_dist, combined_idx, idx_part, row_ids
+                    del ref, dist, global_idx, expanded_idx, combined_dist, combined_idx, idx_part, row_ids
 
                     if self.cleanup_each_ref_batch:
                         self.cp.get_default_memory_pool().free_all_blocks()
@@ -211,7 +219,7 @@ class KNN_GPU:
                 self._sync()
                 download_time += time.perf_counter() - t0
 
-                del query, query_sq, top_dist, top_idx, order
+                del query, top_dist, top_idx, order
 
                 if self.cleanup_each_query_batch:
                     self.cp.get_default_memory_pool().free_all_blocks()

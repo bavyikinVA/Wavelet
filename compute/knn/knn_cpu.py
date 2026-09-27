@@ -253,7 +253,7 @@ def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image
                 progress_callback=lambda p, m: update_progress(p * 0.4, m),
                 log_callback=log_callback,
                 protocol=protocol,
-                stage=f"knn:{source_direction}:{channel}:{scale}:{extreme_type}",
+                stage=f"knn:{source_direction}:{channel}:{float(scale):g}:{extreme_type}",
                 profiling=profiling,
             )
 

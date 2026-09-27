@@ -67,6 +67,8 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 
 import numpy as np
 from PIL import Image
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 from Gram_Shmidt import change_channels
 from history.source_image import save_run_image
@@ -241,6 +243,7 @@ class ImageProcessor:
         # изображение при этой проверке не преобразуется.
         change_channels(color1, color2, [[[0.0]], [[0.0]], [[0.0]]])
         task.color1, task.color2 = color1, color2
+        task.gram_schmidt_applied = False
         if task.channel_representation == "gram_schmidt":
             task.invalidate_analysis_results()
         self.progress.log_info("Цветовой базис Gram–Schmidt успешно выбран")
@@ -319,10 +322,13 @@ class ImageProcessor:
         change_channels(color1, color2, [[[0.0]], [[0.0]], [[0.0]]])
         if hasattr(task, "set_channel_analysis"):
             task.set_channel_analysis("gram_schmidt")
-        else:
-            task.gram_schmidt_applied = True
+        # Явная кнопка действительно выполняет преобразование полного изображения
+        # и сохраняет подготовленные GS1/GS2/GS3 в задаче. Перед CWT эти данные
+        # будут переиспользованы, пока базис/источник не изменятся.
+        prepare_task_channels(task)
+        task.gram_schmidt_applied = True
         self.progress.log_info(
-            "Для анализа выбрано представление Gram–Schmidt (GS1/GS2/GS3)"
+            "Преобразование Gram–Schmidt выполнено; подготовлены каналы GS1/GS2/GS3"
         )
 
     def load_scales_for_task(self, task, start, end, step):
@@ -1050,7 +1056,7 @@ class ImageProcessor:
         interpolator = Interpolator(self.backend) if plan.envelopes else None
         if plan.envelopes:
             self.progress.log_info(
-                "Огибающие: grouped PCHIP, sparse CPU path "
+                "Огибающие: grouped PCHIP, sparse CPU/GPU parity path "
                 "(без плотной H×W матрицы огибающей)"
             )
 
@@ -1138,66 +1144,52 @@ class ImageProcessor:
                                 details={"reused": True},
                             )
                     else:
-                        # ``distance``/``prominence`` use SciPy's 1-D peak
-                        # properties. For large 2500x2000 maps this CPU path is
-                        # deliberately preferred over thousands of tiny GPU
-                        # find_peaks launches; the unfiltered legacy-equivalent
-                        # case keeps the existing vectorized GPU detector.
+                        # Backend-invariant scientific contract: CPU and GPU
+                        # implement the same strict/distance/prominence semantics.
+                        # Device selection changes execution, not the definition
+                        # of an extremum.
                         with extrema_profile.measure():
-                            if self.backend.use_gpu and not filtered_extrema:
+                            if self.backend.use_gpu:
                                 try:
-                                    gpu_detection_kwargs = {
-                                        key: value for key, value in detection_kwargs.items()
-                                        if key not in {"distance", "prominence"}
-                                    }
                                     detected = ExtremesFinder.find_extremes_gpu(
-                                        coefs_2d, **gpu_detection_kwargs
+                                        coefs_2d, **detection_kwargs
                                     )
-                                    if protocol is not None:
-                                        protocol.record_stage(
-                                            extrema_stage, actual_backend="gpu", dtype=COMPUTE_DTYPE_NAME
-                                        )
-                                except Exception as exc:
-                                    fallback_error_names = {
-                                        "GPUUnavailableError", "GPUOutOfMemoryError",
-                                        "GPUDeviceLostError", "GPUCompatibilityError",
-                                    }
-                                    if exc.__class__.__name__ not in fallback_error_names:
-                                        raise
-                                    if (protocol is not None and protocol.strict_backend) or getattr(self.backend, "strict_backend", False):
+                                    extrema_backend = "gpu"
+                                    extrema_algorithm = "cupyx-find-peaks-parity"
+                                except GPU_FALLBACK_ERRORS as exc:
+                                    if self.backend.strict_backend or (
+                                        protocol is not None and protocol.strict_backend
+                                    ):
                                         raise
                                     if protocol is not None:
                                         protocol.record_fallback(
-                                            extrema_stage, reason=exc.__class__.__name__,
+                                            extrema_stage,
+                                            reason=exc.__class__.__name__,
                                             message=str(exc),
                                         )
-                                    self.progress.log_error(
-                                        f"GPU extrema недоступны ({exc.__class__.__name__}), переход на CPU"
-                                    )
                                     detected = self.find_extremes(
                                         coefs=coefs_2d, **detection_kwargs
                                     )
-                                    if protocol is not None:
-                                        protocol.record_stage(
-                                            extrema_stage, actual_backend="cpu", dtype=COMPUTE_DTYPE_NAME,
-                                            fallback=True,
-                                            details={"fallback_reason": exc.__class__.__name__},
-                                        )
+                                    extrema_backend = "cpu"
+                                    extrema_algorithm = "scipy-find-peaks-reference"
                             else:
                                 detected = self.find_extremes(
                                     coefs=coefs_2d, **detection_kwargs
                                 )
-                                if protocol is not None:
-                                    details = {
+                                extrema_backend = "cpu"
+                                extrema_algorithm = "scipy-find-peaks-reference"
+                            if protocol is not None:
+                                protocol.record_stage(
+                                    extrema_stage, actual_backend=extrema_backend,
+                                    dtype=COMPUTE_DTYPE_NAME,
+                                    fallback=(self.backend.use_gpu and extrema_backend == "cpu"),
+                                    details={
+                                        "algorithm": extrema_algorithm,
                                         "distance": extrema_distance,
                                         "prominence": extrema_prominence,
-                                    }
-                                    if self.backend.use_gpu and filtered_extrema:
-                                        details["policy"] = "scipy-filtered-extrema-on-cpu"
-                                    protocol.record_stage(
-                                        extrema_stage, actual_backend="cpu",
-                                        dtype=COMPUTE_DTYPE_NAME, details=details
-                                    )
+                                        "backend_policy": "cpu-gpu-mathematical-parity",
+                                    },
+                                )
                         coefs_2d, pmaxr, pmaxc, pminr, pminc = detected
 
                     # From this point onward all point clouds use one compact
@@ -3645,7 +3637,15 @@ class App(TkinterApp):
 
         # Widget references
         self.load_button = None
+        self.change_image_button = None
         self.print_load_image = None
+        self.channel_rgb_frame = None
+        self.channel_gram_frame = None
+        self.gram_colors_label = None
+        self.gram_color1_label = None
+        self.gram_color2_label = None
+        self.gram_color1_swatch = None
+        self.gram_color2_swatch = None
         self.pipette_button = None
         self.gram_shmidt_button = None
         self.channel_representation_menu = None
@@ -4268,7 +4268,7 @@ class App(TkinterApp):
             mb.showerror("Предыдущие запуски", f"Не удалось восстановить настройки: {error}")
 
     @staticmethod
-    def _add_tab_heading(parent, title, description):
+    def _add_tab_heading(parent, title, description=None):
         ctk.CTkLabel(
             parent,
             text=title,
@@ -4292,11 +4292,7 @@ class App(TkinterApp):
         scrollable = ScrollableFrame(panel)
         scrollable.pack(fill="both", expand=True)
         content = scrollable.scrollable_frame
-        self._add_tab_heading(
-            content,
-            "Подготовка данных",
-            "Загрузите изображение, выполните обрезку и при необходимости настройте цветовые каналы."
-        )
+        self._add_tab_heading(content, "Подготовка данных")
 
         self.load_section = CollapsibleFrame(content, title="Загрузка и обрезка")
         self.load_section.pack(fill="x", padx=5, pady=2)
@@ -5576,20 +5572,35 @@ class App(TkinterApp):
             )
 
     def _setup_load_section(self):
-        """Настройка секции загрузки изображения"""
+        """Настройка секции загрузки изображения."""
+        actions = ctk.CTkFrame(self.load_section.content, fg_color="transparent")
+        self.load_section.add_widget(actions, fill="x", pady=5)
+
+        # Размер не зависит от текста/состояния кнопки: интерфейс не "прыгает"
+        # после загрузки изображения.
         self.load_button = ctk.CTkButton(
-            self.load_section.content,
+            actions,
             text="Загрузить и обрезать изображение",
             command=self.load_image_callback,
-            width=AppTheme.ACTION_BUTTON_WIDTH,
-            height=AppTheme.BUTTON_HEIGHT,
+            width=280,
+            height=42,
             font=AppTheme.section_title_font(),
             fg_color=AppTheme.PRIMARY,
             hover_color=AppTheme.PRIMARY_HOVER
         )
-        self.load_section.add_widget(
-            self.load_button, fill="none", anchor="w", pady=5
+        self.load_button.pack(side="left")
+
+        self.change_image_button = ctk.CTkButton(
+            actions,
+            text="Изменить изображение",
+            command=self.load_image_callback,
+            width=175,
+            height=42,
+            font=AppTheme.body_font(),
+            fg_color=AppTheme.PRIMARY,
+            hover_color=AppTheme.PRIMARY_HOVER,
         )
+        # Кнопка появляется только после успешной загрузки.
 
         self.print_load_image = ctk.CTkLabel(
             self.load_section.content,
@@ -5597,13 +5608,38 @@ class App(TkinterApp):
             font=AppTheme.body_font(),
             text_color=AppTheme.MUTED,
             anchor="w",
-            wraplength=0  # Отключаем перенос текста
+            justify="left",
+            wraplength=0,
         )
         self.load_section.add_widget(self.print_load_image, pady=(0, 5))
 
+    @staticmethod
+    def _source_image_info(task):
+        """Метаданные исходного файла, а не выбранного представления анализа."""
+        if task is None or not task.image_path:
+            return "Изображение не загружено"
+        filename = os.path.basename(task.image_path)
+        try:
+            with Image.open(task.image_path) as source:
+                width, height = source.size
+                image_format = source.format or os.path.splitext(filename)[1].lstrip(".").upper() or "—"
+                mode = source.mode or "—"
+        except Exception:
+            if task.original_image is not None:
+                height, width = task.original_image.shape[:2]
+            else:
+                width = height = 0
+            image_format = os.path.splitext(filename)[1].lstrip(".").upper() or "—"
+            mode = "—"
+        return (
+            f"Файл: {filename}\n"
+            f"Размер: {width} × {height} px\n"
+            f"Формат: {image_format}\n"
+            f"Цветовая схема: {mode}"
+        )
 
     def _setup_channel_section(self):
-        """Явный выбор представления и каналов исследования."""
+        """Динамический выбор представления изображения."""
         representation_frame = ctk.CTkFrame(
             self.channel_section.content, fg_color="transparent"
         )
@@ -5631,77 +5667,238 @@ class App(TkinterApp):
         )
         self.channel_detection_label.pack(fill="x", pady=(5, 0))
 
-        rgb_frame = ctk.CTkFrame(
+        self.channel_rgb_frame = ctk.CTkFrame(
             self.channel_section.content, fg_color="transparent"
         )
-        self.channel_section.add_widget(rgb_frame, pady=(2, 6))
         ctk.CTkLabel(
-            rgb_frame, text="RGB-каналы:", font=AppTheme.body_font(), anchor="w"
+            self.channel_rgb_frame, text="RGB-каналы:",
+            font=AppTheme.body_font(), anchor="w"
         ).pack(fill="x")
-        controls = ctk.CTkFrame(rgb_frame, fg_color="transparent")
+        controls = ctk.CTkFrame(self.channel_rgb_frame, fg_color="transparent")
         controls.pack(fill="x", pady=(5, 0))
         self.rgb_mode_menu = ctk.CTkOptionMenu(
-            controls,
-            values=["Все RGB", "Один канал"],
+            controls, values=["Все RGB", "Один канал"],
             variable=self.rgb_channel_mode_var,
-            command=self._on_channel_settings_changed,
-            width=155,
+            command=self._on_channel_settings_changed, width=155,
         )
         self.rgb_mode_menu.pack(side="left")
         self.rgb_single_channel_menu = ctk.CTkOptionMenu(
-            controls,
-            values=["R", "G", "B"],
+            controls, values=["R", "G", "B"],
             variable=self.rgb_single_channel_var,
-            command=self._on_channel_settings_changed,
-            width=80,
+            command=self._on_channel_settings_changed, width=80,
         )
         self.rgb_single_channel_menu.pack(side="left", padx=(8, 0))
 
-        self.channel_effective_label = ctk.CTkLabel(
-            self.channel_section.content,
-            text="Будут рассчитаны: R, G, B",
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w",
-        )
-        self.channel_section.add_widget(
-            self.channel_effective_label, pady=(0, 8)
-        )
-
-        pipette_frame = ctk.CTkFrame(
+        self.channel_gram_frame = ctk.CTkFrame(
             self.channel_section.content, fg_color="transparent"
         )
-        self.channel_section.add_widget(pipette_frame, pady=2)
         ctk.CTkLabel(
-            pipette_frame,
-            text="Цветовой базис Gram–Schmidt:",
-            font=AppTheme.body_font(),
-            anchor="w",
+            self.channel_gram_frame, text="Опорные цвета Gram–Schmidt:",
+            font=AppTheme.body_font(), anchor="w",
         ).pack(fill="x")
-        self.pipette_button = ctk.CTkButton(
-            pipette_frame,
-            text="Выбрать цвета пипеткой",
-            command=self.pipette_channel,
-            width=AppTheme.ACTION_BUTTON_WIDTH,
-            height=AppTheme.BUTTON_HEIGHT,
-            font=AppTheme.body_font(),
+        self.gram_color1_row = ctk.CTkFrame(self.channel_gram_frame, fg_color="transparent")
+        self.gram_color1_row.pack(fill="x", pady=(4, 0))
+        self.gram_color1_swatch = ctk.CTkFrame(
+            self.gram_color1_row, width=12, height=12, corner_radius=2,
+            fg_color=AppTheme.BORDER,
         )
-        self.pipette_button.pack(anchor="w", pady=(5, 0))
+        self.gram_color1_swatch.pack(side="left", padx=(0, 7))
+        self.gram_color1_swatch.pack_propagate(False)
+        self.gram_color1_label = ctk.CTkLabel(
+            self.gram_color1_row, text="Цвет 1: —",
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY, anchor="w",
+        )
+        self.gram_color1_label.pack(side="left")
 
-        gram_frame = ctk.CTkFrame(
-            self.channel_section.content, fg_color="transparent"
+        self.gram_color2_row = ctk.CTkFrame(self.channel_gram_frame, fg_color="transparent")
+        self.gram_color2_row.pack(fill="x", pady=(2, 0))
+        self.gram_color2_swatch = ctk.CTkFrame(
+            self.gram_color2_row, width=12, height=12, corner_radius=2,
+            fg_color=AppTheme.BORDER,
         )
-        self.channel_section.add_widget(gram_frame, pady=(8, 2))
+        self.gram_color2_swatch.pack(side="left", padx=(0, 7))
+        self.gram_color2_swatch.pack_propagate(False)
+        self.gram_color2_label = ctk.CTkLabel(
+            self.gram_color2_row, text="Цвет 2: —",
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY, anchor="w",
+        )
+        self.gram_color2_label.pack(side="left")
+        gram_actions = ctk.CTkFrame(self.channel_gram_frame, fg_color="transparent")
+        gram_actions.pack(fill="x", pady=(5, 0))
+        self.pipette_button = ctk.CTkButton(
+            gram_actions, text="Выбрать цвета пипеткой",
+            command=self.pipette_channel, width=AppTheme.ACTION_BUTTON_WIDTH,
+            height=AppTheme.BUTTON_HEIGHT, font=AppTheme.body_font(),
+        )
+        self.pipette_button.pack(side="left")
         self.gram_shmidt_button = ctk.CTkButton(
-            gram_frame,
-            text="Использовать Gram–Schmidt",
-            command=self.gramm_shmidt_transform,
-            width=AppTheme.ACTION_BUTTON_WIDTH,
-            height=AppTheme.BUTTON_HEIGHT,
-            font=AppTheme.body_font(),
+            gram_actions, text="Выполнить преобразование",
+            command=self.gramm_shmidt_transform, width=AppTheme.ACTION_BUTTON_WIDTH,
+            height=AppTheme.BUTTON_HEIGHT, font=AppTheme.body_font(),
         )
-        self.gram_shmidt_button.pack(anchor="w")
+        self.gram_shmidt_button.pack(side="left", padx=(8, 0))
+
+        # Интерактивная 3D-геометрия Gram–Schmidt на встроенном Matplotlib.
+        self.gram_geometry_frame = ctk.CTkFrame(
+            self.channel_gram_frame, fg_color="transparent"
+        )
+        self.gram_geometry_frame.pack(fill="x", pady=(12, 2))
+
+        geometry_controls = ctk.CTkFrame(self.gram_geometry_frame, fg_color="transparent")
+        geometry_controls.pack(fill="x", pady=(0, 5))
+        self.gram_link_view_var = tk.BooleanVar(value=True)
+        self.gram_link_view_checkbox = ctk.CTkCheckBox(
+            geometry_controls, text="Связать вращение",
+            variable=self.gram_link_view_var,
+            font=AppTheme.caption_font(),
+        )
+        self.gram_link_view_checkbox.pack(side="right")
+
+        plots = ctk.CTkFrame(self.gram_geometry_frame, fg_color="transparent")
+        plots.pack(fill="x")
+        plots.grid_columnconfigure((0, 1), weight=1, uniform="gs_plot")
+
+        self.gram_before_figure, self.gram_before_ax, self.gram_before_canvas = \
+            self._create_gs_3d_panel(plots, "До", 0, (0, 4))
+        self.gram_after_figure, self.gram_after_ax, self.gram_after_canvas = \
+            self._create_gs_3d_panel(plots, "После Gram–Schmidt", 1, (4, 0))
+
+        self._gram_syncing_view = False
+        self.gram_before_canvas.mpl_connect(
+            "button_release_event", lambda _event: self._sync_gs_camera(self.gram_before_ax, self.gram_after_ax)
+        )
+        self.gram_after_canvas.mpl_connect(
+            "button_release_event", lambda _event: self._sync_gs_camera(self.gram_after_ax, self.gram_before_ax)
+        )
+
         self._update_channel_controls_state()
+
+    @staticmethod
+    def _gs_basis(color1, color2):
+        """Вернуть исходные единичные направления и ортонормированный GS-базис."""
+        v1 = np.asarray(color1, dtype=np.float64)
+        v2 = np.asarray(color2, dtype=np.float64)
+        v1 = v1 / np.linalg.norm(v1)
+        v2 = v2 / np.linalg.norm(v2)
+        e1 = v1
+        orth = v2 - np.dot(v2, e1) * e1
+        e2 = orth / np.linalg.norm(orth)
+        e3 = np.cross(e1, e2)
+        e3 = e3 / np.linalg.norm(e3)
+        return v1, v2, e1, e2, e3
+
+    def _create_gs_3d_panel(self, parent, title, column, padx):
+        """Создать встроенную интерактивную 3D-панель Matplotlib."""
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+        box.grid(row=0, column=column, sticky="nsew", padx=padx)
+        ctk.CTkLabel(
+            box, text=title, font=AppTheme.body_font(), anchor="center"
+        ).pack(fill="x", pady=(0, 3))
+
+        figure = Figure(figsize=(5.0, 3.5), dpi=100, facecolor="#202020")
+        ax = figure.add_subplot(111, projection="3d")
+        canvas = FigureCanvasTkAgg(figure, master=box)
+        canvas.get_tk_widget().configure(
+            background="#202020", highlightthickness=1, highlightbackground=AppTheme.BORDER
+        )
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        toolbar_frame = tk.Frame(box, bg="#202020")
+        toolbar_frame.pack(fill="x")
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side="left")
+        return figure, ax, canvas
+
+    @staticmethod
+    def _style_gs_3d_axis(ax):
+        """Единое оформление RGB-пространства для корректного сравнения панелей."""
+        ax.clear()
+        ax.set_facecolor("#202020")
+        ax.set_xlim(-1.05, 1.05)
+        ax.set_ylim(-1.05, 1.05)
+        ax.set_zlim(-1.05, 1.05)
+        ax.set_box_aspect((1, 1, 1))
+        ax.set_xlabel("R", color="#d96b6b", labelpad=4)
+        ax.set_ylabel("G", color="#6fcf7b", labelpad=4)
+        ax.set_zlabel("B", color="#6b9bd9", labelpad=4)
+        ax.tick_params(colors="#a9a9a9", labelsize=7, pad=1)
+        ax.grid(True, alpha=0.22)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            try:
+                axis.pane.set_facecolor((0.12, 0.12, 0.12, 1.0))
+                axis.pane.set_edgecolor((0.35, 0.35, 0.35, 1.0))
+            except AttributeError:
+                pass
+        ax.view_init(elev=22, azim=-55)
+
+    def _draw_gs_3d_plot(self, ax, canvas, vectors, placeholder=None):
+        """Обновить интерактивный 3D-график без пересоздания Matplotlib canvas."""
+        self._style_gs_3d_axis(ax)
+        axis_vectors = (
+            ((1, 0, 0), "R", "#d96b6b"),
+            ((0, 1, 0), "G", "#6fcf7b"),
+            ((0, 0, 1), "B", "#6b9bd9"),
+        )
+        for vector, label, color in axis_vectors:
+            x, y, z = vector
+            ax.quiver(0, 0, 0, x, y, z, color=color, linewidth=1.2, arrow_length_ratio=0.08)
+            ax.text(x * 1.08, y * 1.08, z * 1.08, label, color=color, fontsize=9, fontweight="bold")
+
+        if vectors:
+            for vector, label, color in vectors:
+                x, y, z = (float(value) for value in vector)
+                ax.quiver(0, 0, 0, x, y, z, color=color, linewidth=2.8, arrow_length_ratio=0.10)
+                ax.scatter([x], [y], [z], color=color, s=28, depthshade=False)
+                ax.text(x * 1.08, y * 1.08, z * 1.08, label, color=color, fontsize=9, fontweight="bold")
+        elif placeholder:
+            ax.text2D(0.5, 0.05, placeholder, transform=ax.transAxes, ha="center",
+                      color=AppTheme.TEXT_SECONDARY, fontsize=9)
+        canvas.draw_idle()
+
+    def _sync_gs_camera(self, source_ax, target_ax):
+        """После вращения одной панели перенести положение камеры на вторую."""
+        if self._gram_syncing_view or not getattr(self, "gram_link_view_var", None):
+            return
+        if not self.gram_link_view_var.get():
+            return
+        self._gram_syncing_view = True
+        try:
+            target_ax.view_init(elev=source_ax.elev, azim=source_ax.azim, roll=getattr(source_ax, "roll", 0))
+            target_ax.figure.canvas.draw_idle()
+        finally:
+            self._gram_syncing_view = False
+
+    def _update_gram_geometry(self, task, has_colors, applied):
+        before_ax = getattr(self, "gram_before_ax", None)
+        after_ax = getattr(self, "gram_after_ax", None)
+        before_canvas = getattr(self, "gram_before_canvas", None)
+        after_canvas = getattr(self, "gram_after_canvas", None)
+        if before_ax is None or after_ax is None or before_canvas is None or after_canvas is None:
+            return
+        if not has_colors or task is None:
+            self._draw_gs_3d_plot(before_ax, before_canvas, [], "Выберите два цвета")
+            self._draw_gs_3d_plot(after_ax, after_canvas, [], "Сначала выполните преобразование")
+            return
+        try:
+            v1, v2, e1, e2, e3 = self._gs_basis(task.color1, task.color2)
+        except (ValueError, FloatingPointError):
+            self._draw_gs_3d_plot(before_ax, before_canvas, [], "Некорректные цветовые векторы")
+            self._draw_gs_3d_plot(after_ax, after_canvas, [], "Преобразование недоступно")
+            return
+        c1 = tuple(int(v) for v in task.color1)
+        c2 = tuple(int(v) for v in task.color2)
+        color1 = f"#{c1[0]:02x}{c1[1]:02x}{c1[2]:02x}"
+        color2 = f"#{c2[0]:02x}{c2[1]:02x}{c2[2]:02x}"
+        self._draw_gs_3d_plot(before_ax, before_canvas, [(v1, "v₁", color1), (v2, "v₂", color2)])
+        if applied:
+            self._draw_gs_3d_plot(after_ax, after_canvas, [
+                (e1, "GS1", "#e0a458"),
+                (e2, "GS2", "#58b4e0"),
+                (e3, "GS3", "#b078d1"),
+            ])
+        else:
+            self._draw_gs_3d_plot(after_ax, after_canvas, [], "Нажмите «Выполнить преобразование»")
 
     def _on_channel_settings_changed(self, _value=None):
         task = getattr(self, "current_task", None)
@@ -5714,14 +5911,10 @@ class App(TkinterApp):
             "Grayscale": "grayscale",
             "Gram–Schmidt": "gram_schmidt",
         }.get(self.channel_representation_var.get(), "rgb")
-        rgb_mode = (
-            "single" if self.rgb_channel_mode_var.get() == "Один канал"
-            else "all"
-        )
+        rgb_mode = "single" if self.rgb_channel_mode_var.get() == "Один канал" else "all"
         try:
             task.set_channel_analysis(
-                representation,
-                rgb_mode=rgb_mode,
+                representation, rgb_mode=rgb_mode,
                 single_channel=self.rgb_single_channel_var.get(),
             )
         except ValueError as error:
@@ -5738,68 +5931,78 @@ class App(TkinterApp):
         has_source = bool(task is not None and task.image_path)
         representation = self.channel_representation_var.get()
         is_rgb = representation == "RGB"
+        is_gram = representation == "Gram–Schmidt"
         is_single = is_rgb and self.rgb_channel_mode_var.get() == "Один канал"
         has_colors = bool(task is not None and task.has_colors_selected())
 
         if self.channel_representation_menu is not None:
-            self.channel_representation_menu.configure(
-                state="normal" if has_source else "disabled"
-            )
+            self.channel_representation_menu.configure(state="normal" if has_source else "disabled")
+
+        # Показываем только настройки выбранного представления.
+        if self.channel_rgb_frame is not None:
+            self.channel_rgb_frame.pack_forget()
+            if is_rgb:
+                self.channel_rgb_frame.pack(fill="x", pady=(2, 6))
+        if self.channel_gram_frame is not None:
+            self.channel_gram_frame.pack_forget()
+            if is_gram:
+                self.channel_gram_frame.pack(fill="x", pady=(2, 6))
+
         if self.rgb_mode_menu is not None:
-            self.rgb_mode_menu.configure(
-                state="normal" if has_source and is_rgb else "disabled"
-            )
+            self.rgb_mode_menu.configure(state="normal" if has_source and is_rgb else "disabled")
         if self.rgb_single_channel_menu is not None:
-            self.rgb_single_channel_menu.configure(
-                state="normal" if has_source and is_single else "disabled"
-            )
+            self.rgb_single_channel_menu.configure(state="normal" if has_source and is_single else "disabled")
 
         if task is None:
             detection = "Тип изображения ещё не определён"
-            effective = "Будут рассчитаны: —"
         else:
             if task.detected_color_type == "grayscale":
                 similarity = task.grayscale_similarity
-                suffix = (
-                    f" · совпадение RGB {similarity:.2%}"
-                    if similarity is not None else ""
-                )
+                suffix = f" · совпадение RGB {similarity:.2%}" if similarity is not None else ""
                 detection = "Обнаружено: grayscale" + suffix
             elif task.detected_color_type == "color":
                 detection = "Обнаружено: цветное изображение"
             else:
                 detection = "Тип изображения ещё не определён"
 
-            codes = task.analysis_channel_codes_for_settings()
-            readable = {
-                "r": "R", "g": "G", "b": "B", "gray": "Gray",
-                "gs1": "GS1", "gs2": "GS2", "gs3": "GS3",
-            }
-            effective = "Будут рассчитаны: " + ", ".join(
-                readable.get(code, code) for code in codes
-            )
-            if task.channel_representation == "gram_schmidt" and not has_colors:
-                effective += " · требуется цветовой базис"
-
         if self.channel_detection_label is not None:
             self.channel_detection_label.configure(text=detection)
-        if self.channel_effective_label is not None:
-            self.channel_effective_label.configure(text=effective)
+        if has_colors:
+            c1 = tuple(int(v) for v in task.color1)
+            c2 = tuple(int(v) for v in task.color2)
+            if self.gram_color1_label is not None:
+                self.gram_color1_label.configure(text=f"Цвет 1: RGB {c1}")
+            if self.gram_color2_label is not None:
+                self.gram_color2_label.configure(text=f"Цвет 2: RGB {c2}")
+            if self.gram_color1_swatch is not None:
+                self.gram_color1_swatch.configure(fg_color=f"#{c1[0]:02x}{c1[1]:02x}{c1[2]:02x}")
+            if self.gram_color2_swatch is not None:
+                self.gram_color2_swatch.configure(fg_color=f"#{c2[0]:02x}{c2[1]:02x}{c2[2]:02x}")
+        else:
+            if self.gram_color1_label is not None:
+                self.gram_color1_label.configure(text="Цвет 1: —")
+            if self.gram_color2_label is not None:
+                self.gram_color2_label.configure(text="Цвет 2: —")
+            if self.gram_color1_swatch is not None:
+                self.gram_color1_swatch.configure(fg_color=AppTheme.BORDER)
+            if self.gram_color2_swatch is not None:
+                self.gram_color2_swatch.configure(fg_color=AppTheme.BORDER)
         if self.pipette_button is not None:
             self.pipette_button.configure(
                 text="Изменить цвета пипеткой" if has_colors else "Выбрать цвета пипеткой",
-                state="normal" if has_source else "disabled",
-                fg_color=AppTheme.PRIMARY,
-                hover_color=AppTheme.PRIMARY_HOVER,
+                state="normal" if has_source and is_gram else "disabled",
+                fg_color=AppTheme.PRIMARY, hover_color=AppTheme.PRIMARY_HOVER,
             )
+        selected = bool(task is not None and task.channel_representation == "gram_schmidt"
+                        and task.is_gram_schmidt_applied() and has_colors)
         if self.gram_shmidt_button is not None:
-            selected = bool(task is not None and task.channel_representation == "gram_schmidt")
             self.gram_shmidt_button.configure(
-                text="Gram–Schmidt выбран" if selected else "Использовать Gram–Schmidt",
-                state="normal" if has_source and has_colors else "disabled",
+                text="Преобразование выполнено" if selected else "Выполнить преобразование",
+                state="normal" if has_source and is_gram and has_colors else "disabled",
                 fg_color=AppTheme.SUCCESS if selected else AppTheme.PRIMARY,
                 hover_color=AppTheme.SUCCESS_HOVER if selected else AppTheme.PRIMARY_HOVER,
             )
+        self._update_gram_geometry(task, has_colors, selected)
 
     def _setup_scales_section(self):
         """Настройка секции масштабов"""
@@ -6385,22 +6588,31 @@ class App(TkinterApp):
             )
             self._loading_task_settings = False
             self._update_channel_controls_state()
-            # Обновляем информацию о загруженном изображении
+            # Исходное изображение: действие кнопки не меняет размер/подпись,
+            # состояние и метаданные показываются отдельно.
             if self.current_task.image_path:
                 self.load_button.configure(
                     text="Изображение загружено",
-                    fg_color=AppTheme.SUCCESS,
-                    hover_color=AppTheme.SUCCESS_HOVER
+                    fg_color=AppTheme.SUCCESS, hover_color=AppTheme.SUCCESS_HOVER,
+                    state="disabled",
                 )
-                text = f"Файл: {os.path.basename(self.current_task.image_path)}"
-                self.print_load_image.configure(text=text, text_color=AppTheme.TEXT_ON_DARK)
+                if self.change_image_button is not None and not self.change_image_button.winfo_manager():
+                    self.change_image_button.pack(side="left", padx=(8, 0))
+                self.print_load_image.configure(
+                    text=self._source_image_info(self.current_task),
+                    text_color=AppTheme.TEXT_ON_DARK,
+                )
             else:
                 self.load_button.configure(
                     text="Загрузить и обрезать изображение",
-                    fg_color=AppTheme.PRIMARY,
-                    hover_color=AppTheme.PRIMARY_HOVER
+                    fg_color=AppTheme.PRIMARY, hover_color=AppTheme.PRIMARY_HOVER,
+                    state="normal",
                 )
-                self.print_load_image.configure(text="Изображение не загружено", text_color=AppTheme.MUTED)
+                if self.change_image_button is not None:
+                    self.change_image_button.pack_forget()
+                self.print_load_image.configure(
+                    text="Изображение не загружено", text_color=AppTheme.MUTED
+                )
 
             # Обновляем KNN
             self.knn_text_var.set(str(self.current_task.k_neighbors))
@@ -6438,9 +6650,12 @@ class App(TkinterApp):
             self.load_button.configure(
                 text="Загрузить и обрезать изображение",
                 fg_color=AppTheme.PRIMARY,
-                hover_color=AppTheme.PRIMARY_HOVER
+                hover_color=AppTheme.PRIMARY_HOVER,
+                state="normal",
             )
             self.print_load_image.configure(text="Изображение не загружено", text_color=AppTheme.MUTED)
+            if self.change_image_button is not None:
+                self.change_image_button.pack_forget()
             self._update_channel_controls_state()
             self.button_save_scales.configure(
                 text="Применить масштабы",
@@ -6754,8 +6969,6 @@ class App(TkinterApp):
             "single" if self.rgb_channel_mode_var.get() == "Один канал" else "all"
         )
         task.rgb_single_channel = self.rgb_single_channel_var.get()
-        task.gram_schmidt_applied = task.channel_representation == "gram_schmidt"
-
         task.process_rows = bool(self.row_var.get())
         task.process_columns = bool(self.col_var.get())
         task.find_maxima = bool(self.max_var.get())
@@ -6938,11 +7151,7 @@ class App(TkinterApp):
             font=AppTheme.body_font(),
         )
         self.pipeline_section.add_widget(self.pipeline_stage_status_label, pady=(6, 1))
-        self.pipeline_execution_plan_label = ctk.CTkLabel(
-            self.pipeline_section.content, text="", anchor="w", justify="left",
-            font=AppTheme.body_font(),
-        )
-        self.pipeline_section.add_widget(self.pipeline_execution_plan_label, pady=(0, 4))
+        self.pipeline_execution_plan_label = None
 
         # Синхронизация пока остаётся частью вычислительной модели, но не входит
         # в набор пользовательских сценариев этой страницы.
@@ -7160,10 +7369,12 @@ class App(TkinterApp):
         if getattr(self, "pipeline_stage_status_label", None) is not None:
             try:
                 self.pipeline_stage_status_label.configure(text=format_stage_status(task))
-                self.pipeline_execution_plan_label.configure(text=format_execution_plan(task))
+                if self.pipeline_execution_plan_label is not None:
+                    self.pipeline_execution_plan_label.configure(text="")
             except Exception:
                 self.pipeline_stage_status_label.configure(text="Состояние этапов: ещё не рассчитано")
-                self.pipeline_execution_plan_label.configure(text="")
+                if self.pipeline_execution_plan_label is not None:
+                    self.pipeline_execution_plan_label.configure(text="")
 
         self._update_statistics_controls_state()
         self._update_export_rows_visibility()
