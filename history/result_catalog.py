@@ -9,7 +9,7 @@ from result_naming import number_from_token
 
 
 def save_coefficient_preview(folder, name, coefficients):
-    directory = Path(folder) / 'previews'
+    directory = Path(folder)
     directory.mkdir(exist_ok=True, parents=True)
     # Keep every coefficient and its original dtype. Downsampling here used to
     # discard narrow extrema and phase detail before the viewer even loaded it.
@@ -132,23 +132,78 @@ def _related_ml_artifacts(root):
                 related.append(item)
     return related
 
+def _canonical_result_key(item):
+    """Same numerical result exported into multiple formats/preview folders.
+
+    ML runs are kept independent; direction, feature axis, and extrema kind
+    remain part of the identity to avoid merging scientifically distinct maps.
+    """
+    path = Path(item['path'])
+    stem = path.stem.casefold()
+    if item['category'] == 'Источник':
+        stem = 'image'
+    if item.get('artifact') == 'cwt2d' and stem.endswith('_complex'):
+        stem = stem[:-8]
+    return (item['task_id'], item['result_scope'], item.get('ml_run'),
+            item['category'], item.get('artifact'), item.get('direction'),
+            item.get('feature_axis'), item.get('point_kind'),
+            item.get('scale'), item.get('orientation'), item.get('channel'),
+            item.get('algorithm'), stem)
+
+
+def _result_priority(item):
+    """Prefer canonical lossless numeric data over text exports."""
+    path = Path(item['path'])
+    return (0 if path.suffix.lower() == '.npy' else
+            2 if path.suffix.lower() == '.npz' else
+            3 if path.suffix.lower() == '.csv' else
+            4 if path.suffix.lower() == '.txt' else 5)
+
+
+def _collapse_export_duplicates(items):
+    chosen = {}
+    for item in items:
+        key = _canonical_result_key(item)
+        if key not in chosen or _result_priority(item) < _result_priority(chosen[key]):
+            chosen[key] = item
+    return list(chosen.values())
+
+
 def discover_results(folder):
+    """Discover an entire experiment, preserving per-task provenance.
+
+    A legacy standalone task folder remains a valid viewer root.  Sibling
+    fingerprint matching is intentionally not used: image equality does not
+    establish that artifacts belong to the same experimental task.
+    """
     root = Path(folder) if folder else None
     if root is None or not root.is_dir():
         return []
-    local = [
-        _artifact(path, root)
-        for path in root.rglob('*') if path.is_file()
-        and not any(part.casefold().startswith('.pipeline_cache') for part in path.relative_to(root).parts)
-        and (path.name.casefold() in {'image.png', 'изображение.png'}
-             or (path.suffix.lower() in {'.npy', '.npz', '.csv', '.txt'}
-                 and not path.stem.casefold().startswith('график_расчетов')))
-    ]
-    seen = {item['path'] for item in local}
-    related = [item for item in _related_ml_artifacts(root) if item['path'] not in seen]
-    return sorted(local + related,
-        key=lambda item: (item['category'] != 'Источник', item['category'],
-                          Path(item['path']).suffix.lower() not in {'.png', '.npy'}, item['label']))
+    candidates = []
+    for path in root.rglob('*'):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if any(part.casefold().startswith('.pipeline_cache') for part in relative.parts):
+            continue
+        if not (path.name.casefold() in {'image.png', 'изображение.png'}
+                or (path.suffix.lower() in {'.npy', '.npz', '.csv', '.txt'}
+                    and not path.stem.casefold().startswith('график_расчетов'))):
+            continue
+        item = _artifact(path, root)
+        task_part = next((part for part in relative.parts if part.startswith('task_')), None)
+        item['task_id'] = task_part or root.name
+        item['task_name'] = (task_part.split('_')[0] + ' ' + task_part.split('_')[1]
+                             if task_part and len(task_part.split('_')) > 1 else root.name)
+        parts = relative.parts
+        ml_index = next((i for i, part in enumerate(parts) if part.casefold() == 'ml'), -1)
+        item['task_folder'] = str(root / task_part) if task_part else str(root)
+        item['result_scope'] = 'ml' if ml_index >= 0 else 'pipeline'
+        item['ml_run'] = '/'.join(parts[ml_index + 1:-1]) if ml_index >= 0 else None
+        candidates.append(item)
+    return sorted(_collapse_export_duplicates(candidates), key=lambda item: (
+        item['task_id'], item['category'] != 'Источник', item['category'],
+        Path(item['path']).suffix.lower() not in {'.png', '.npy'}, item['label']))
 
 
 def result_parameters(path):

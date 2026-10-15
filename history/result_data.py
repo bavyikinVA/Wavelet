@@ -32,15 +32,17 @@ def load_result(item, folder):
         if 'morlet' in path.stem.lower():
             candidates.extend([path.with_name(path.stem + '_complex.npy'),
                                path.with_name(path.stem + '_magnitude.csv'),
+                               path.parent / (path.stem + '.npy'),
                                Path(folder) / 'previews' / (path.stem + '.npy'),
                                Path(folder) / 'Предпросмотр' / (path.stem + '.npy')])
         if 'кластеры_изображение' in path.stem:
             candidates.insert(0, path.parent / 'кластеры.csv')
         path = next((p for p in candidates if p.is_file()), path)
     stat = path.stat()
-    source = Path(folder) / 'image.png'
+    source_root = Path(item.get('task_folder') or folder)
+    source = source_root / 'image.png'
     if not source.is_file():
-        source = Path(folder) / 'Изображение.png'  # Existing run archives.
+        source = source_root / 'Изображение.png'  # Existing run archives.
     shape = None
     if source.is_file():
         with Image.open(source) as image:
@@ -52,7 +54,7 @@ def load_result(item, folder):
     # A run-local source identity prevents same-size, unrelated layers matching.
     # Content identity lets sibling ML runs of the same research image be
     # compared even though each run owns its own copied image.png.
-    data['source_id'] = _source_identity(source, folder)
+    data['source_id'] = _source_identity(source, source_root)
     return data
 
 

@@ -64,7 +64,7 @@ class ProgressManager:
         self.frame = ctk.CTkFrame(
             self.parent, border_width=1, border_color=AppTheme.BORDER
         )
-        self.frame.pack(fill="x", padx=20, pady=(4, 10))
+        self.frame.pack(fill="x", padx=AppTheme.WINDOW_PADDING + AppTheme.PANEL_GAP, pady=(4, 10))
 
         status_frame = ctk.CTkFrame(self.frame, fg_color="transparent")
         status_frame.pack(fill="x", padx=12, pady=(8, 2))
@@ -100,21 +100,25 @@ class ProgressManager:
         self._create_progress_row("Общий прогресс", "overall")
         self._create_progress_row("Текущий этап", "stage")
 
+        # Постоянная нижняя строка: слева действия по завершении,
+        # справа кнопка отмены, создаваемая основным окном.
         self.completion_actions = ctk.CTkFrame(self.frame, fg_color="transparent")
+        self.completion_actions.pack(fill="x", padx=12, pady=(4, 8))
+        self.result_actions = ctk.CTkFrame(self.completion_actions, fg_color="transparent")
         self.result_btn = ctk.CTkButton(
-            self.completion_actions, text="Открыть результаты", width=150,
+            self.result_actions, text="Открыть результаты", width=150,
             height=AppTheme.COMPACT_CONTROL_HEIGHT,
             command=lambda: self._call_action(self._result_callback)
         )
         self.result_btn.pack(side="left")
         self.folder_btn = ctk.CTkButton(
-            self.completion_actions, text="Открыть папку", width=125,
+            self.result_actions, text="Открыть папку", width=125,
             height=AppTheme.COMPACT_CONTROL_HEIGHT,
             command=lambda: self._call_action(self._folder_callback)
         )
         self.folder_btn.pack(side="left", padx=(8, 0))
         self.history_btn = ctk.CTkButton(
-            self.completion_actions, text="К предыдущим запускам", width=180,
+            self.result_actions, text="К предыдущим запускам", width=180,
             height=AppTheme.COMPACT_CONTROL_HEIGHT,
             command=lambda: self._call_action(self._history_callback)
         )
@@ -206,7 +210,7 @@ class ProgressManager:
     def _apply_begin_run(self, title):
         if self.run_control.event.is_set():
             return
-        self.completion_actions.pack_forget()
+        self.result_actions.pack_forget()
         self.state_badge.configure(text="● ВЫПОЛНЯЕТСЯ", text_color=AppTheme.INFO)
         self.progress_label.configure(text=title, text_color=AppTheme.TEXT_ON_DARK)
         self._set_bars(0.0, 0.0)
@@ -219,15 +223,21 @@ class ProgressManager:
         self._stage_index = self._stages.index(name) if index is None else int(index)
         self._stage_index = max(0, min(self._stage_index, len(self._stages) - 1))
         self._stage_progress = 0.0
-        self._ui(lambda: self._apply_begin_stage(name))
-        self.log_info(f"Этап {self._stage_index + 1}/{len(self._stages)}: {name}")
+        # Capture the stage snapshot: queued Tk callbacks may run after the
+        # compute thread has already advanced to the next stage.
+        stage_index = self._stage_index
+        stage_count = len(self._stages)
+        self._ui(lambda: self._apply_begin_stage(name, stage_index, stage_count))
+        self.log_info(f"Этап {stage_index + 1}/{stage_count}: {name}")
 
-    def _apply_begin_stage(self, name):
+    def _apply_begin_stage(self, name, stage_index, stage_count):
         if self.run_control.event.is_set():
             return
         self.progress_label.configure(text=name, text_color=AppTheme.TEXT_ON_DARK)
-        self._apply_stage_label()
-        self._set_bars(self._overall_value(), 0.0)
+        self.stage_label.configure(
+            text=f"Этап {stage_index + 1} из {stage_count} · {name}"
+        )
+        self._set_bars(stage_index / stage_count, 0.0)
 
     def complete_stage(self):
         self.update_progress(1.0)
@@ -287,7 +297,7 @@ class ProgressManager:
         count = len(self._stages)
         self.stage_label.configure(text=f"Все этапы завершены · {count} из {count}")
         self._set_bars(1.0, 1.0)
-        self.completion_actions.pack(fill="x", padx=12, pady=(4, 8))
+        self.result_actions.pack(side="left")
 
     def fail_run(self, message):
         self._ui(lambda: self._apply_failed(message))
@@ -298,14 +308,14 @@ class ProgressManager:
             self._started_at = None
             self.state_badge.configure(text='● ОТМЕНЕНО', text_color=AppTheme.TEXT_SECONDARY)
             self.progress_label.configure(text='Расчёт отменён. Частичные файлы сохранены.')
-            self.completion_actions.pack_forget()
+            self.result_actions.pack_forget()
         self._ui(apply)
 
     def _apply_failed(self, message):
         self._cancel_timer()
         self.state_badge.configure(text="● ОШИБКА", text_color=AppTheme.DANGER)
         self.progress_label.configure(text=message, text_color=AppTheme.DANGER)
-        self.completion_actions.pack_forget()
+        self.result_actions.pack_forget()
 
     def _schedule_timer(self):
         self._cancel_timer()
@@ -430,7 +440,7 @@ class ProgressManager:
         self.stage_label.configure(text="Этапы появятся после запуска")
         self.timer_label.configure(text="00:00")
         self._set_bars(0.0, 0.0)
-        self.completion_actions.pack_forget()
+        self.result_actions.pack_forget()
 
     def safe_destroy(self):
         self._is_active = False

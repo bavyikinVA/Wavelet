@@ -1,11 +1,15 @@
-"""GPU implementation of the project's 1-D extrema semantics.
+"""Extrema detection with a vectorized CUDA fast path.
 
-The GPU path intentionally mirrors :mod:`compute.extremes.detection`:
-strict local extrema for the default policy and ``find_peaks`` with the same
-``distance``, ``prominence`` and no-plateau policy for filtered detection.
+Filtered extrema use the bounded-memory SciPy reference on host arrays.
+Calling cupyx.scipy.signal.find_peaks individually on thousands of GPU lines
+can stall the pipeline; CPU processing also preserves exact SciPy semantics.
 """
+from __future__ import annotations
+
+import numpy as np
+
 from compute.backend_policy import classify_gpu_exception
-from compute.extremes.detection import normalize_peak_parameters
+from compute.extremes.detection import find_extrema_2d, normalize_peak_parameters
 
 
 class ExtremesFinder:
@@ -13,42 +17,38 @@ class ExtremesFinder:
     def find_extremes_gpu(coefs_gpu, row_var=True, col_var=True,
                           max_var=True, min_var=True, *,
                           distance=1, prominence=0.0):
-        """Find extrema on GPU with the same scientific contract as CPU.
-
-        Returns ``(coefs_numpy, max_row, max_col, min_row, min_col)`` for
-        compatibility with the application pipeline.  Peak detection itself is
-        executed on the GPU; the final coordinates are transferred to host
-        memory because downstream caches/exports use host ``int32`` arrays.
-        """
         try:
             import cupy as cp
-            from cupyx.scipy.signal import find_peaks
 
             distance, prominence = normalize_peak_parameters(distance, prominence)
-            if not isinstance(coefs_gpu, cp.ndarray):
-                coefs_gpu = cp.asarray(coefs_gpu, dtype=cp.float32)
-            elif coefs_gpu.dtype != cp.float32:
-                coefs_gpu = coefs_gpu.astype(cp.float32, copy=False)
-
-            if coefs_gpu.ndim != 2:
-                raise ValueError("Поиск экстремумов ожидает двумерную матрицу коэффициентов")
+            input_is_gpu = isinstance(coefs_gpu, cp.ndarray)
+            host_reference = None if input_is_gpu else np.asarray(coefs_gpu)
 
             if distance == 1 and prominence == 0.0:
+                device_coefs = (coefs_gpu if input_is_gpu else cp.asarray(host_reference, dtype=cp.float32))
+                if device_coefs.dtype != cp.float32:
+                    device_coefs = device_coefs.astype(cp.float32, copy=False)
+                if device_coefs.ndim != 2:
+                    raise ValueError("Поиск экстремумов ожидает двумерную матрицу коэффициентов")
                 result = ExtremesFinder._strict_gpu(
-                    coefs_gpu, row_var, col_var, max_var, min_var
+                    device_coefs, row_var, col_var, max_var, min_var
                 )
+                coefs_numpy = cp.asnumpy(device_coefs) if input_is_gpu else host_reference
             else:
-                kwargs = {"plateau_size": (None, 1)}
-                if distance > 1:
-                    kwargs["distance"] = distance
-                if prominence > 0.0:
-                    kwargs["prominence"] = prominence
-                result = ExtremesFinder._filtered_gpu(
-                    coefs_gpu, row_var, col_var, max_var, min_var,
-                    find_peaks=find_peaks, kwargs=kwargs,
+                # Use one host transfer at most: SciPy is substantially more
+                # predictable than per-line GPU peak-finding for filtered data.
+                coefs_numpy = cp.asnumpy(coefs_gpu) if input_is_gpu else host_reference
+                if coefs_numpy.ndim != 2:
+                    raise ValueError("Поиск экстремумов ожидает двумерную матрицу коэффициентов")
+                cpu_points = find_extrema_2d(
+                    coefs_numpy, row_var, col_var, max_var, min_var,
+                    distance=distance, prominence=prominence,
                 )
-
-            return (cp.asnumpy(coefs_gpu), *result)
+                result = tuple(
+                    np.asarray(points, dtype=np.int32).reshape(-1, 2)
+                    for points in cpu_points
+                )
+            return (coefs_numpy, *result)
         except Exception as exc:
             mapped = classify_gpu_exception(exc)
             if mapped is None:
@@ -56,51 +56,42 @@ class ExtremesFinder:
             raise mapped from exc
 
     @staticmethod
+    def _to_host_points(x_gpu, y_gpu):
+        import cupy as cp
+
+        if x_gpu.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        pts = cp.stack((x_gpu, y_gpu), axis=1).astype(cp.int32, copy=False)
+        return cp.asnumpy(pts).astype(np.int32, copy=False)
+
+    @staticmethod
     def _strict_gpu(coefs_gpu, row_var, col_var, max_var, min_var):
         import cupy as cp
 
-        pmaxr, pmaxc, pminr, pminc = [], [], [], []
+        empty = np.empty((0, 2), dtype=np.int32)
+        pmaxr = pmaxc = pminr = pminc = empty
+
         if row_var and (max_var or min_var) and coefs_gpu.shape[1] >= 3:
-            left, center, right = coefs_gpu[:, :-2], coefs_gpu[:, 1:-1], coefs_gpu[:, 2:]
+            left = coefs_gpu[:, :-2]
+            center = coefs_gpu[:, 1:-1]
+            right = coefs_gpu[:, 2:]
             if max_var:
                 yy, xx = cp.where((center > left) & (center > right))
-                pmaxr = [[int(x + 1), int(y)] for y, x in zip(cp.asnumpy(yy), cp.asnumpy(xx))]
+                pmaxr = ExtremesFinder._to_host_points(xx + 1, yy)
             if min_var:
                 yy, xx = cp.where((center < left) & (center < right))
-                pminr = [[int(x + 1), int(y)] for y, x in zip(cp.asnumpy(yy), cp.asnumpy(xx))]
+                pminr = ExtremesFinder._to_host_points(xx + 1, yy)
 
         if col_var and (max_var or min_var) and coefs_gpu.shape[0] >= 3:
-            up, center, down = coefs_gpu[:-2, :], coefs_gpu[1:-1, :], coefs_gpu[2:, :]
+            up = coefs_gpu[:-2, :]
+            center = coefs_gpu[1:-1, :]
+            down = coefs_gpu[2:, :]
             if max_var:
                 yy, xx = cp.where((center > up) & (center > down))
-                pmaxc = [[int(x), int(y + 1)] for y, x in zip(cp.asnumpy(yy), cp.asnumpy(xx))]
+                pmaxc = ExtremesFinder._to_host_points(xx, yy + 1)
             if min_var:
                 yy, xx = cp.where((center < up) & (center < down))
-                pminc = [[int(x), int(y + 1)] for y, x in zip(cp.asnumpy(yy), cp.asnumpy(xx))]
+                pminc = ExtremesFinder._to_host_points(xx, yy + 1)
+
         return pmaxr, pmaxc, pminr, pminc
 
-    @staticmethod
-    def _filtered_gpu(coefs_gpu, row_var, col_var, max_var, min_var, *, find_peaks, kwargs):
-        import cupy as cp
-
-        pmaxr, pmaxc, pminr, pminc = [], [], [], []
-        if row_var and (max_var or min_var):
-            for y in range(coefs_gpu.shape[0]):
-                signal = coefs_gpu[y]
-                if max_var:
-                    peaks, _ = find_peaks(signal, **kwargs)
-                    pmaxr.extend([int(x), int(y)] for x in cp.asnumpy(peaks))
-                if min_var:
-                    peaks, _ = find_peaks(-signal, **kwargs)
-                    pminr.extend([int(x), int(y)] for x in cp.asnumpy(peaks))
-
-        if col_var and (max_var or min_var):
-            for x in range(coefs_gpu.shape[1]):
-                signal = coefs_gpu[:, x]
-                if max_var:
-                    peaks, _ = find_peaks(signal, **kwargs)
-                    pmaxc.extend([int(x), int(y)] for y in cp.asnumpy(peaks))
-                if min_var:
-                    peaks, _ = find_peaks(-signal, **kwargs)
-                    pminc.extend([int(x), int(y)] for y in cp.asnumpy(peaks))
-        return pmaxr, pmaxc, pminr, pminc

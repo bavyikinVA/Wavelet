@@ -105,17 +105,18 @@ def load_point_cache(task_folder, artifact, cwt_axis, feature_axis, channel, sca
 
     stem = point_stem(artifact, cwt_axis, feature_axis, channel, scale, kind)
     scale_dir = Path(task_folder) / "scales" / scale_folder_name(scale)
-    txt_points = _load_txt_points(scale_dir / f"{stem}.txt", as_array=as_array)
-    if txt_points is not None:
-        return txt_points
-
-    npz_path = scale_dir / f"{stem}.npz"
-    if npz_path.is_file():
-        with np.load(npz_path, allow_pickle=False) as payload:
-            points = payload.get("points")
-            if points is not None:
-                array = np.asarray(points, dtype=np.int32).reshape(-1, 2)
-                return array if as_array else array.tolist()
+    stage = "envelopes" if artifact == "env" else "extremes"
+    for source_dir in (scale_dir / stage, scale_dir):
+        txt_points = _load_txt_points(source_dir / f"{stem}.txt", as_array=as_array)
+        if txt_points is not None:
+            return txt_points
+        npz_path = source_dir / f"{stem}.npz"
+        if npz_path.is_file():
+            with np.load(npz_path, allow_pickle=False) as payload:
+                points = payload.get("points")
+                if points is not None:
+                    array = np.asarray(points, dtype=np.int32).reshape(-1, 2)
+                    return array if as_array else array.tolist()
     return None
 
 
@@ -175,7 +176,10 @@ def load_complete_cwt(task):
             per_scale = []
             for scale in np.asarray(task.scales):
                 stem = cwt1d_stem(cwt_axis, channel, scale)
-                path = folder / "previews" / f"{stem}.npy"
+                path = folder / "scales" / scale_folder_name(scale) / "wavelets" / f"{stem}.npy"
+                if not path.is_file():
+                    legacy = folder / "previews" / f"{stem}.npy"
+                    path = legacy if legacy.is_file() else path
                 if not path.is_file():
                     return None
                 array = np.load(path, allow_pickle=False)

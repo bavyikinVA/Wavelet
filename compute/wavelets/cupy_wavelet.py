@@ -132,8 +132,11 @@ class CupyWaveletGPU:
 
             results.extend(chunk_results)
 
-            # Очищаем память после каждого чанка
+            # Очищаем device/pinned pools после каждого крупного чанка.
+            # Pinned host buffers otherwise remain cached by CuPy and can make
+            # process RSS look like a leak across consecutive research runs.
             self.cp.get_default_memory_pool().free_all_blocks()
+            self.cp.get_default_pinned_memory_pool().free_all_blocks()
 
         return np.asarray(results, dtype=np.float32)
 
@@ -164,8 +167,9 @@ class CupyWaveletGPU:
             }
 
     def clear_cache(self):
-        """Clear GPU memory cache"""
+        """Clear device and pinned-host CuPy memory pools."""
         try:
             self.cp.get_default_memory_pool().free_all_blocks()
+            self.cp.get_default_pinned_memory_pool().free_all_blocks()
         except Exception as e:
             logger.debug(f"Cache clearing failed: {e}")

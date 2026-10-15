@@ -393,7 +393,6 @@ def _execution_summary(protocol) -> dict:
 
     return {
         "requested_backend": raw.get("requested_backend"),
-        "strict_backend": bool(raw.get("strict_backend", False)),
         "stages": stages,
         "warnings": raw.get("warnings", []),
     }

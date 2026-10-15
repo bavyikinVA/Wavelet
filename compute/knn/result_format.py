@@ -8,11 +8,13 @@ payloads remain readable through :func:`neighbor_arrays`.
 from __future__ import annotations
 
 from typing import Mapping
+from pathlib import Path
 
 import numpy as np
 
 
 COMPACT_KNN_FORMAT = "compact_arrays_v1"
+DISK_KNN_FORMAT = "knn_npz_v1"
 
 
 def make_compact_neighbors(indices, distances, angles=None) -> dict:
@@ -38,6 +40,70 @@ def make_compact_neighbors(indices, distances, angles=None) -> dict:
             raise ValueError("KNN angles must have the same shape as indices")
         result["angles"] = ang
     return result
+
+
+def make_disk_knn_payload(path, point_count: int) -> dict:
+    """Return a lightweight on-disk KNN descriptor.
+
+    The canonical NPZ already contains points, indices, distances and angles.
+    Keeping only this descriptor in ``ProcessingTask.knn_results`` prevents
+    completed runs from pinning hundreds of MiB (or GiB) of NumPy arrays in
+    RAM while preserving instant dataset discovery for the ML page.
+    """
+    return {
+        "format": DISK_KNN_FORMAT,
+        "path": str(Path(path).resolve()),
+        "point_count": int(point_count),
+    }
+
+
+def is_disk_knn_payload(payload) -> bool:
+    return (
+        isinstance(payload, Mapping)
+        and payload.get("format") == DISK_KNN_FORMAT
+        and bool(payload.get("path"))
+    )
+
+
+def knn_payload_point_count(payload) -> int:
+    """Return point count without materializing a disk-backed KNN dataset."""
+    if is_disk_knn_payload(payload):
+        try:
+            return max(0, int(payload.get("point_count", 0)))
+        except (TypeError, ValueError):
+            return 0
+    if isinstance(payload, Mapping):
+        points = np.asarray(payload.get("points", []))
+        return int(len(points)) if points.ndim >= 1 else 0
+    return 0
+
+
+def materialize_knn_payload(payload) -> dict:
+    """Load one disk-backed KNN group, or return an in-memory group unchanged.
+
+    Loading is intentionally one-group-at-a-time.  The ML UI selects one
+    channel/scale/direction/point-type dataset, so there is no reason to keep
+    every KNN group of every completed task resident in RAM.
+    """
+    if not is_disk_knn_payload(payload):
+        return payload
+
+    path = Path(str(payload["path"]))
+    if not path.is_file():
+        raise FileNotFoundError(f"KNN NPZ not found: {path}")
+    with np.load(path, allow_pickle=False) as data:
+        points = np.ascontiguousarray(data["points"], dtype=np.float32)
+        indices = np.ascontiguousarray(data["indices"], dtype=np.int32)
+        distances = np.ascontiguousarray(data["distances"], dtype=np.float32)
+        angles = (
+            np.ascontiguousarray(data["angles"], dtype=np.float32)
+            if "angles" in data
+            else None
+        )
+    return {
+        "points": points,
+        "neighbors": make_compact_neighbors(indices, distances, angles),
+    }
 
 
 def is_compact_neighbors(neighbors) -> bool:

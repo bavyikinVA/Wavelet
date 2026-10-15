@@ -24,7 +24,9 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
 from result_naming import dated_folder_name, ml_dataset_slug
-from compute.knn.result_format import neighbor_arrays
+from compute.knn.result_format import (
+    neighbor_arrays, knn_payload_point_count, materialize_knn_payload,
+)
 
 from .errors import ClusteringError
 
@@ -100,8 +102,7 @@ def knn_dataset_options(knn_results: dict):
     """Return stable descriptors used by the GUI to select one ML source."""
     result = []
     for direction, channel, scale, point_type, payload in _iter_knn_groups(knn_results):
-        points = np.asarray(payload.get("points", []))
-        count = int(len(points)) if points.ndim >= 1 else 0
+        count = knn_payload_point_count(payload)
         key = (direction, channel, float(scale), point_type)
         direction_name = (
             "CWT по строкам" if direction in {"rows", "row", "str", "0"}
@@ -153,8 +154,14 @@ def extract_knn_features(
 
     for group_index, (direction, channel, scale, point_type, payload) in enumerate(groups, 1):
         _check_cancel(cancel_callback)
-        points = np.asarray(payload.get("points", []), dtype=float)
-        neighbors = payload.get("neighbors", {})
+        try:
+            materialized = materialize_knn_payload(payload)
+        except (OSError, KeyError, ValueError) as error:
+            raise ClusteringError(
+                f"Не удалось загрузить KNN-набор для ML: {error}"
+            ) from error
+        points = np.asarray(materialized.get("points", []), dtype=float)
+        neighbors = materialized.get("neighbors", {})
         if points.ndim != 2 or points.shape[1] < 2:
             continue
 
@@ -717,7 +724,15 @@ def run_clustering(
 
     timestamp = dated_folder_name(datetime.now())
     slug = _dataset_slug(table.records)
-    output_dir = os.path.join(output_root, "ml", slug, timestamp)
+    # Only attribute an ML run to a scale when ALL its observations
+    # belong to that scale. Mixed-scale datasets stay at task level.
+    from result_naming import scale_folder_name
+    dataset_scales = {str(r.get("scale")) for r in table.records if r.get("scale") is not None}
+    if len(dataset_scales) == 1:
+        scale_value = next(r.get("scale") for r in table.records if r.get("scale") is not None)
+        output_dir = os.path.join(output_root, "scales", scale_folder_name(scale_value), "ml", slug, timestamp)
+    else:
+        output_dir = os.path.join(output_root, "ml", slug, timestamp)
     os.makedirs(output_dir, exist_ok=True)
     if tiled:
         base = f"ml_dbscan_{slug}"

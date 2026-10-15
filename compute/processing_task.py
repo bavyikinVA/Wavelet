@@ -161,12 +161,10 @@ class ProcessingTask:
         self.scales = np.array([], dtype=np.float32)
         self.num_scale = 0
 
-        # Computational reproducibility policy for this task/run.
+        # Requested backend; GPU infrastructure failures automatically fall back to CPU.
         self.requested_backend = "auto"
-        self.strict_backend = False
         self.execution_protocol = ExecutionProtocol(
             requested_backend=self.requested_backend,
-            strict_backend=self.strict_backend,
         )
         # Incremental execution: downstream stages may reuse artifacts from
         # the same task while the scientific CWT inputs remain unchanged.
@@ -194,11 +192,11 @@ class ProcessingTask:
         self.calculate_envelopes = False
         self.calculate_knn = False
         self.output_wavelet_image = False
-        self.output_wavelet_text = True
+        self.output_wavelet_text = False
         self.output_wavelet_numpy = False  # устаревший формат; в новом UI не используется
-        self.output_extremes_text = True
+        self.output_extremes_text = False
         self.output_extremes_image = False
-        self.output_envelopes_text = True
+        self.output_envelopes_text = False
         self.output_envelopes_image = False
         # KNN: NPZ is the primary lossless machine-readable export.
         # TXT remains an optional human-readable export; PNG is a sampled
@@ -213,7 +211,7 @@ class ProcessingTask:
         # Статистики экстремумов и межстрочная синхронизация
         self.calculate_statistics = False
         self.statistics_output_image = False
-        self.statistics_output_csv = True
+        self.statistics_output_csv = False
         self.calculate_synchronization = False
         self.synchronization_output_heatmap = False
         self.synchronization_output_matrix_csv = True
@@ -377,7 +375,6 @@ class ProcessingTask:
             'colors_selected': has_colors,
             'channel_summary': self.channel_summary(),
             'requested_backend': self.requested_backend,
-            'strict_backend': self.strict_backend,
         }
 
     def set_analysis_mode(self, mode):

@@ -22,11 +22,9 @@ def _process_row_wrapper(args):
 
 
 class ComputeBackend:
-    def __init__(self, use_gpu: bool = True, *, lazy: bool = False,
-                 strict_backend: bool = False):
+    def __init__(self, use_gpu: bool = True, *, lazy: bool = False):
         self.use_gpu = use_gpu
         self.requested_backend = "gpu" if use_gpu else "cpu"
-        self.strict_backend = bool(strict_backend)
         self.gpu_processor = None
         self._initialized = False
         self._gpu_checked = False
@@ -40,7 +38,6 @@ class ComputeBackend:
             "status": "pending",
             "available": True,
             "dtype": COMPUTE_DTYPE_NAME,
-            "strict_backend": self.strict_backend,
         }
         if not lazy:
             self.ensure_initialized()
@@ -61,7 +58,6 @@ class ComputeBackend:
             "status": "active",
             "available": True,
             "dtype": COMPUTE_DTYPE_NAME,
-            "strict_backend": self.strict_backend,
         }
 
         try:
@@ -98,15 +94,12 @@ class ComputeBackend:
                     })
                     logger.info("GPU backend: %s", self.backend_info["device_name"])
                 else:
-                    if self.strict_backend:
-                        raise GPUUnavailableError("Requested GPU backend is unavailable")
                     logger.info("GPU not available, using CPU")
                     self.use_gpu = False
-            except GPU_FALLBACK_ERRORS:
-                raise
+            except GPU_FALLBACK_ERRORS as exc:
+                logger.warning("GPU initialization failed: %s", exc)
+                self.use_gpu = False
             except Exception as exc:
-                if self.strict_backend:
-                    raise GPUUnavailableError(str(exc)) from exc
                 logger.warning("GPU initialization failed: %s", exc)
                 self.use_gpu = False
 
@@ -127,8 +120,6 @@ class ComputeBackend:
                     protocol.record_stage(stage, actual_backend="gpu", dtype=COMPUTE_DTYPE_NAME)
                 return np.asarray(result, dtype=COMPUTE_DTYPE)
             except GPU_FALLBACK_ERRORS as exc:
-                if self.strict_backend or (protocol is not None and protocol.strict_backend):
-                    raise
                 logger.warning("GPU computation failed: %s. Using CPU.", exc)
                 if protocol is not None:
                     protocol.record_fallback(
@@ -193,7 +184,6 @@ class ComputeBackend:
         self.backend_info.update({
             "requested_backend": self.requested_backend,
             "dtype": COMPUTE_DTYPE_NAME,
-            "strict_backend": self.strict_backend,
             "cpu_engine": getattr(self, "cpu_engine", "numba-flat"),
         })
         return dict(self.backend_info, gpu_checked=self._gpu_checked)
@@ -229,16 +219,11 @@ class ComputeBackend:
             })
             logger.info("Switched to GPU backend: %s", self.backend_info["device_name"])
         else:
-            if self.strict_backend:
-                raise GPUUnavailableError("Requested GPU backend is unavailable")
             self.use_gpu = False
             self.backend_info.update({"use_gpu": False, "device_name": "CPU", "gpu_available": False})
             logger.warning("GPU not available, staying on CPU")
         return self.use_gpu
 
-    def set_strict_backend(self, enabled: bool) -> None:
-        self.strict_backend = bool(enabled)
-        self.backend_info["strict_backend"] = self.strict_backend
 
     def toggle_backend(self) -> bool:
         return self.set_use_gpu(not self.use_gpu)

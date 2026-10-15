@@ -3,6 +3,7 @@ import sys
 import warnings
 import platform
 from uuid import uuid4
+from pathlib import Path
 from dataclasses import replace
 
 
@@ -68,7 +69,7 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 import numpy as np
 from PIL import Image
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from Gram_Shmidt import change_channels
 from history.source_image import save_run_image
@@ -82,6 +83,7 @@ from history.pipeline_resume import (
 from history.pipeline_state import (
     stage_statuses, minimal_execution_plan, mark_stage_ready,
     format_stage_status, format_execution_plan,
+    requested_stage_names, STAGE_LABELS,
 )
 from result_naming import (
     CHANNEL_CODES,
@@ -110,7 +112,7 @@ from compute.channel_analysis import (
 from image_cropper_app import run_cropper
 from pipette import run_pipette
 from utils.gui import TkinterApp, ScrollableFrame, CollapsibleFrame
-from utils.tooltip import HoverTooltip
+from utils.help_icon import HelpIcon
 from utils.progress_manager import ProgressManager
 from utils.theme import AppTheme
 from utils.icon_button import IconButton
@@ -142,6 +144,7 @@ class ImageProcessor:
         self.tasks = []
         self.current_task_index = -1
         self.root_folder_path = ""
+        self.experiment_id = None
 
         # Инициализация бэкендов
         from compute.backend import ComputeBackend
@@ -172,8 +175,9 @@ class ImageProcessor:
 
         # Создаём корневую папку для первой задачи
         if len(self.tasks) == 1:
-            root_folder_name = run_root_folder_name(datetime.now())
+            root_folder_name = run_root_folder_name(datetime.now()) + "_" + uuid4().hex[:8]
             self.create_downloads_folder(root_folder_name)
+            self.experiment_id = uuid4().hex
         return task.task_id
 
     def remove_task(self, task_id):
@@ -450,8 +454,6 @@ class ImageProcessor:
             return result
 
         except GPU_FALLBACK_ERRORS as e:
-            if self.backend.strict_backend:
-                raise
             self.progress.log_error(
                 f"GPU батчевая обработка недоступна ({e.__class__.__name__}): {e}. Возврат к CPU."
             )
@@ -548,8 +550,6 @@ class ImageProcessor:
                     )
 
                 except GPU_FALLBACK_ERRORS as e:
-                    if task.execution_protocol.strict_backend or self.backend.strict_backend:
-                        raise
                     self.progress.log_error(
                         f"Ошибка инфраструктуры GPU ({e.__class__.__name__}): {e}. Переход на CPU..."
                     )
@@ -649,7 +649,7 @@ class ImageProcessor:
             channel = task.analysis_data[channel_index].astype(np.float32)
             for scale in task.scales:
                 scale_folder = self.create_scale_folder(scale, task_folder)
-                output_folder = os.path.join(scale_folder, "wavelets_2d")
+                output_folder = os.path.join(scale_folder, "wavelets")
                 os.makedirs(output_folder, exist_ok=True)
 
                 for angle in task.orientations:
@@ -677,8 +677,6 @@ class ImageProcessor:
                             mapped = classify_gpu_exception(error)
                             if mapped is None:
                                 raise
-                            if task.execution_protocol.strict_backend or self.backend.strict_backend:
-                                raise mapped from error
                             self.progress.log_error(
                                 f"Ошибка 2D Morlet на GPU ({mapped.__class__.__name__}): "
                                 f"{mapped}. Переход на CPU."
@@ -710,14 +708,8 @@ class ImageProcessor:
 
                     file_stem = cwt2d_stem(channel_code, scale, angle)
                     magnitude = np.abs(coefficients)
-                    save_coefficient_preview(task_folder, file_stem, coefficients)
+                    save_coefficient_preview(output_folder, file_stem, coefficients)
                     phase = np.angle(coefficients)
-
-                    if task.output_wavelet_numpy:
-                        np.save(
-                            os.path.join(output_folder, file_stem + "_complex.npy"),
-                            coefficients
-                        )
 
                     if task.output_wavelet_text:
                         np.savetxt(
@@ -774,12 +766,14 @@ class ImageProcessor:
         for channel in range(len(channel_meta)):
             for scale in range(task.num_scale):
                 scale_folder_path = self.create_scale_folder(task.scales[scale], task_folder)
+                wavelets_folder = os.path.join(scale_folder_path, "wavelets")
+                os.makedirs(wavelets_folder, exist_ok=True)
                 array_2d = task.result[type_data][channel][scale]
                 file_stem = cwt1d_stem(
                     cwt_axis, channel_codes[channel], task.scales[scale]
                 )
                 save_coefficient_preview(
-                    task.task_folder_path, file_stem, array_2d
+                    os.path.join(scale_folder_path, "wavelets"), file_stem, array_2d
                 )
 
                 current_scale += 1
@@ -790,7 +784,7 @@ class ImageProcessor:
 
                 if info_out == 0 or info_out == 10:
                     filename = file_stem + ".txt"
-                    file_path = os.path.join(scale_folder_path, filename)
+                    file_path = os.path.join(wavelets_folder, filename)
                     np.savetxt(file_path, array_2d, fmt='%.3f', delimiter=",")
                     self.progress.log_debug(f"Сохранен текстовый файл: {file_path}")
 
@@ -803,20 +797,12 @@ class ImageProcessor:
                     fig.colorbar(im, ax=ax)
                     fig.savefig(
                         os.path.join(
-                            scale_folder_path,
+                            wavelets_folder,
                             file_stem + ".png"),
                         dpi=300)
 
                     plt.close(fig)
 
-                if task.output_wavelet_numpy:
-                    np.save(
-                        os.path.join(
-                            scale_folder_path,
-                            file_stem + ".npy"
-                        ),
-                        array_2d
-                    )
     @staticmethod
     def find_extremes(coefs, row_var, col_var, max_var, min_var,
                       distance=1, prominence=0.0):
@@ -856,7 +842,8 @@ class ImageProcessor:
         # object is rebound with a minimal globals dictionary.
         from history.pipeline_resume import (
             cwt_signature as _resume_cwt_signature,
-            load_point_cache as _load_point_cache,
+            load_point_cache as _load_point_cache_impl,
+            point_cache_path as _point_cache_path,
             save_point_cache as _save_point_cache,
         )
         from history.pipeline_state import stage_statuses as _stage_statuses
@@ -878,6 +865,8 @@ class ImageProcessor:
         import os as _profile_os
         import time as _profile_time
         from compute.stage_profiling import StageProfile, current_rss_bytes, format_mib
+        from compute.backend_policy import GPU_FALLBACK_ERRORS as _GPU_FALLBACK_ERRORS
+        import numpy as _point_np
 
         point_pipeline_started = _profile_time.perf_counter()
         point_pipeline_rss_start = current_rss_bytes()
@@ -906,6 +895,7 @@ class ImageProcessor:
             "points": 0,
             "links": 0,
             "stored_bytes": 0,
+            "resident_bytes": 0,
             "image_files": 0,
             "image_sampled_files": 0,
             "image_source_points": 0,
@@ -925,27 +915,33 @@ class ImageProcessor:
             "cache_read": StageProfile("Point cache read"),
             "cache_write_extrema": StageProfile("Extrema cache write"),
             "cache_write_envelopes": StageProfile("Envelopes cache write"),
+            "cache_retire": StageProfile("Point cache retire"),
             "text_export_extrema": StageProfile("Extrema TXT export"),
             "text_export_envelopes": StageProfile("Envelopes TXT export"),
             "image_export_extrema": StageProfile("Extrema PNG export"),
             "image_export_envelopes": StageProfile("Envelopes PNG export"),
             "knn_result_store": StageProfile("KNN result store"),
+            "canonical_point_npz": StageProfile("Point canonical NPZ write"),
         }
         point_profile_stats = {
             "cache_files_written": 0,
             "cache_bytes_written": 0,
             "cache_files_read": 0,
+            "cache_files_retired": 0,
+            "cache_bytes_retired": 0,
             "extrema_text_files": 0,
             "extrema_text_points": 0,
             "envelope_text_files": 0,
             "envelope_text_points": 0,
             "extrema_image_files": 0,
             "envelope_image_files": 0,
+            "canonical_point_files": 0,
+            "canonical_point_bytes": 0,
         }
 
         def _read_point_cache(*args):
             with point_profiles["cache_read"].measure():
-                result = _read_point_cache(*args, as_array=True)
+                result = _load_point_cache_impl(*args, as_array=True)
             if result is not None:
                 point_profile_stats["cache_files_read"] += 1
             return result
@@ -959,6 +955,59 @@ class ImageProcessor:
             except OSError:
                 pass
             return path
+
+        def _retire_point_cache(artifact, cwt_axis, feature_axis, channel, scale, kind):
+            """Drop the duplicate hidden NPY after canonical NPZ is durable.
+
+            ``load_point_cache`` already falls back to the scale-folder NPZ, so
+            keeping both byte-identical point stores after a successful publish
+            only wastes disk space.  Empty point clouds intentionally keep their
+            tiny cache file because no canonical NPZ is emitted for them.
+            """
+            cache_path = _point_cache_path(
+                resume_cache_folder, artifact, cwt_axis, feature_axis,
+                channel, scale, kind
+            )
+            if not cache_path.is_file():
+                return
+            try:
+                size = cache_path.stat().st_size
+            except OSError:
+                size = 0
+            try:
+                with point_profiles["cache_retire"].measure():
+                    cache_path.unlink()
+            except OSError:
+                return
+            point_profile_stats["cache_files_retired"] += 1
+            point_profile_stats["cache_bytes_retired"] += size
+
+        def _save_points_npz(path, title, local_points, native_shape):
+            """Save the canonical lossless point layer without ZIP compression.
+
+            Extrema/envelope coordinates are already compact ``int32`` Nx2 arrays.
+            ``np.savez_compressed`` spent tens of seconds deflating tens of
+            millions of coordinates on large images, while the scientific GPU
+            stages had already finished.  Uncompressed NPZ keeps the exact same
+            viewer/resume schema (``points`` + ``shape``), but turns the write
+            into a sequential binary I/O operation.
+            """
+            if local_points is None or len(local_points) == 0:
+                return
+            points = _point_np.asarray(local_points, dtype=_point_np.int32).reshape(-1, 2)
+            filename = _profile_os.path.join(path, f"{title}.npz")
+            with point_profiles["canonical_point_npz"].measure():
+                _point_np.savez(
+                    filename,
+                    points=points,
+                    shape=_point_np.asarray(native_shape, dtype=_point_np.int32),
+                )
+            point_profile_stats["canonical_point_files"] += 1
+            try:
+                point_profile_stats["canonical_point_bytes"] += _profile_os.path.getsize(filename)
+            except OSError:
+                pass
+            return filename
 
         total_envelope_input_points = 0
         total_envelope_points = 0
@@ -976,6 +1025,17 @@ class ImageProcessor:
             "Профилирование Extrema/Envelopes: perf_counter + process RSS "
             "(пиковая память, шаг выборки 20 мс)"
         )
+        if self.backend.use_gpu:
+            self.progress.log_info(
+                "Extrema backend: GPU (CuPy/CUDA; strict vectorized, "
+                "distance/prominence — SciPy CPU (hybrid, без GPU-вызовов на каждую линию))"
+            )
+
+        if self.backend.use_gpu and plan.envelopes:
+            self.progress.log_info(
+                "Envelopes backend: GPU (vectorized grouped sparse PCHIP; "
+                "без построчных GPU→CPU синхронизаций)"
+            )
 
         use_gpu_knn = bool(plan.knn and self.backend.use_gpu)
         if plan.knn:
@@ -1039,7 +1099,10 @@ class ImageProcessor:
         channels_to_process = list(range(available_count))
         total_operations = len(branches) * len(channels_to_process) * task.num_scale
         current_operation = 0
-        extremes = []
+        # Point clouds are persisted immediately to canonical NPZ files.
+        # Do not keep a second run-wide list of every extrema/envelope array:
+        # on 1920x2560 stress runs it can retain hundreds of MiB until the end
+        # of the stage for no downstream purpose.
         total_extrema_points = 0
 
         scale_block_sizes = getattr(task, "scale_block_sizes", [5])
@@ -1056,7 +1119,7 @@ class ImageProcessor:
         interpolator = Interpolator(self.backend) if plan.envelopes else None
         if plan.envelopes:
             self.progress.log_info(
-                "Огибающие: grouped PCHIP, sparse CPU/GPU parity path "
+                "Огибающие: vectorized grouped sparse PCHIP на выбранном backend "
                 "(без плотной H×W матрицы огибающей)"
             )
 
@@ -1149,18 +1212,24 @@ class ImageProcessor:
                         # Device selection changes execution, not the definition
                         # of an extremum.
                         with extrema_profile.measure():
-                            if self.backend.use_gpu:
+                            # Strict extrema are computed on GPU. Filtered extrema
+                            # use the SciPy CPU reference to avoid costly per-line
+                            # cupyx find_peaks calls and preserve scientific parity.
+                            use_gpu_extrema = self.backend.use_gpu
+                            extrema_fallback = False
+                            if use_gpu_extrema:
                                 try:
                                     detected = ExtremesFinder.find_extremes_gpu(
                                         coefs_2d, **detection_kwargs
                                     )
-                                    extrema_backend = "gpu"
-                                    extrema_algorithm = "cupyx-find-peaks-parity"
-                                except GPU_FALLBACK_ERRORS as exc:
-                                    if self.backend.strict_backend or (
-                                        protocol is not None and protocol.strict_backend
-                                    ):
-                                        raise
+                                    extrema_backend = "cpu-hybrid" if filtered_extrema else "gpu"
+                                    extrema_algorithm = (
+                                        "scipy-find-peaks-hybrid-host-v3"
+                                        if filtered_extrema
+                                        else "cupy-strict-vectorized-v2"
+                                    )
+                                except _GPU_FALLBACK_ERRORS as exc:
+                                    extrema_fallback = True
                                     if protocol is not None:
                                         protocol.record_fallback(
                                             extrema_stage,
@@ -1177,17 +1246,25 @@ class ImageProcessor:
                                     coefs=coefs_2d, **detection_kwargs
                                 )
                                 extrema_backend = "cpu"
-                                extrema_algorithm = "scipy-find-peaks-reference"
+                                extrema_algorithm = (
+                                    "scipy-find-peaks-filtered"
+                                    if filtered_extrema
+                                    else "numpy-strict-vectorized"
+                                )
                             if protocol is not None:
                                 protocol.record_stage(
                                     extrema_stage, actual_backend=extrema_backend,
                                     dtype=COMPUTE_DTYPE_NAME,
-                                    fallback=(self.backend.use_gpu and extrema_backend == "cpu"),
+                                    fallback=extrema_fallback,
                                     details={
                                         "algorithm": extrema_algorithm,
                                         "distance": extrema_distance,
                                         "prominence": extrema_prominence,
-                                        "backend_policy": "cpu-gpu-mathematical-parity",
+                                        "backend_policy": (
+                                            "scipy-filtered-host-primary" if extrema_backend == "cpu-hybrid"
+                                            else "gpu-vectorized-primary" if extrema_backend == "gpu"
+                                            else "cpu-fallback"
+                                        ),
                                     },
                                 )
                         coefs_2d, pmaxr, pmaxc, pminr, pminc = detected
@@ -1377,10 +1454,28 @@ class ImageProcessor:
                                 channel_code, scale_value, kind,
                             )
                             profile_suffix = "extrema" if artifact == "ext" else "envelopes"
+                            # NPZ is the canonical lossless point representation
+                            # used by the built-in viewer, independent of export choices.
+                            stage_folder = os.path.join(
+                                scale_folder, "extremes" if artifact == "ext" else "envelopes"
+                            )
+                            os.makedirs(stage_folder, exist_ok=True)
+                            canonical_path = _save_points_npz(
+                                stage_folder, title, points, coefs_2d.shape[:2]
+                            )
+                            # The canonical uncompressed NPZ is also a valid
+                            # resume source.  Once it is safely written, remove
+                            # the duplicate hidden NPY cache for this non-empty
+                            # point cloud.
+                            if canonical_path and resume_cache_folder:
+                                _retire_point_cache(
+                                    artifact, cwt_axis, feature_axis, channel_code,
+                                    scale_value, kind
+                                )
                             if save_text:
                                 with point_profiles[f"text_export_{profile_suffix}"].measure():
                                     self.save_extremes_to_file(
-                                        scale_folder, title, points
+                                        stage_folder, title, points
                                     )
                                 if artifact == "ext":
                                     point_profile_stats["extrema_text_files"] += 1
@@ -1391,15 +1486,13 @@ class ImageProcessor:
                             if save_image:
                                 with point_profiles[f"image_export_{profile_suffix}"].measure():
                                     self.save_extremes_graphic(
-                                        scale_folder, title, points,
+                                        stage_folder, title, points,
                                         coefs_2d=coefs_2d,
                                     )
                                 if artifact == "ext":
                                     point_profile_stats["extrema_image_files"] += 1
                                 else:
                                     point_profile_stats["envelope_image_files"] += 1
-
-                    extremes.append(knn_extremes)
 
                     if plan.knn:
                         self.progress.update_progress(
@@ -1408,10 +1501,11 @@ class ImageProcessor:
                         from compute.knn.knn_cpu import (
                             process_extremes_with_knn,
                         )
+                        os.makedirs(os.path.join(scale_folder, "knn"), exist_ok=True)
                         with knn_total_profile.measure():
                             knn_result = process_extremes_with_knn(
                                 knn_extremes,
-                                scale_folder,
+                                os.path.join(scale_folder, "knn"),
                                 knn_var,
                                 task.original_image,
                                 knn_bool_text_var,
@@ -1423,9 +1517,7 @@ class ImageProcessor:
                                 protocol=protocol,
                                 profiling=knn_profiles,
                                 profiling_stats=knn_profile_stats,
-                                print_npz_var=bool(
-                                    getattr(task, "output_knn_npz", True)
-                                ),
+                                print_npz_var=True,
                                 png_max_points=int(
                                     getattr(task, "knn_png_max_points", 50000)
                                 ),
@@ -1441,6 +1533,18 @@ class ImageProcessor:
                                             point_type,
                                         )
                                     ] = payload
+
+                    # All complete point/KNN artifacts for this scale are now
+                    # on disk. Drop the last strong references immediately so
+                    # RAM usage follows one working scale instead of the sum of
+                    # every processed scale/channel/direction.
+                    knn_result = None
+                    knn_extremes = None
+                    raw_by_axis = None
+                    pmaxr = pmaxc = pminr = pminc = None
+                    raw_max = raw_min = upper_points = lower_points = None
+                    detected = None
+                    coefs_2d = None
 
                 if plan.statistics:
                     for feature in feature_axes:
@@ -1514,24 +1618,31 @@ class ImageProcessor:
             "Point I/O workload — "
             f"cache reads={point_profile_stats['cache_files_read']}, "
             f"cache writes={point_profile_stats['cache_files_written']}, "
-            f"cache size={point_profile_stats['cache_bytes_written'] / (1024 ** 2):.1f} MiB, "
+            f"cache written={point_profile_stats['cache_bytes_written'] / (1024 ** 2):.1f} MiB, "
+            f"cache retired={point_profile_stats['cache_files_retired']} files/"
+            f"{point_profile_stats['cache_bytes_retired'] / (1024 ** 2):.1f} MiB, "
+            f"cache retained={(point_profile_stats['cache_bytes_written'] - point_profile_stats['cache_bytes_retired']) / (1024 ** 2):.1f} MiB, "
             f"Extrema TXT={point_profile_stats['extrema_text_files']} files/"
             f"{point_profile_stats['extrema_text_points']} points, "
             f"Envelopes TXT={point_profile_stats['envelope_text_files']} files/"
             f"{point_profile_stats['envelope_text_points']} points, "
             f"Extrema PNG={point_profile_stats['extrema_image_files']}, "
-            f"Envelopes PNG={point_profile_stats['envelope_image_files']}"
+            f"Envelopes PNG={point_profile_stats['envelope_image_files']}, "
+            f"canonical point NPZ={point_profile_stats['canonical_point_files']} files/"
+            f"{point_profile_stats['canonical_point_bytes'] / (1024 ** 2):.1f} MiB"
         )
         point_profile_labels = (
             ("compact arrays", "compact"),
             ("cache read", "cache_read"),
             ("Extrema cache write", "cache_write_extrema"),
             ("Envelopes cache write", "cache_write_envelopes"),
+            ("cache retire", "cache_retire"),
             ("Extrema TXT export", "text_export_extrema"),
             ("Envelopes TXT export", "text_export_envelopes"),
             ("Extrema PNG export", "image_export_extrema"),
             ("Envelopes PNG export", "image_export_envelopes"),
             ("KNN result store", "knn_result_store"),
+            ("canonical point NPZ write", "canonical_point_npz"),
         )
         for label, key in point_profile_labels:
             if point_profiles[key].computed_calls:
@@ -1545,7 +1656,8 @@ class ImageProcessor:
                 f"groups={knn_profile_stats['groups']}, "
                 f"points={knn_profile_stats['points']}, "
                 f"links={knn_profile_stats['links']}, "
-                f"compact stored={knn_profile_stats['stored_bytes'] / (1024 ** 2):.1f} MiB, "
+                f"logical arrays={knn_profile_stats['stored_bytes'] / (1024 ** 2):.1f} MiB, "
+                f"resident after store={knn_profile_stats['resident_bytes'] / (1024 ** 2):.1f} MiB, "
                 f"NPZ files={knn_profile_stats['npz_files']}, "
                 f"NPZ size={knn_profile_stats['npz_bytes'] / (1024 ** 2):.1f} MiB, "
                 f"TXT files={knn_profile_stats['text_files']}, "
@@ -1642,7 +1754,9 @@ class ImageProcessor:
             f"end={format_mib(point_pipeline_rss_end)}"
         )
         self.progress.update_progress(1.0, "Экстремумы и огибающие завершены")
-        return extremes
+        # Historical callers ignored this return value; canonical point/KNN
+        # artifacts and task metadata are the authoritative results.
+        return []
 
     @staticmethod
     def _valid_point_collection(points):
@@ -1665,9 +1779,10 @@ class ImageProcessor:
         cwt_axis = branch["cwt_axis"]
         feature_axis = feature["axis"]
         coordinate = "y" if feature_axis == "row" else "x"
-        histogram_dir = os.path.join(
-            task.task_folder_path,
-            "statistics",
+        histogram_dir = (
+            os.path.join(task.task_folder_path, "scales", scale_folder_name(scales[0]), "statistics")
+            if len(set(map(str, scales))) == 1 else
+            os.path.join(task.task_folder_path, "statistics")
         )
         file_base = statistics_stem(
             cwt_axis, feature_axis, channel_code,
@@ -1803,6 +1918,23 @@ class ImageProcessor:
                 task.synchronization_results[
                     (channel_code, block_size, metric_name)
                 ] = results
+
+    @staticmethod
+    def save_points_npz(path, title, local_points, native_shape):
+        """Save lossless point data for the internal viewer.
+
+        Point clouds are stored as uncompressed NPZ because they are already
+        compact int32 arrays and compression is disproportionately expensive on
+        multi-million-point runs.  The file schema is unchanged.
+        """
+        if local_points is None or len(local_points) == 0:
+            return
+        points = np.asarray(local_points, dtype=np.int32).reshape(-1, 2)
+        np.savez(
+            os.path.join(path, f"{title}.npz"),
+            points=points,
+            shape=np.asarray(native_shape, dtype=np.int32),
+        )
 
     @staticmethod
     def save_extremes_to_file(path, title, local_points):
@@ -2591,17 +2723,8 @@ class ImageProcessor:
                     f"Вычислительный бэкенд: {self.backend.get_backend_info()['device_name']}")
             requested_backend = getattr(self.backend, "requested_backend", "gpu" if self.backend.use_gpu else "cpu")
             task.requested_backend = requested_backend
-            task.strict_backend = bool(getattr(task, "strict_backend", False))
-            self.backend.set_strict_backend(task.strict_backend)
-            task.execution_protocol.reset(
-                requested_backend=requested_backend,
-                strict_backend=task.strict_backend,
-            )
+            task.execution_protocol.reset(requested_backend=requested_backend)
             if requested_backend == "gpu" and not self.backend.use_gpu:
-                if task.strict_backend:
-                    raise GPUUnavailableError(
-                        "Строгий режим: запрошен GPU, но CUDA backend недоступен"
-                    )
                 task.execution_protocol.record_fallback(
                     "backend_initialization",
                     reason="GPUUnavailableError",
@@ -2717,9 +2840,11 @@ class ImageProcessor:
                         selected.append("KNN")
                     if "statistics" in execution_plan:
                         selected.append("статистики")
-                    self.progress.update_progress(0.7, "Начало анализа точек...")
+                    # Use the exact name registered by begin_run().  A dynamic
+                    # "Досчёт" label used to append an unexpected fifth stage.
+                    self.progress.update_progress(1.0)
                     self.progress.begin_stage(
-                        f"{task.task_name} · Досчёт: {', '.join(selected)}"
+                        f"{task.task_name} · {task.execution_stage_names()[2]}"
                     )
                     self.compute_points(
                         task,
@@ -2743,8 +2868,13 @@ class ImageProcessor:
                     if "statistics" in execution_plan:
                         mark_stage_ready(task, "statistics")
                 elif pipeline_plan.point_pipeline_required:
-                    self.progress.log_info(
-                        "Все выбранные этапы анализа точек уже актуальны — пересчёт пропущен"
+                    # This stage is in the run plan even if all point results
+                    # are ready; complete it instead of leaving progress at CWT.
+                    self.progress.begin_stage(
+                        f"{task.task_name} · {task.execution_stage_names()[2]}"
+                    )
+                    self.progress.update_progress(
+                        1.0, "Все выбранные этапы анализа точек уже актуальны"
                     )
 
             task.last_completed_cwt_signature = current_cwt_signature
@@ -2769,11 +2899,29 @@ class ImageProcessor:
                 pass
             raise
         finally:
-            # Очищаем тяжёлые временные коэффициенты; KNN/статистики остаются
-            # доступными для ML и истории. Исходный RGB не меняется.
+            # Heavy scientific arrays are persisted to canonical files.  Keep
+            # only lightweight task metadata/disk-backed KNN descriptors in
+            # memory between experiments.
+            from compute.stage_profiling import (
+                current_rss_bytes as _task_rss, format_mib as _task_mib,
+            )
+            _rss_before_cleanup = _task_rss()
             task.result = {}
             clear_prepared_channels(task)
-            # self.clear_gpu_cache()
+            try:
+                self.clear_gpu_memory()
+            except Exception:
+                pass
+            
+            import gc as _task_gc
+            _task_gc.collect()
+            _rss_after_cleanup = _task_rss()
+            self.progress.log_info(
+                "Очистка памяти после задачи: "
+                f"RSS {_task_mib(_rss_before_cleanup)} → "
+                f"{_task_mib(_rss_after_cleanup)}; "
+                f"KNN metadata groups={len(getattr(task, 'knn_results', {}))}"
+            )
 
     @staticmethod
     def _get_output_type(wp_var1, wp_var2):
@@ -2968,6 +3116,11 @@ class App(TkinterApp):
         super().__init__()
         self._compute_thread = None
         self._ml_thread = None
+        self._waiting_to_close = False
+        self._close_started_at = None
+        # Bind explicitly on the concrete App, after CTk has initialized.
+        # The callback must remain functional even when a worker is active.
+        self.protocol("WM_DELETE_WINDOW", self.safe_destroy)
         # Explicit UI lock states. Never infer widget availability from
         # Thread.is_alive(): worker shutdown and Tk callbacks are asynchronous.
         self._ml_ui_locked = False
@@ -3073,7 +3226,7 @@ class App(TkinterApp):
         self.history_button.pack(side="right", padx=3)
 
         # Постоянная панель задач и единая рабочая область со вкладками.
-        self.main_container = ctk.CTkFrame(self)
+        self.main_container = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
         self.main_container.pack(
             fill="both", expand=True,
             padx=AppTheme.WINDOW_PADDING,
@@ -3097,7 +3250,9 @@ class App(TkinterApp):
                                         fg_color=AppTheme.BORDER, cursor='sb_h_double_arrow')
         self.sidebar_grip.place(relx=1, rely=0, relheight=1, anchor='ne')
         self.sidebar_grip.bind('<B1-Motion>', self._resize_tasks_panel)
-        self.workspace_frame = ctk.CTkFrame(self.main_container)
+        self.workspace_frame = ctk.CTkFrame(
+            self.main_container, fg_color="transparent", corner_radius=0
+        )
         self.workspace_frame.grid(
             row=0, column=1, sticky="nsew",
             padx=(AppTheme.PANEL_GAP // 2, 0)
@@ -3110,9 +3265,13 @@ class App(TkinterApp):
 
         yield "Подготовка панели выполнения…"
         self.progress_manager = ProgressManager(self)
-        self.cancel_compute_button = ctk.CTkButton(self.progress_manager.frame, text='Отменить расчёт',
-                                                   command=self._request_cancel, state='disabled', width=150)
-        self.cancel_compute_button.pack(anchor='e', padx=12, pady=3)
+        self.cancel_compute_button = ctk.CTkButton(
+            self.progress_manager.completion_actions,
+            text='Отменить расчёт', command=self._request_cancel,
+            state='disabled', width=150,
+            height=AppTheme.COMPACT_CONTROL_HEIGHT,
+        )
+        self.cancel_compute_button.pack(side='right')
 
         # менеджер изображений
         self.image_processor = ImageProcessor(self.progress_manager)
@@ -3151,7 +3310,6 @@ class App(TkinterApp):
         # Переменная для GPU/CPU переключения
         self.use_gpu_var = tk.BooleanVar(value=True)
         self.compute_device_var = tk.StringVar(value="cpu")
-        self.strict_backend_var = tk.BooleanVar(value=False)
 
         # Обновляем UI после инициализации image_processor
         yield "Завершение подготовки…"
@@ -3273,7 +3431,24 @@ class App(TkinterApp):
             child.destroy()
 
         try:
-            runs = self.run_history.list_runs(limit=self._welcome_recent_limit())
+            latest = {}
+            for entry in self.run_history.list_runs(limit=1000):
+                latest.setdefault(entry['experiment_id'], entry)
+            runs = []
+            for experiment in self.run_history.list_experiments(limit=self._welcome_recent_limit()):
+                entry = latest.get(experiment['id'])
+                if entry is None:
+                    entry = {
+                        'id': -1, 'experiment_id': experiment['id'],
+                        'experiment_name': experiment['name'],
+                        'experiment_root': experiment['root_path'],
+                        'created_at': experiment['created_at'],
+                        'status': '', 'output_path': experiment['root_path'],
+                        'analysis_mode': '—', 'pipeline_preset': 'Нет расчётов',
+                        'image_path': '', 'duration_seconds': 0,
+                        'researcher_note': '',
+                    }
+                runs.append(entry)
         except Exception as error:
             ctk.CTkLabel(
                 container,
@@ -3349,7 +3524,7 @@ class App(TkinterApp):
         top = ctk.CTkFrame(card, fg_color="transparent")
         top.pack(fill="x", padx=12, pady=(6, 2))
         ctk.CTkLabel(
-            top, text=f"Эксперимент №{run['id']}",
+            top, text=run.get("experiment_name", f"Исследование {run['experiment_id'][:8]}"),
             font=ctk.CTkFont(size=15, weight="bold"), anchor="w"
         ).pack(side="left")
         ctk.CTkLabel(
@@ -3379,12 +3554,12 @@ class App(TkinterApp):
                 middle, text="Результаты", width=96, height=25,
                 fg_color="transparent", hover_color=AppTheme.NAV_HOVER,
                 text_color=AppTheme.NAV_TEXT_ACTIVE, font=ctk.CTkFont(size=13),
-                command=lambda folder=run["output_path"]: self._open_results_from_welcome(folder),
+                command=lambda folder=run["experiment_root"]: self._open_results_from_welcome(folder),
             ).pack(side="right", padx=(6, 0))
         ctk.CTkButton(
             middle, text="Продолжить", width=102, height=25,
             font=ctk.CTkFont(size=13),
-            command=lambda run_id=run["id"]: self._continue_research(run_id)
+            command=lambda experiment_id=run["experiment_id"]: self._restore_experiment(experiment_id)
         ).pack(side="right")
 
         meta = [
@@ -3471,7 +3646,11 @@ class App(TkinterApp):
                 pady=(2, AppTheme.SECTION_GAP),
             )
         if hasattr(self, "progress_manager") and not self.progress_manager.frame.winfo_manager():
-            self.progress_manager.frame.pack(fill="x", padx=20, pady=(4, 10))
+            self.progress_manager.frame.pack(
+                fill="x",
+                padx=AppTheme.WINDOW_PADDING + AppTheme.PANEL_GAP,
+                pady=(4, 10),
+            )
         current_tab = None
         if hasattr(self, "workspace_tabs"):
             current_tab = self.workspace_tabs.current_tab()
@@ -3480,12 +3659,21 @@ class App(TkinterApp):
         )
 
     def _start_new_research(self):
+        """Begin an independent experiment, rather than append to the old one."""
+        if getattr(self, '_compute_ui_locked', False) or getattr(self, '_ml_ui_locked', False):
+            mb.showwarning("Исследование", "Сначала завершите текущий расчёт")
+            return
+        self.image_processor.tasks.clear()
+        self.image_processor.current_task_index = -1
+        self.image_processor.root_folder_path = ""
+        self.image_processor.experiment_id = None
+        self.current_task = None
         self._show_workspace()
         self.add_new_task()
 
     def _continue_research(self, run_id):
         self._show_workspace()
-        self._restore_history_run(run_id)
+        self._restore_experiment(self.run_history.get_run(run_id)["experiment_id"])
 
     def _open_results_from_welcome(self, folder):
         self._show_workspace()
@@ -3580,11 +3768,11 @@ class App(TkinterApp):
         self.extrema_distance_var = tk.StringVar(value="1")
         self.extrema_prominence_var = tk.StringVar(value="0.0")
         self.wp_var1 = tk.BooleanVar(value=False)
-        self.wp_var2 = tk.BooleanVar(value=True)
+        self.wp_var2 = tk.BooleanVar(value=False)
         self.wavelet_numpy_var = tk.BooleanVar(value=False)
-        self.p_ex_var1 = tk.BooleanVar(value=True)
+        self.p_ex_var1 = tk.BooleanVar(value=False)
         self.p_ex_var2 = tk.BooleanVar(value=False)
-        self.envelope_text_var = tk.BooleanVar(value=True)
+        self.envelope_text_var = tk.BooleanVar(value=False)
         self.envelope_image_var = tk.BooleanVar(value=False)
         self.knn_bool_npz_var = tk.BooleanVar(value=True)
         self.knn_bool_text_var = tk.BooleanVar(value=False)
@@ -3594,7 +3782,7 @@ class App(TkinterApp):
         self.centering_means_var = tk.BooleanVar(value=False)
         self.calculate_statistics_var = tk.BooleanVar(value=False)
         self.statistics_image_var = tk.BooleanVar(value=False)
-        self.statistics_csv_var = tk.BooleanVar(value=True)
+        self.statistics_csv_var = tk.BooleanVar(value=False)
         self.calculate_sync_var = tk.BooleanVar(value=False)
         self.sync_heatmap_var = tk.BooleanVar(value=False)
         self.sync_matrix_csv_var = tk.BooleanVar(value=True)
@@ -3792,7 +3980,7 @@ class App(TkinterApp):
             self.results_panel = ResultsPanel(self.workspace_tabs.tab(name))
             self.results_panel.pack(fill="both", expand=True)
             task = getattr(self, 'current_task', None)
-            self.results_panel.load_folder(task.task_folder_path if task else '')
+            self.results_panel.load_folder(self.image_processor.root_folder_path)
         elif name == "ML" and not hasattr(self, 'ml_panel'):
             self.ml_panel = self._create_ml_tab(self.workspace_tabs.tab(name))
             self._update_ml_tab_state()
@@ -3969,6 +4157,7 @@ class App(TkinterApp):
         self._refresh_history_tab(force=True)
 
     def _refresh_history_tab(self, force=False):
+        """One history card per experiment, with its complete task/run tree."""
         if not hasattr(self, "history_scrollable"):
             return
         if (not force and hasattr(self, 'history_panel') and
@@ -3979,194 +4168,91 @@ class App(TkinterApp):
         for card in self.history_cards:
             card.destroy()
         self.history_cards.clear()
-        # Берём достаточно записей для локальной фильтрации и пагинации.
-        # Store возвращает их от новых к старым.
-        runs = self.run_history.list_runs(limit=1000)
-        query_source = (
-            self.history_search_entry.get()
-            if hasattr(self, "history_search_entry")
-            else self.history_search_var.get()
-        )
-        query = query_source.strip().casefold()
+        experiments = self.run_history.list_experiments(limit=1000)
+        query = self.history_search_entry.get().strip().casefold() if hasattr(
+            self, 'history_search_entry') else self.history_search_var.get().strip().casefold()
         status_filter = self.history_status_var.get()
-
-        filtered_runs = []
+        runs = self.run_history.list_runs(limit=100000)
+        grouped = {}
         for run in runs:
-            if status_filter == "Завершённые" and run["status"] != "completed":
+            grouped.setdefault(run['experiment_id'], []).append(run)
+        filtered = []
+        for experiment in experiments:
+            experiment_runs = grouped.get(experiment['id'], [])
+            if status_filter == "Завершённые" and not any(r['status'] == 'completed' for r in experiment_runs):
                 continue
-            if status_filter == "С ошибкой" and run["status"] != "failed":
+            if status_filter == "С ошибкой" and not any(r['status'] == 'failed' for r in experiment_runs):
                 continue
-            if status_filter == "Отменённые" and run["status"] != "cancelled":
+            if status_filter == "Отменённые" and not any(r['status'] == 'cancelled' for r in experiment_runs):
                 continue
-
-            # В поиск обязательно включаем номер эксперимента: запрос "11"
-            # должен находить "Эксперимент №11".
-            searchable = " ".join((
-                str(run.get("id", "")),
-                str(run.get("created_at", "")),
-                run.get("task_name", ""),
-                run.get("image_path", ""),
-                run.get("pipeline_preset", ""),
-                run.get("ml_algorithm", ""),
-                run.get("researcher_note", ""),
-                run.get("status", ""),
-            )).casefold()
-            if query and query not in searchable:
+            task_rows = self.run_history.list_tasks(experiment['id'])
+            search_blob = ' '.join([experiment['name'], experiment['root_path'], experiment['id']]
+                + [row['name'] for row in task_rows]
+                + [str(value) for r in experiment_runs for value in (
+                    r.get('task_name',''), r.get('ml_algorithm',''), r.get('researcher_note',''), r.get('image_path',''))]).casefold()
+            if query and query not in search_blob:
                 continue
-            filtered_runs.append(run)
-
-        total_runs = len(filtered_runs)
+            filtered.append((experiment, task_rows, experiment_runs))
         try:
             page_size = max(1, int(self.history_page_size_var.get()))
         except (TypeError, ValueError):
             page_size = 5
             self.history_page_size_var.set("5")
-
-        self.history_total_pages = max(
-            1, (total_runs + page_size - 1) // page_size
-        )
-        self.history_page = max(
-            1, min(self.history_page, self.history_total_pages)
-        )
-
-        start_index = (self.history_page - 1) * page_size
-        end_index = start_index + page_size
-        runs = filtered_runs[start_index:end_index]
-
-        if hasattr(self, "history_page_label"):
-            if total_runs:
-                first_number = start_index + 1
-                last_number = min(end_index, total_runs)
-                self.history_page_label.configure(
-                    text=(
-                        f"Страница {self.history_page} из "
-                        f"{self.history_total_pages} · "
-                        f"{first_number}–{last_number} из {total_runs}"
-                    )
-                )
-            else:
-                self.history_page_label.configure(text="Нет записей")
-
-        if hasattr(self, "history_prev_button"):
-            self.history_prev_button.configure(
-                state="normal" if self.history_page > 1 else "disabled"
-            )
-        if hasattr(self, "history_next_button"):
-            self.history_next_button.configure(
-                state=(
-                    "normal"
-                    if self.history_page < self.history_total_pages
-                    else "disabled"
-                )
-            )
-
+        total = len(filtered)
+        self.history_total_pages = max(1, (total + page_size - 1) // page_size)
+        self.history_page = max(1, min(self.history_page, self.history_total_pages))
+        begin = (self.history_page - 1) * page_size
+        selected = filtered[begin:begin + page_size]
+        if hasattr(self, 'history_page_label'):
+            self.history_page_label.configure(text=(
+                f"Страница {self.history_page} из {self.history_total_pages} · "
+                f"{begin + 1}–{min(begin + page_size, total)} из {total}"
+                if total else "Нет исследований"))
+        if hasattr(self, 'history_prev_button'):
+            self.history_prev_button.configure(state="normal" if self.history_page > 1 else "disabled")
+        if hasattr(self, 'history_next_button'):
+            self.history_next_button.configure(state="normal" if self.history_page < self.history_total_pages else "disabled")
         parent = self.history_scrollable.scrollable_frame
-        if not runs:
-            empty = ctk.CTkLabel(
-                parent, text="По заданным условиям запусков не найдено",
-                text_color=AppTheme.TEXT_SECONDARY, font=AppTheme.body_font()
-            )
-            empty.pack(anchor="w", padx=12, pady=16)
-            self.history_cards.append(empty)
+        if not selected:
+            label = ctk.CTkLabel(parent, text="Исследования не найдены",
+                                 text_color=AppTheme.TEXT_SECONDARY)
+            label.pack(anchor='w', padx=12, pady=16)
+            self.history_cards.append(label)
             return
-        for run in runs:
-            card = ctk.CTkFrame(
-                parent, border_width=1, border_color=AppTheme.BORDER,
-                corner_radius=8
-            )
-            card.pack(fill="x", padx=6, pady=4)
+        for experiment, tasks, task_runs in selected:
+            card = ctk.CTkFrame(parent, border_width=1, border_color=AppTheme.BORDER, corner_radius=8)
+            card.pack(fill='x', padx=6, pady=5)
             self.history_cards.append(card)
-            status = {'completed': 'Завершён', 'cancelled': 'Отменён'}.get(run['status'], 'Ошибка')
-            status_color = (AppTheme.SUCCESS if run['status'] == 'completed' else
-                            AppTheme.TEXT_SECONDARY if run['status'] == 'cancelled' else AppTheme.DANGER)
-            title = ctk.CTkFrame(card, fg_color="transparent")
-            title.pack(fill="x", padx=12, pady=(9, 2))
-            image_name = os.path.basename(run["image_path"]) or "Источник не указан"
-            ctk.CTkLabel(
-                title, text=f"Эксперимент №{run['id']} · {run['created_at'].replace('T', ' ')}",
-                font=AppTheme.section_title_font(), anchor="w"
-            ).pack(side="left", fill="x", expand=True)
-            ctk.CTkLabel(
-                title, text=status, text_color=status_color,
-                font=AppTheme.caption_font()
-            ).pack(side="right")
-            try:
-                snapshot = self.run_history.get_settings(run["id"])
-                details = self._format_history_snapshot(snapshot)
-            except Exception:
-                details = {
-                    "wavelet": "Morlet",
-                    "scales": "данные недоступны",
-                    "stages": run["pipeline_preset"],
-                    "nuances": run["analysis_mode"].upper(),
-                }
-            ctk.CTkLabel(
-                card,
-                text=f"{image_name} · {run['task_name']} · {format_time(run['duration_seconds'])}",
-                font=AppTheme.body_font(), anchor="w"
-            ).pack(fill="x", padx=12, pady=(1, 3))
-            detail_text = (
-                f"Вейвлет: {details['wavelet']}\n"
-                f"Масштабы: {details['scales']}\n"
-                f"Сценарий: {run['pipeline_preset']}\n"
-                f"Выполнено: {details['stages']}\n"
-                f"Нюансы: {details['nuances']}"
-            )
-            ctk.CTkLabel(
-                card, text=detail_text, font=AppTheme.caption_font(),
-                text_color=AppTheme.TEXT_SECONDARY, anchor="w",
-                justify="left", wraplength=850
-            ).pack(fill="x", padx=12, pady=1)
-            if feature_checkpoint_available(run.get("output_path", "")):
-                ctk.CTkLabel(
-                    card,
-                    text="● Контрольная точка признаков доступна для продолжения",
-                    font=AppTheme.caption_font(), text_color=AppTheme.SUCCESS,
-                    anchor="w"
-                ).pack(fill="x", padx=12, pady=(3, 1))
-            if run["ml_summary"]:
-                ctk.CTkLabel(
-                    card, text=run["ml_summary"], font=AppTheme.caption_font(),
-                    text_color=AppTheme.TEXT_SECONDARY, anchor="w"
-                ).pack(fill="x", padx=12, pady=1)
-            if run["error_message"]:
-                ctk.CTkLabel(
-                    card, text=run["error_message"], font=AppTheme.caption_font(),
-                    text_color=AppTheme.DANGER, anchor="w", justify="left",
-                    wraplength=760
-                ).pack(fill="x", padx=12, pady=1)
-            note_row = ctk.CTkFrame(card, fg_color="transparent")
-            note_row.pack(fill="x", padx=12, pady=(5, 1))
-            note_var = tk.StringVar(value=run.get("researcher_note", ""))
-            ctk.CTkEntry(
-                note_row, textvariable=note_var,
-                placeholder_text="Заметка исследователя", height=28
-            ).pack(side="left", fill="x", expand=True)
-            ctk.CTkButton(
-                note_row, text="Сохранить заметку", width=135,
-                height=AppTheme.COMPACT_CONTROL_HEIGHT,
-                command=lambda run_id=run["id"], var=note_var:
-                    self._save_history_note(run_id, var.get())
-            ).pack(side="left", padx=(8, 0))
-            actions = ctk.CTkFrame(card, fg_color="transparent")
-            actions.pack(fill="x", padx=12, pady=(5, 9))
-            view_results = ctk.CTkButton(
-                actions, text="Результаты", width=110,
-                command=lambda folder=run['output_path']: self._show_saved_results(folder)
-            )
-            view_results._read_only_during_compute = True
-            view_results.pack(side="left", padx=(0, 6))
-            ctk.CTkButton(
-                actions, text="Продолжить исследование", width=190,
-                height=AppTheme.COMPACT_CONTROL_HEIGHT,
-                command=lambda run_id=run["id"]: self._restore_history_run(run_id)
-            ).pack(side="left")
-            if run["output_path"]:
-                ctk.CTkButton(
-                    actions, text="Открыть результаты", width=150,
-                    height=AppTheme.COMPACT_CONTROL_HEIGHT,
-                    command=lambda path=run["output_path"]: self._open_result_path(path)
-                ).pack(side="left", padx=(8, 0))
+            ctk.CTkLabel(card, text=experiment['name'], font=AppTheme.section_title_font(),
+                         anchor='w').pack(fill='x', padx=12, pady=(9, 2))
+            ctk.CTkLabel(card, text=(f"Создано: {experiment['created_at'].replace('T',' ')} · "
+                f"Задач: {len(tasks)} · Запусков: {len(task_runs)} · ML: {experiment['ml_count']}"),
+                text_color=AppTheme.TEXT_SECONDARY, anchor='w',
+                font=AppTheme.caption_font()).pack(fill='x', padx=12, pady=(0, 4))
+            for row in tasks:
+                nested = [r for r in task_runs if r['task_id'] == row['id']]
+                ml = sum(r['run_type'] == 'ml' for r in nested)
+                info = f"{row['name']} · {len(nested)} запусков · ML: {ml}"
+                if nested:
+                    info += ' · Последний: ' + nested[0]['status']
+                ctk.CTkLabel(card, text=info, anchor='w',
+                    font=AppTheme.caption_font()).pack(fill='x', padx=22, pady=1)
+                for run in nested:
+                    label = ("ML " + run['ml_algorithm'].upper()) if run['run_type'] == 'ml' else 'CWT / конвейер'
+                    ctk.CTkLabel(card,
+                        text=f"    {run['created_at'].replace('T',' ')} · {label} · {run['status']}",
+                        text_color=AppTheme.TEXT_SECONDARY,
+                        font=AppTheme.caption_font(), anchor='w').pack(fill='x', padx=32, pady=0)
+            buttons = ctk.CTkFrame(card, fg_color='transparent')
+            buttons.pack(fill='x', padx=12, pady=(7, 10))
+            eid = experiment['id']
+            root = experiment['root_path']
+            ctk.CTkButton(buttons, text="Продолжить исследование", width=190,
+                command=lambda value=eid: self._restore_experiment(value)).pack(side='left', padx=(0, 8))
+            ctk.CTkButton(buttons, text="Результаты", width=110,
+                command=lambda value=root: self._show_saved_results(value)).pack(side='left', padx=(0, 8))
+            ctk.CTkButton(buttons, text="Открыть папку", width=130,
+                command=lambda value=root: self._open_result_path(value)).pack(side='left')
 
     @staticmethod
     def _format_history_snapshot(snapshot):
@@ -4209,63 +4295,10 @@ class App(TkinterApp):
             mb.showerror("Результаты", f"Не удалось открыть папку: {error}")
 
     def _restore_history_run(self, run_id):
-        import cv2
-        self._show_workspace()
         try:
-            snapshot = self.run_history.get_settings(run_id)
-            run_record = self.run_history.get_run(run_id)
-            task = ProcessingTask()
-            task.apply_settings_snapshot(snapshot)
-            source_path = task.image_path
-            if source_path and os.path.isfile(source_path):
-                image = cv2.imread(source_path)
-                if image is not None:
-                    task.original_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                    b, g, r = cv2.split(image)
-                    task.data = [r, g, b]
-                    task.data_copy = [channel.copy() for channel in task.data]
-                    # Представление будет подготовлено перед новым расчётом;
-                    # исходный RGB при восстановлении истории не преобразуется.
-                else:
-                    task.image_path = ""
-            else:
-                task.image_path = ""
-            restored_checkpoints = []
-            output_path = run_record.get("output_path", "")
-            if output_path and os.path.isdir(output_path):
-                try:
-                    restored_checkpoints = restore_feature_checkpoint(
-                        task, output_path
-                    )
-                except Exception as checkpoint_error:
-                    self.progress_manager.log_error(
-                        f"Контрольная точка не восстановлена: {checkpoint_error}"
-                    )
-            # A restored experiment is always a new variant. Reused data stays
-            # in memory, while new ML files go to a fresh result directory.
-            task.task_folder_path = ""
-            task_id = self.image_processor.add_task(task)
-            self.image_processor.set_current_task(task_id)
-            self.current_task = task
-            self._update_ui_for_current_task()
-            self._update_tasks_display()
-            # Как и при обычной загрузке, переход между этапами остаётся
-            # осознанным действием исследователя.
-            self.workspace_tabs.set("Данные")
-            if restored_checkpoints:
-                self.progress_manager.log_info(
-                    "Восстановлена контрольная точка: "
-                    + ", ".join(restored_checkpoints)
-                )
-                self._update_ml_tab_state()
-            if not task.image_path:
-                mb.showwarning(
-                    "Источник не найден",
-                    "Настройки восстановлены, но исходное изображение было перемещено "
-                    "или удалено. Загрузите его заново."
-                )
+            self._restore_experiment(self.run_history.get_run(run_id)['experiment_id'])
         except Exception as error:
-            mb.showerror("Предыдущие запуски", f"Не удалось восстановить настройки: {error}")
+            mb.showerror("Предыдущие запуски", str(error))
 
     @staticmethod
     def _add_tab_heading(parent, title, description=None):
@@ -4321,15 +4354,23 @@ class App(TkinterApp):
         content = scrollable.scrollable_frame
         self.analysis_content = content
 
-        self._add_tab_heading(
+        ctk.CTkLabel(
             content,
-            "Параметры расчёта",
-            "Настройте режим анализа, этапы вычислений и форматы сохранения результатов."
-        )
+            text="Настройте режим вейвлет-анализа, этапы вычислений и форматы экспорта результатов",
+            font=AppTheme.page_title_font(),
+            text_color=AppTheme.TEXT_ON_DARK,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", padx=10, pady=(10, 12))
+
+        # Фиксированная сетка страницы: шесть рядов в заданном порядке.
+        analysis_grid = ctk.CTkFrame(content, fg_color="transparent")
+        analysis_grid.pack(fill="x", padx=5, pady=(0, 4))
+        analysis_grid.grid_columnconfigure(0, weight=1)
 
         # Строка 1: вычислительное устройство + режим вейвлет-анализа.
-        top_row = ctk.CTkFrame(content, fg_color="transparent")
-        top_row.pack(fill="x", padx=5, pady=(0, 4))
+        top_row = ctk.CTkFrame(analysis_grid, fg_color="transparent")
+        top_row.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         top_row.grid_columnconfigure((0, 1), weight=1, uniform="analysis_top")
 
         self.compute_settings_section = CollapsibleFrame(
@@ -4359,9 +4400,19 @@ class App(TkinterApp):
         )
         self._populate_analysis_mode_section(self.analysis_mode_section.content)
 
-        # Строка 2: масштабы + настройки выбранного вейвлет-преобразования.
-        transform_row = ctk.CTkFrame(content, fg_color="transparent")
-        transform_row.pack(fill="x", padx=5, pady=4)
+        # Строка 2: сценарий анализа.
+        self.pipeline_section = CollapsibleFrame(
+            analysis_grid,
+            title="Сценарий анализа",
+            fg_color=AppTheme.NAV_HOVER,
+            corner_radius=10,
+        )
+        self.pipeline_section.grid(row=1, column=0, sticky="ew", pady=4)
+        self._setup_pipeline_section()
+
+        # Строка 3: масштабы + настройки выбранного вейвлет-преобразования.
+        transform_row = ctk.CTkFrame(analysis_grid, fg_color="transparent")
+        transform_row.grid(row=2, column=0, sticky="ew", pady=4)
         transform_row.grid_columnconfigure((0, 1), weight=1, uniform="analysis_transform")
 
         self.scales_section = CollapsibleFrame(
@@ -4378,6 +4429,8 @@ class App(TkinterApp):
         self.transform_slot = ctk.CTkFrame(transform_row, fg_color="transparent")
         self.transform_slot.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
         self.transform_slot.grid_columnconfigure(0, weight=1)
+        # Обе карточки занимают высоту общей строки, без внутренних пустых подписей.
+        self.transform_slot.grid_rowconfigure(0, weight=1)
 
         self.extremes_section = CollapsibleFrame(
             self.transform_slot,
@@ -4390,7 +4443,7 @@ class App(TkinterApp):
 
         self.two_d_section = CollapsibleFrame(
             self.transform_slot,
-            title="Настройки 2D Morlet",
+            title="Настройки 2-D преобразования",
             fg_color=AppTheme.NAV_HOVER,
             corner_radius=10,
         )
@@ -4398,28 +4451,34 @@ class App(TkinterApp):
         self._setup_2d_section()
         self.two_d_section.grid_remove()
 
-        # Строка 3: сценарий анализа.
-        self.pipeline_section = CollapsibleFrame(content, title="Сценарий анализа")
-        self.pipeline_section.pack(fill="x", padx=5, pady=4)
-        self._setup_pipeline_section()
-
         # Строка 4: параметры выбранных этапов.
         self.stage_settings_section = CollapsibleFrame(
-            content, title="Настройки выбранных этапов"
+            analysis_grid,
+            title="Настройки выбранных этапов",
+            fg_color=AppTheme.NAV_HOVER,
+            corner_radius=10,
         )
-        self.stage_settings_section.pack(fill="x", padx=5, pady=4)
+        self.stage_settings_section.grid(row=3, column=0, sticky="ew", pady=4)
         self._setup_stage_settings_section()
 
         # Строка 5: экспорт результатов.
-        self.export_section = CollapsibleFrame(content, title="Экспорт результатов")
-        self.export_section.pack(fill="x", padx=5, pady=4)
+        self.export_section = CollapsibleFrame(
+            analysis_grid,
+            title="Экспорт результатов",
+            fg_color=AppTheme.NAV_HOVER,
+            corner_radius=10,
+        )
+        self.export_section.grid(row=4, column=0, sticky="ew", pady=4)
         self._setup_export_results_section()
 
         # Строка 6: дополнительные файлы.
         self.intermediate_section = CollapsibleFrame(
-            content, title="Дополнительные файлы"
+            analysis_grid,
+            title="Дополнительные файлы",
+            fg_color=AppTheme.NAV_HOVER,
+            corner_radius=10,
         )
-        self.intermediate_section.pack(fill="x", padx=5, pady=4)
+        self.intermediate_section.grid(row=5, column=0, sticky="ew", pady=4)
         self._setup_intermediate_section()
 
         self.compute_section = ctk.CTkFrame(content, fg_color="transparent")
@@ -4856,8 +4915,8 @@ class App(TkinterApp):
             mb.showerror("ML", "Проверьте числовые параметры алгоритма")
             return
         try:
-            task.task_folder_path = ""
             self.image_processor.create_task_folder(task)
+            self._persist_experiment_task(task)
         except Exception as error:
             mb.showerror("ML", f"Не удалось создать папку результатов: {error}")
             return
@@ -4937,6 +4996,7 @@ class App(TkinterApp):
                     f"Масштабы: {task.scales_summary()}"
                 ),
             )
+            self._persist_experiment_task(task)
             self.run_history.add_run(
                 task=task,
                 status="completed",
@@ -4944,10 +5004,12 @@ class App(TkinterApp):
                 settings=snapshot,
                 ml_summary=self._history_ml_summary(task),
                 ml_algorithm=task.ml_algorithm,
+                run_type="ml", output_path=result["output_dir"],
             )
             self.after_safe(0, self._refresh_history_tab)
             self.after_safe(0, lambda: self._finish_ml_clustering(task, result))
         except RunCancelled:
+            self._persist_experiment_task(task)
             self.run_history.add_run(
                 task=task, status="cancelled",
                 duration_seconds=time.time() - started,
@@ -4956,6 +5018,7 @@ class App(TkinterApp):
             self.after_safe(0, self._refresh_history_tab)
             self.after_safe(0, self._cancel_ml_clustering)
         except (ClusteringError, ValueError) as error:
+            self._persist_experiment_task(task)
             self.run_history.add_run(
                 task=task, status="failed",
                 duration_seconds=time.time() - started,
@@ -4967,6 +5030,7 @@ class App(TkinterApp):
         except Exception as error:
             details = f"Ошибка ML: {error}\n{traceback.format_exc()}"
             self.progress_manager.log_error(details)
+            self._persist_experiment_task(task)
             self.run_history.add_run(
                 task=task, status="failed",
                 duration_seconds=time.time() - started,
@@ -4990,7 +5054,7 @@ class App(TkinterApp):
     def _finish_ml_clustering(self, task, result):
         self._ml_ui_locked = False
         self.cancel_compute_button.configure(state="disabled", text="Отменить расчёт")
-        self._show_saved_results(task.task_folder_path)
+        self._show_saved_results(self.image_processor.root_folder_path)
         if self.current_task is task:
             self._show_ml_result(result)
         self._refresh_ml_controls_state()
@@ -4999,7 +5063,7 @@ class App(TkinterApp):
         )
         self.progress_manager.finish_run(
             "ML-кластеризация завершена",
-            result_callback=lambda: self._show_saved_results(task.task_folder_path),
+            result_callback=lambda: self._show_saved_results(self.image_processor.root_folder_path),
             folder_callback=lambda: self._open_result_path(result["output_dir"]),
             history_callback=lambda: self.workspace_tabs.set("Предыдущие запуски"),
         )
@@ -5152,55 +5216,115 @@ class App(TkinterApp):
                 state="normal" if analysis_ready else "disabled"
             )
 
+    
+    @staticmethod
+    def _help_label(parent, text, key, *, font=None, padx=0, pady=0):
+        """Label with inline info icon placed without breaking layout."""
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=padx, pady=pady)
+        ctk.CTkLabel(
+            row,
+            text=text,
+            font=font or AppTheme.body_font(),
+            anchor="w"
+        ).pack(side="left")
+        HelpIcon(row, key).pack(side="left", padx=(6, 0))
+        return row
+
+    @staticmethod
+    def _attach_help_to_section_header(section, key):
+        """Show help beside the title without moving CollapsibleFrame controls.
+
+        The title button must remain packed in its original parent. Repacking
+        it into a child frame can remove the title in Tk/CustomTkinter.
+        """
+        if getattr(section, "_header_help_attached", False):
+            return
+
+        # The existing full-width collapse button retains its pack() layout.
+        # The information icon is an overlay, not another packed row.
+        font = section.toggle_btn.cget("font")
+        try:
+            title_width = font.measure(f"▼ {section.title}")
+        except (AttributeError, TypeError, ValueError):
+            title_width = 110
+        icon = HelpIcon(section.header, key)
+        icon.place(x=12 + title_width, rely=0.5, anchor="w")
+        section._header_help_attached = True
+
     def _setup_2d_section(self):
         """Настройки ориентационного двумерного вейвлета Морле."""
-        ctk.CTkLabel(
-            self.two_d_section.content,
-            text="Ориентации, градусы (через запятую)",
-            font=AppTheme.body_font(),
-            anchor="w"
-        ).pack(fill="x", pady=(0, 4))
+
+        # Ориентации — поле на всю ширину карточки.
+        self._help_label(self.two_d_section.content,
+                         "Ориентации, градусы (через запятую)",
+                         "morlet.orientations", padx=(5, 5), pady=(0, 4))
+
         ctk.CTkEntry(
             self.two_d_section.content,
             textvariable=self.orientations_var,
             placeholder_text="0, 45, 90, 135"
-        ).pack(fill="x", pady=(0, 8))
+        ).pack(fill="x", pady=(0, 8), padx=(5, 10))
+
+        # Центральная частота ω₀ — подпись и поле в одной строке.
+        omega_row = ctk.CTkFrame(
+            self.two_d_section.content,
+            fg_color="transparent"
+        )
+        omega_row.pack(fill="x", pady=(0, 8))
 
         ctk.CTkLabel(
-            self.two_d_section.content,
+            omega_row,
             text="Центральная частота ω₀",
             font=AppTheme.body_font(),
             anchor="w"
-        ).pack(fill="x", pady=(0, 4))
+        ).pack(side="left", padx=(5, 0))
+        HelpIcon(omega_row, "morlet.omega0").pack(side="left", padx=(5, 0))
+
         ctk.CTkEntry(
-            self.two_d_section.content,
+            omega_row,
             textvariable=self.morlet_omega0_var,
-            placeholder_text="6.0"
-        ).pack(fill="x", pady=(0, 8))
+            placeholder_text="6.0",
+            width=110
+        ).pack(side="right", padx=(0, 10))
+
+        # Анизотропность — подпись и поле в одной строке.
+        anisotropy_row = ctk.CTkFrame(
+            self.two_d_section.content,
+            fg_color="transparent"
+        )
+        anisotropy_row.pack(fill="x", pady=(0, 8))
 
         ctk.CTkLabel(
-            self.two_d_section.content,
+            anisotropy_row,
             text="Анизотропность",
             font=AppTheme.body_font(),
             anchor="w"
-        ).pack(fill="x", pady=(0, 4))
-        ctk.CTkEntry(
-            self.two_d_section.content,
-            textvariable=self.morlet_anisotropy_var,
-            placeholder_text="1.0"
-        ).pack(fill="x")
+        ).pack(side="left", padx=(5, 0))
+        HelpIcon(anisotropy_row, "morlet.anisotropy").pack(side="left", padx=(5, 0))
 
-        ctk.CTkLabel(
-            self.two_d_section.content,
-            text=("Ориентация задаёт направление чувствительности фильтра; "
-                  "ω₀ управляет частотой несущей, а анизотропность — "
-                  "вытянутостью вейвлета."),
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w",
-            justify="left",
-            wraplength=420
-        ).pack(fill="x", pady=(8, 0))
+        ctk.CTkEntry(
+            anisotropy_row,
+            textvariable=self.morlet_anisotropy_var,
+            placeholder_text="1.0",
+            width=110
+        ).pack(side="right", padx=(0, 10))
+
+        # # Пояснение параметров.
+        # ctk.CTkLabel(
+        #     self.two_d_section.content,
+        #     text=(
+        #         "Ориентация задаёт направление чувствительности фильтра; "
+        #         "ω₀ управляет частотой несущей, а анизотропность — "
+        #         "вытянутостью вейвлета."
+        #     ),
+        #     font=AppTheme.caption_font(),
+        #     text_color=AppTheme.TEXT_SECONDARY,
+        #     anchor="w",
+        #     justify="left",
+        #     wraplength=420
+        # ).pack(fill="x", pady=(8, 0), padx=(5, 0))
+
 
     def _setup_analysis_mode_section(self, parent, manage_geometry=True):
         """Создать отдельный блок выбора режима анализа."""
@@ -5475,26 +5599,6 @@ class App(TkinterApp):
             anchor="w", justify="left"
         ).pack(fill="x", padx=(28, 0), pady=(2, 0))
 
-        strict_row = ctk.CTkFrame(
-            self.compute_settings_section.content, fg_color="transparent"
-        )
-        strict_row.pack(fill="x", pady=(10, 0))
-        self.strict_backend_checkbox = ctk.CTkCheckBox(
-            strict_row,
-            text="Строгая воспроизводимость: не переходить GPU → CPU",
-            variable=self.strict_backend_var,
-            command=self._on_strict_backend_changed,
-        )
-        self.strict_backend_checkbox.pack(anchor="w")
-        ctk.CTkLabel(
-            strict_row,
-            text=(
-                "При ошибке CUDA расчёт остановится вместо автоматического "
-                "fallback на CPU."
-            ),
-            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w", justify="left", wraplength=520,
-        ).pack(fill="x", padx=(28, 0), pady=(2, 0))
 
     @staticmethod
     def _get_cpu_display_info():
@@ -5536,16 +5640,6 @@ class App(TkinterApp):
         self._update_compute_settings_display()
         self._update_gpu_section()
 
-    def _on_strict_backend_changed(self):
-        enabled = bool(self.strict_backend_var.get())
-        self.image_processor.backend.set_strict_backend(enabled)
-        if self.current_task is not None:
-            self.current_task.strict_backend = enabled
-        self.progress_manager.log_info(
-            "Строгая воспроизводимость включена: GPU fallback запрещён"
-            if enabled else
-            "Строгая воспроизводимость выключена: GPU fallback разрешён"
-        )
 
     def toggle_gpu_backend(self):
         """Обратная совместимость со старым переключателем GPU."""
@@ -5753,15 +5847,21 @@ class App(TkinterApp):
             font=AppTheme.caption_font(),
         )
         self.gram_link_view_checkbox.pack(side="right")
+        self.gram_reset_view_button = ctk.CTkButton(
+            geometry_controls, text="Сбросить вид",
+            command=self._reset_gs_camera, width=120,
+            height=30, font=AppTheme.caption_font(),
+        )
+        self.gram_reset_view_button.pack(side="right", padx=(0, 10))
 
         plots = ctk.CTkFrame(self.gram_geometry_frame, fg_color="transparent")
         plots.pack(fill="x")
         plots.grid_columnconfigure((0, 1), weight=1, uniform="gs_plot")
 
         self.gram_before_figure, self.gram_before_ax, self.gram_before_canvas = \
-            self._create_gs_3d_panel(plots, "До", 0, (0, 4))
+            self._create_gs_3d_panel(plots, "До преобразования", 0, (0, 4))
         self.gram_after_figure, self.gram_after_ax, self.gram_after_canvas = \
-            self._create_gs_3d_panel(plots, "После Gram–Schmidt", 1, (4, 0))
+            self._create_gs_3d_panel(plots, "После преобразования", 1, (4, 0))
 
         self._gram_syncing_view = False
         self.gram_before_canvas.mpl_connect(
@@ -5803,11 +5903,6 @@ class App(TkinterApp):
         )
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        toolbar_frame = tk.Frame(box, bg="#202020")
-        toolbar_frame.pack(fill="x")
-        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame, pack_toolbar=False)
-        toolbar.update()
-        toolbar.pack(side="left")
         return figure, ax, canvas
 
     @staticmethod
@@ -5856,6 +5951,13 @@ class App(TkinterApp):
                       color=AppTheme.TEXT_SECONDARY, fontsize=9)
         canvas.draw_idle()
 
+    def _reset_gs_camera(self):
+        """Вернуть обе 3D-панели Gram–Schmidt к исходному ракурсу."""
+        for ax in (getattr(self, "gram_before_ax", None), getattr(self, "gram_after_ax", None)):
+            if ax is not None:
+                ax.view_init(elev=22, azim=-55, roll=0)
+                ax.figure.canvas.draw_idle()
+
     def _sync_gs_camera(self, source_ax, target_ax):
         """После вращения одной панели перенести положение камеры на вторую."""
         if self._gram_syncing_view or not getattr(self, "gram_link_view_var", None):
@@ -5877,8 +5979,10 @@ class App(TkinterApp):
         if before_ax is None or after_ax is None or before_canvas is None or after_canvas is None:
             return
         if not has_colors or task is None:
-            self._draw_gs_3d_plot(before_ax, before_canvas, [], "Выберите два цвета")
-            self._draw_gs_3d_plot(after_ax, after_canvas, [], "Сначала выполните преобразование")
+            # До выбора опорных цветов обе панели остаются пустыми:
+            # показываем только координатное RGB-пространство без подсказок и векторов.
+            self._draw_gs_3d_plot(before_ax, before_canvas, [])
+            self._draw_gs_3d_plot(after_ax, after_canvas, [])
             return
         try:
             v1, v2, e1, e2, e3 = self._gs_basis(task.color1, task.color2)
@@ -5898,7 +6002,9 @@ class App(TkinterApp):
                 (e3, "GS3", "#b078d1"),
             ])
         else:
-            self._draw_gs_3d_plot(after_ax, after_canvas, [], "Нажмите «Выполнить преобразование»")
+            # Цвета уже выбраны: исходные векторы показаны слева,
+            # правая панель остаётся пустой до явного запуска Gram–Schmidt.
+            self._draw_gs_3d_plot(after_ax, after_canvas, [])
 
     def _on_channel_settings_changed(self, _value=None):
         task = getattr(self, "current_task", None)
@@ -6006,9 +6112,11 @@ class App(TkinterApp):
 
     def _setup_scales_section(self):
         """Настройка секции масштабов"""
+        self._attach_help_to_section_header(self.scales_section, "scales.range")
+
         # Поля ввода
         input_frame = ctk.CTkFrame(self.scales_section.content, fg_color="transparent")
-        self.scales_section.add_widget(input_frame, pady=2)
+        self.scales_section.add_widget(input_frame, pady=0)
 
         # От
         start_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
@@ -6033,7 +6141,7 @@ class App(TkinterApp):
 
         # Кнопки
         button_frame = ctk.CTkFrame(self.scales_section.content, fg_color="transparent")
-        self.scales_section.add_widget(button_frame, pady=(10, 2))
+        self.scales_section.add_widget(button_frame, pady=(5, 0))
 
         self.button_save_scales = ctk.CTkButton(
             button_frame,
@@ -6060,101 +6168,39 @@ class App(TkinterApp):
             anchor="w",
             wraplength=0
         )
-        self.scales_section.add_widget(self.label_custom_scale, pady=(5, 0))
+        # Пустая подпись не должна резервировать целую строку под кнопками.
+        self.scales_section.add_widget(self.label_custom_scale, pady=(3, 0))
+        self.label_custom_scale.pack_forget()
+
+    def _set_scales_status(self, text):
+        """Показывать служебную подпись масштабов только при наличии текста."""
+        if not text:
+            self.label_custom_scale.configure(text="", text_color=AppTheme.MUTED)
+            self.label_custom_scale.pack_forget()
+            return
+        self.label_custom_scale.configure(text=text, text_color=AppTheme.TEXT_ON_DARK)
+        self.scales_section.add_widget(self.label_custom_scale, pady=(3, 0))
 
     def _setup_extremes_section(self):
-        """Параметры 1D-направлений и типов экстремумов в две колонки."""
+        """Параметры самого 1D CWT: только выбор направлений обработки."""
         grid = ctk.CTkFrame(self.extremes_section.content, fg_color="transparent")
         self.extremes_section.add_widget(grid, pady=2)
-        grid.grid_columnconfigure((0, 1), weight=1, uniform="transform_options")
+        grid.grid_columnconfigure(0, weight=1)
 
         direction_frame = ctk.CTkFrame(grid, fg_color="transparent")
-        direction_frame.grid(row=0, column=0, sticky="nw", padx=(0, 10))
-        ctk.CTkLabel(
-            direction_frame, text="Источники 1D CWT:",
-            font=AppTheme.body_font(), anchor="w"
-        ).pack(fill="x", pady=(0, 5))
+        direction_frame.grid(row=0, column=0, sticky="nw")
+        self._help_label(direction_frame, "Направления 1D CWT:",
+                         "cwt.directions", pady=(0, 5))
         self.row_checkbox = ctk.CTkCheckBox(
             direction_frame, text="CWT по строкам", variable=self.row_var,
             command=self._on_direction_changed
         )
-        self.row_checkbox.pack(anchor="w", pady=3)
+        self.row_checkbox.pack(anchor="w", pady=7)
         self.col_checkbox = ctk.CTkCheckBox(
             direction_frame, text="CWT по столбцам", variable=self.col_var,
             command=self._on_direction_changed
         )
-        self.col_checkbox.pack(anchor="w", pady=3)
-
-        type_frame = ctk.CTkFrame(grid, fg_color="transparent")
-        type_frame.grid(row=0, column=1, sticky="nw", padx=(10, 0))
-        ctk.CTkLabel(
-            type_frame, text="Тип экстремумов:",
-            font=AppTheme.body_font(), anchor="w"
-        ).pack(fill="x", pady=(0, 5))
-        self.max_checkbox = ctk.CTkCheckBox(
-            type_frame, text="Максимумы", variable=self.max_var,
-            command=self._store_settings_for_current_task
-        )
-        self.max_checkbox.pack(anchor="w", pady=3)
-        self.min_checkbox = ctk.CTkCheckBox(
-            type_frame, text="Минимумы", variable=self.min_var,
-            command=self._store_settings_for_current_task
-        )
-        self.min_checkbox.pack(anchor="w", pady=3)
-
-        filter_frame = ctk.CTkFrame(grid, fg_color="transparent")
-        filter_frame.grid(
-            row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0)
-        )
-        filter_frame.grid_columnconfigure((0, 1), weight=1, uniform="extrema_filters")
-
-        distance_box = ctk.CTkFrame(filter_frame, fg_color="transparent")
-        distance_box.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        ctk.CTkLabel(
-            distance_box, text="Минимальное расстояние (distance), пикс.:",
-            font=AppTheme.body_font(), anchor="w"
-        ).pack(fill="x", pady=(0, 4))
-        self.extrema_distance_entry = ctk.CTkEntry(
-            distance_box, textvariable=self.extrema_distance_var,
-            placeholder_text="1"
-        )
-        self.extrema_distance_entry.pack(fill="x")
-        self.extrema_distance_tooltip = HoverTooltip(
-            self.extrema_distance_entry,
-            text=("Минимальное расстояние между соседними экстремумами "
-                  "вдоль строки/столбца. 1 — без дополнительного фильтра."),
-            delay_ms=350, wraplength=360,
-        )
-
-        prominence_box = ctk.CTkFrame(filter_frame, fg_color="transparent")
-        prominence_box.grid(row=0, column=1, sticky="ew", padx=(10, 0))
-        ctk.CTkLabel(
-            prominence_box, text="Проминентность (prominence):",
-            font=AppTheme.body_font(), anchor="w"
-        ).pack(fill="x", pady=(0, 4))
-        self.extrema_prominence_entry = ctk.CTkEntry(
-            prominence_box, textvariable=self.extrema_prominence_var,
-            placeholder_text="0.0"
-        )
-        self.extrema_prominence_entry.pack(fill="x")
-        self.extrema_prominence_tooltip = HoverTooltip(
-            self.extrema_prominence_entry,
-            text=("Минимальная выраженность экстремума в единицах "
-                  "коэффициентов CWT. 0 — без дополнительного фильтра."),
-            delay_ms=350, wraplength=360,
-        )
-
-        self.extremes_hint_label = ctk.CTkLabel(
-            self.extremes_section.content,
-            text=("Для каждого выбранного CWT экстремумы ищутся "
-                  "и по строкам, и по столбцам."),
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w", justify="left", wraplength=500,
-        )
-        self.extremes_section.add_widget(
-            self.extremes_hint_label, pady=(6, 0)
-        )
+        self.col_checkbox.pack(anchor="w", pady=7)
 
     def _on_direction_changed(self):
         """Сразу синхронизировать направления и доступность зависимых этапов."""
@@ -6162,11 +6208,77 @@ class App(TkinterApp):
         self._update_pipeline_controls_state()
         self._update_action_availability()
 
+    def _persist_experiment_task(self, task):
+        """Persist even unfinished tasks; results directories need not exist yet."""
+        processor = self.image_processor
+        if not processor.experiment_id or not processor.root_folder_path:
+            return
+        self.run_history.ensure_experiment(
+            processor.experiment_id, processor.root_folder_path,
+            f"Исследование {os.path.basename(processor.root_folder_path)}"
+        )
+        self.run_history.save_task(processor.experiment_id, task)
+
+    def _restore_experiment(self, experiment_id):
+        """Restore the original experiment, including tasks with no calculations."""
+        import cv2
+        if self._workspace_is_busy():
+            mb.showwarning("Исследование", "Дождитесь окончания расчёта")
+            return
+        try:
+            record = self.run_history.get_experiment(experiment_id)
+            saved_tasks = self.run_history.list_tasks(experiment_id)
+            if not os.path.isdir(record['root_path']):
+                mb.showerror("Исследование", "Каталог результатов не существует")
+                return
+            processor = self.image_processor
+            processor.tasks.clear()
+            processor.current_task_index = -1
+            processor.experiment_id = experiment_id
+            processor.root_folder_path = record['root_path']
+            for row in saved_tasks:
+                task = ProcessingTask()
+                task.apply_settings_snapshot(__import__('json').loads(row['settings_json']))
+                task.task_id = row['task_number']
+                task.task_name = row['name']
+                task.persistent_id = row['id']
+                task.task_folder_path = row['folder_path']
+                source = task.image_path
+                if source and os.path.isfile(source):
+                    image = cv2.imread(source)
+                    if image is not None:
+                        task.original_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                        b, g, r = cv2.split(image)
+                        task.data = [r, g, b]
+                        task.data_copy = [channel.copy() for channel in task.data]
+                if task.task_folder_path and os.path.isdir(task.task_folder_path):
+                    try:
+                        restore_feature_checkpoint(task, task.task_folder_path)
+                    except Exception as error:
+                        self.progress_manager.log_error(
+                            f"Не удалось восстановить KNN задачи {task.task_id}: {error}"
+                        )
+                processor.tasks.append(task)
+            if not processor.tasks:
+                self._show_workspace()
+                self.add_new_task()
+                return
+            processor.current_task_index = 0
+            self.current_task = processor.tasks[0]
+            self._show_workspace()
+            self._update_ui_for_current_task()
+            self._update_tasks_display()
+            self.workspace_tabs.set("Данные")
+            self._update_ml_tab_state()
+        except Exception as error:
+            mb.showerror("Исследование", f"Не удалось продолжить исследование: {error}")
+
     def add_new_task(self):
         try:
             # Создаем новую задачу
             new_task = ProcessingTask()
             task_id = self.image_processor.add_task(new_task)
+            self._persist_experiment_task(new_task)
             # устанавливаем как текущую
             self.current_task = new_task
             self.image_processor.set_current_task(task_id)
@@ -6353,8 +6465,14 @@ class App(TkinterApp):
 
         def remove_task():
             self.image_processor.remove_task(task.task_id)
-            if self.current_task and self.current_task.task_id == task.task_id:
-                self.current_task = None
+            self.run_history.remove_task(
+                getattr(self.image_processor, 'experiment_id', None),
+                getattr(task, 'persistent_id', None), self.image_processor.tasks
+            )
+            self.current_task = self.image_processor.get_current_task()
+            if self.current_task is None and self.image_processor.tasks:
+                self.image_processor.current_task_index = 0
+                self.current_task = self.image_processor.tasks[0]
             self._update_tasks_display()
             self._update_ui_for_current_task()
 
@@ -6484,7 +6602,7 @@ class App(TkinterApp):
     def _update_ui_for_current_task(self):
         """Обновление UI в соответствии с текущей задачей"""
         if hasattr(self, 'results_panel'):
-            self.results_panel.load_folder(self.current_task.task_folder_path if self.current_task else '')
+            self.results_panel.load_folder(self.image_processor.root_folder_path)
         if self.current_task:
             self.analysis_mode_selector.configure(state="normal")
             self._loading_task_settings = True
@@ -6580,12 +6698,6 @@ class App(TkinterApp):
                 else "Все RGB"
             )
             self.rgb_single_channel_var.set(self.current_task.rgb_single_channel)
-            self.strict_backend_var.set(
-                bool(getattr(self.current_task, "strict_backend", False))
-            )
-            self.image_processor.backend.set_strict_backend(
-                self.strict_backend_var.get()
-            )
             self._loading_task_settings = False
             self._update_channel_controls_state()
             # Исходное изображение: действие кнопки не меняет размер/подпись,
@@ -6631,7 +6743,7 @@ class App(TkinterApp):
                     hover_color=AppTheme.PRIMARY_HOVER,
                     state='normal'
                 )
-                self.label_custom_scale.configure(text="", text_color=AppTheme.MUTED)
+                self._set_scales_status("")
 
                 # Включаем поля ввода
                 self.entry_start.configure(state='normal')
@@ -6643,7 +6755,7 @@ class App(TkinterApp):
                     scales_text = f"Масштабы: {', '.join(map(str, self.current_task.scales))}"
                 else:
                     scales_text = f"Загружено {len(self.current_task.scales)} масштабов"
-                self.label_custom_scale.configure(text=scales_text, text_color=AppTheme.TEXT_ON_DARK)
+                self._set_scales_status(scales_text)
 
         else:
             # Сбрасываем UI если нет активной задачи
@@ -6669,7 +6781,7 @@ class App(TkinterApp):
                 hover_color=AppTheme.PRIMARY_HOVER,
                 state='disabled'
             )
-            self.label_custom_scale.configure(text="", text_color=AppTheme.MUTED)
+            self._set_scales_status("")
 
         self._apply_analysis_mode_ui()
         self._update_pipeline_controls_state()
@@ -6868,7 +6980,7 @@ class App(TkinterApp):
             self.button_load_scales_file.configure(state='disabled')
 
             scale_info = f"Масштабы: {start}-{end} (шаг {step})"
-            self.label_custom_scale.configure(text=scale_info, text_color=AppTheme.TEXT_ON_DARK)
+            self._set_scales_status(scale_info)
 
             self._update_tasks_display()
             self._update_action_availability()
@@ -6909,7 +7021,7 @@ class App(TkinterApp):
             else:
                 scales_text = f"Загружено {self.current_task.num_scale} масштабов"
 
-            self.label_custom_scale.configure(text=scales_text, text_color=AppTheme.TEXT_ON_DARK)
+            self._set_scales_status(scales_text)
 
             self.button_load_scales_file.configure(
                 text="Файл загружен",
@@ -6997,7 +7109,7 @@ class App(TkinterApp):
         task.output_extremes_image = bool(self.p_ex_var2.get())
         task.output_envelopes_text = bool(self.envelope_text_var.get())
         task.output_envelopes_image = bool(self.envelope_image_var.get())
-        task.output_knn_npz = bool(self.knn_bool_npz_var.get())
+        task.output_knn_npz = True
         task.output_knn_text = bool(self.knn_bool_text_var.get())
         task.output_knn_image = bool(self.knn_bool_image_var.get())
         try:
@@ -7008,7 +7120,6 @@ class App(TkinterApp):
             pass
         task.save_source_channels = bool(self.print_channels_txt_var.get())
         task.save_centering_means = bool(self.centering_means_var.get())
-        task.strict_backend = bool(self.strict_backend_var.get())
         task.calculate_statistics = bool(self.calculate_statistics_var.get())
         task.statistics_output_image = bool(self.statistics_image_var.get())
         task.statistics_output_csv = bool(self.statistics_csv_var.get())
@@ -7074,6 +7185,8 @@ class App(TkinterApp):
         except ValueError:
             pass
 
+        self._persist_experiment_task(task)
+
         if self.app_start_button is not None:
             self.after_idle(self._update_pipeline_controls_state)
             self.after_idle(self._update_action_availability)
@@ -7096,12 +7209,7 @@ class App(TkinterApp):
             width=260
         )
         self.pipeline_preset_selector.pack(side="left")
-        self.pipeline_preset_tooltip = HoverTooltip(
-            self.pipeline_preset_selector,
-            text_provider=self._current_pipeline_tooltip_text,
-            delay_ms=450,
-            wraplength=390,
-        )
+        HelpIcon(top, "pipeline.preset").pack(side="left", padx=(7, 0))
 
         stages = ctk.CTkFrame(self.pipeline_section.content, fg_color="transparent")
         self.pipeline_section.add_widget(stages, pady=(4, 2))
@@ -7146,12 +7254,18 @@ class App(TkinterApp):
         )
         self.calculate_statistics_switch.grid(row=0, column=4, sticky="w", padx=(10, 0))
 
-        self.pipeline_stage_status_label = ctk.CTkLabel(
-            self.pipeline_section.content, text="", anchor="w", justify="left",
-            font=AppTheme.body_font(),
-        )
-        self.pipeline_section.add_widget(self.pipeline_stage_status_label, pady=(6, 1))
+        # Статусы показаны отдельными метками: каждому состоянию свой цвет.
+        status_row = ctk.CTkFrame(self.pipeline_section.content, fg_color="transparent")
+        self.pipeline_section.add_widget(status_row, pady=(6, 1))
+        ctk.CTkLabel(
+            status_row, text="Статус:", font=AppTheme.body_font(), anchor="w"
+        ).pack(side="left", padx=(0, 5))
+        HelpIcon(status_row, "pipeline.status").pack(side="left", padx=(0, 15))
+        self.pipeline_status_items = ctk.CTkFrame(status_row, fg_color="transparent")
+        self.pipeline_status_items.pack(side="left", fill="x", expand=True)
+        self.pipeline_stage_status_label = None  # Вместо общей строки — отдельные метки.
         self.pipeline_execution_plan_label = None
+
 
         # Синхронизация пока остаётся частью вычислительной модели, но не входит
         # в набор пользовательских сценариев этой страницы.
@@ -7328,6 +7442,7 @@ class App(TkinterApp):
             for widget in stage_widgets:
                 if widget is not None:
                     widget.configure(state="disabled")
+            self._update_stage_settings_visibility()
             return
 
         is_1d = task.analysis_mode == "1d"
@@ -7366,27 +7481,148 @@ class App(TkinterApp):
                 state="normal" if plan.knn else "disabled"
             )
 
-        if getattr(self, "pipeline_stage_status_label", None) is not None:
-            try:
-                self.pipeline_stage_status_label.configure(text=format_stage_status(task))
-                if self.pipeline_execution_plan_label is not None:
-                    self.pipeline_execution_plan_label.configure(text="")
-            except Exception:
-                self.pipeline_stage_status_label.configure(text="Состояние этапов: ещё не рассчитано")
-                if self.pipeline_execution_plan_label is not None:
-                    self.pipeline_execution_plan_label.configure(text="")
+        if getattr(self, "pipeline_status_items", None) is not None:
+            self._refresh_pipeline_status_items(task)
+            if self.pipeline_execution_plan_label is not None:
+                self.pipeline_execution_plan_label.configure(text="")
 
         self._update_statistics_controls_state()
+        self._update_stage_settings_visibility()
         self._update_export_rows_visibility()
 
+    def _refresh_pipeline_status_items(self, task):
+        """Обновить цветные статусы запрошенных этапов без изменения вычислений."""
+        container = self.pipeline_status_items
+        for child in container.winfo_children():
+            child.destroy()
+
+        try:
+            states = stage_statuses(task)
+            requested = requested_stage_names(task)
+        except (ValueError, TypeError, AttributeError, OSError):
+            ctk.CTkLabel(
+                container, text="Данные о состоянии пока недоступны",
+                font=AppTheme.body_font(), text_color=AppTheme.TEXT_SECONDARY,
+            ).pack(side="left")
+            return
+
+        appearance = {
+            "ready": ("готово", AppTheme.SUCCESS),
+            "missing": ("нет", AppTheme.TEXT_SECONDARY),
+            "stale": ("устарело", AppTheme.WARNING),
+        }
+        for index, stage in enumerate(requested):
+            word, color = appearance.get(
+                states.get(stage), appearance["missing"]
+            )
+            ctk.CTkLabel(
+                container,
+                text=f"{STAGE_LABELS[stage]}: {word}",
+                text_color=color,
+                font=AppTheme.body_font(),
+                anchor="w",
+            ).pack(side="left", padx=(0, 13 if index < len(requested) - 1 else 0))
+
     def _setup_stage_settings_section(self):
-        """Карточки параметров этапов, которые требуют дополнительных настроек."""
+        """Создать карточки настроек этапов; видимость обновляется динамически."""
         holder = ctk.CTkFrame(self.stage_settings_section.content, fg_color="transparent")
         self.stage_settings_section.add_widget(holder, pady=0)
         holder.grid_columnconfigure((0, 1), weight=1, uniform="stage_settings")
+        self.stage_settings_holder = holder
 
+        # -------------------------------------------------------------
+        # Экстремумы
+        # -------------------------------------------------------------
+        self.extrema_settings_card = ctk.CTkFrame(holder)
+        ctk.CTkLabel(
+            self.extrema_settings_card, text="Экстремумы",
+            font=AppTheme.section_title_font(), anchor="w"
+        ).pack(fill="x", padx=12, pady=(10, 6))
+
+        extrema_type_row = ctk.CTkFrame(
+            self.extrema_settings_card, fg_color="transparent"
+        )
+        extrema_type_row.pack(fill="x", padx=12, pady=(0, 8))
+        ctk.CTkLabel(
+            extrema_type_row, text="Тип локальных экстремумов:",
+            font=AppTheme.body_font(), anchor="w"
+        ).pack(side="left", padx=(0, 4))
+        self.max_checkbox = ctk.CTkCheckBox(
+            extrema_type_row, text="Максимумы", variable=self.max_var,
+            command=self._store_settings_for_current_task
+        )
+        self.max_checkbox.pack(side="left", padx=(5, 16))
+        self.min_checkbox = ctk.CTkCheckBox(
+            extrema_type_row, text="Минимумы", variable=self.min_var,
+            command=self._store_settings_for_current_task
+        )
+        self.min_checkbox.pack(side="left")
+
+        
+        # Настройки фильтрации экстремумов
+        extrema_filter_row = ctk.CTkFrame(
+            self.extrema_settings_card,
+            fg_color="transparent"
+        )
+        extrema_filter_row.pack(fill="x", padx=12, pady=(2, 8))
+
+        # Distance
+        distance_row = ctk.CTkFrame(
+            extrema_filter_row,
+            fg_color="transparent"
+        )
+        distance_row.pack(fill="x", pady=(0, 8))
+
+        ctk.CTkLabel(
+            distance_row,
+            text="Distance, пикс.:",
+            font=AppTheme.body_font(),
+            anchor="w"
+        ).pack(side="left")
+
+        HelpIcon(
+            distance_row, "extrema.distance"
+        ).pack(side="left", padx=(6, 0))
+
+        self.extrema_distance_entry = ctk.CTkEntry(
+            distance_row,
+            textvariable=self.extrema_distance_var,
+            placeholder_text="1",
+            width=110
+        )
+        self.extrema_distance_entry.pack(side="left", padx=(10, 0))
+
+        # Prominence
+        prominence_row = ctk.CTkFrame(
+            extrema_filter_row,
+            fg_color="transparent"
+        )
+        prominence_row.pack(fill="x")
+
+        ctk.CTkLabel(
+            prominence_row,
+            text="Prominence:",
+            font=AppTheme.body_font(),
+            anchor="w"
+        ).pack(side="left")
+
+        HelpIcon(
+            prominence_row, "extrema.prominence"
+        ).pack(side="left", padx=(6, 0))
+
+        self.extrema_prominence_entry = ctk.CTkEntry(
+            prominence_row,
+            textvariable=self.extrema_prominence_var,
+            placeholder_text="0.0",
+            width=110
+        )
+        self.extrema_prominence_entry.pack(side="left", padx=(29, 0))
+
+
+        # -------------------------------------------------------------
+        # KNN и углы
+        # -------------------------------------------------------------
         self.knn_settings_card = ctk.CTkFrame(holder)
-        self.knn_settings_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         ctk.CTkLabel(
             self.knn_settings_card, text="KNN и углы",
             font=AppTheme.section_title_font(), anchor="w"
@@ -7402,8 +7638,10 @@ class App(TkinterApp):
         self.entry_near_point.bind("<KeyPress>", self.on_entry_click)
         self.entry_near_point.bind("<<Paste>>", self.on_entry_click)
 
+        # -------------------------------------------------------------
+        # Статистики
+        # -------------------------------------------------------------
         self.statistics_settings_card = ctk.CTkFrame(holder)
-        self.statistics_settings_card.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
         ctk.CTkLabel(
             self.statistics_settings_card, text="Статистики",
             font=AppTheme.section_title_font(), anchor="w"
@@ -7426,14 +7664,127 @@ class App(TkinterApp):
         self.synchronization_parameter_widgets = []
         self.synchronization_output_widgets = []
 
+        self.stage_settings_empty_label = ctk.CTkLabel(
+            holder,
+            text="Для выбранного сценария нет дополнительных настроек этапов.",
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w",
+            justify="left",
+        )
+
+        # Начальное состояние уточняется после создания/активации задачи.
+        self._update_stage_settings_visibility()
+
+    def _update_stage_settings_visibility(self):
+        """Показывать только карточки настроек реально выбранных этапов."""
+        holder = getattr(self, "stage_settings_holder", None)
+        if holder is None:
+            return
+
+        task = getattr(self, "current_task", None)
+        is_1d = bool(task is not None and task.analysis_mode == "1d")
+
+        # Для видимости ориентируемся именно на выбранные пользователем этапы,
+        # а не на исполнимость плана. Например, если временно сняты оба
+        # направления CWT, выбранная карточка остаётся на месте, но её поля
+        # блокируются в _update_pipeline_controls_state().
+        cards = (
+            (
+                getattr(self, "extrema_settings_card", None),
+                bool(is_1d and task.calculate_extrema),
+            ),
+            (
+                getattr(self, "knn_settings_card", None),
+                bool(is_1d and task.calculate_knn),
+            ),
+            (
+                getattr(self, "statistics_settings_card", None),
+                bool(is_1d and task.calculate_statistics),
+            ),
+        )
+
+        for card, _visible in cards:
+            if card is not None:
+                card.grid_remove()
+        self.stage_settings_empty_label.grid_remove()
+
+        visible_cards = [card for card, visible in cards if card is not None and visible]
+
+        # Сворачиваем общий блок, если выбран только CWT. При переходе
+        # к любому другому этапу раскрываем его и показываем карточки.
+        # Подпись состояния запоминается: обычное обновление интерфейса
+        # не отменяет ручное сворачивание пользователем.
+        stage_signature = (
+            id(task) if task is not None else None,
+            is_1d,
+            tuple(visible for _, visible in cards),
+            bool(is_1d and task.calculate_envelopes) if task is not None else False,
+        )
+        if getattr(self, "_stage_settings_auto_signature", None) != stage_signature:
+            self._stage_settings_auto_signature = stage_signature
+            # При наличии любых дополнительных этапов показываем содержимое.
+            # Огибающие могут быть выбраны без отдельной карточки параметров.
+            has_stages = bool(
+                is_1d and task is not None and (
+                    task.calculate_extrema
+                    or task.calculate_envelopes
+                    or task.calculate_knn
+                    or task.calculate_statistics
+                )
+            )
+            section = self.stage_settings_section
+            if section.is_expanded != has_stages:
+                # Не вызываем toggle(): он анимирует каждое изменение и может
+                # конфликтовать с частыми обновлениями зависимостей сценария.
+                section.is_expanded = has_stages
+                section.toggle_btn.configure(
+                    text=f"{'▼' if has_stages else '▶'} {section.title}"
+                )
+                if has_stages:
+                    section.content.pack(fill="x", padx=10, pady=(5, 10))
+                else:
+                    section.content.pack_forget()
+
+        if not visible_cards:
+            self.stage_settings_empty_label.grid(
+                row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=8
+            )
+            return
+
+        # Две карточки в строке. Если карточка в последней строке одна,
+        # растягиваем её на всю ширину — без пустой визуальной колонки.
+        for index, card in enumerate(visible_cards):
+            row = index // 2
+            column = index % 2
+            is_last_single = (
+                index == len(visible_cards) - 1
+                and len(visible_cards) % 2 == 1
+            )
+            if is_last_single:
+                card.grid(
+                    row=row, column=0, columnspan=2, sticky="nsew",
+                    padx=0, pady=(0 if row == 0 else 5, 0)
+                )
+            else:
+                card.grid(
+                    row=row, column=column, columnspan=1, sticky="nsew",
+                    padx=((0, 5) if column == 0 else (5, 0)),
+                    pady=(0 if row == 0 else 5, 0),
+                )
+
     def _setup_export_results_section(self):
-        """Единая таблица экспорта; KNN имеет быстрый полный формат NPZ."""
+        """Пользовательский экспорт: только TXT/CSV и PNG.
+
+        Lossless NPY/NPZ сохраняются автоматически как внутренние форматы
+        проекта и не требуют отдельной настройки пользователем.
+        """
         table = ctk.CTkFrame(self.export_section.content, fg_color="transparent")
         self.export_section.add_widget(table, pady=0)
         table.grid_columnconfigure(0, weight=2)
-        table.grid_columnconfigure((1, 2, 3), weight=1, uniform="export_formats")
+        table.grid_columnconfigure((1, 2), weight=1, uniform="export_formats")
 
-        headers = ("Результат", "TXT/CSV", "NPZ", "PNG")
+        headers = ("Результат", "TXT/CSV", "PNG")
         for column, title in enumerate(headers):
             ctk.CTkLabel(
                 table, text=title, font=AppTheme.section_title_font(),
@@ -7441,11 +7792,11 @@ class App(TkinterApp):
             ).grid(row=0, column=column, sticky="ew", padx=8, pady=(4, 7))
 
         rows = [
-            ("Вейвлеты", self.wp_var2, None, self.wp_var1, "wavelet"),
-            ("Экстремумы", self.p_ex_var1, None, self.p_ex_var2, "extrema"),
-            ("Огибающие", self.envelope_text_var, None, self.envelope_image_var, "envelopes"),
-            ("KNN и углы", self.knn_bool_text_var, self.knn_bool_npz_var, self.knn_bool_image_var, "knn"),
-            ("Статистики", self.statistics_csv_var, None, self.statistics_image_var, "statistics"),
+            ("Вейвлеты", self.wp_var2, self.wp_var1, "wavelet"),
+            ("Экстремумы", self.p_ex_var1, self.p_ex_var2, "extrema"),
+            ("Огибающие", self.envelope_text_var, self.envelope_image_var, "envelopes"),
+            ("KNN и углы", self.knn_bool_text_var, self.knn_bool_image_var, "knn"),
+            ("Статистики", self.statistics_csv_var, self.statistics_image_var, "statistics"),
         ]
         self.extremes_output_widgets = []
         self.envelopes_output_widgets = []
@@ -7453,50 +7804,25 @@ class App(TkinterApp):
         self.statistics_output_widgets = []
         self.export_result_rows = {}
 
-        for row_index, (label, text_var, npz_var, png_var, kind) in enumerate(rows, start=1):
+        for row_index, (label, text_var, png_var, kind) in enumerate(rows, start=1):
             label_widget = ctk.CTkLabel(table, text=label, anchor="w")
-            label_widget.grid(
-                row=row_index, column=0, sticky="ew", padx=8, pady=3
-            )
-
-            text_cb = ctk.CTkCheckBox(
-                table, text="", variable=text_var, width=24
-            )
+            label_widget.grid(row=row_index, column=0, sticky="ew", padx=8, pady=3)
+            text_cb = ctk.CTkCheckBox(table, text="", variable=text_var, width=24)
             text_cb.grid(row=row_index, column=1, pady=3)
+            png_cb = ctk.CTkCheckBox(table, text="", variable=png_var, width=24)
+            png_cb.grid(row=row_index, column=2, pady=3)
 
-            if npz_var is None:
-                npz_widget = ctk.CTkLabel(
-                    table, text="—", text_color=AppTheme.TEXT_SECONDARY
-                )
-            else:
-                npz_widget = ctk.CTkCheckBox(
-                    table, text="", variable=npz_var, width=24
-                )
-            npz_widget.grid(row=row_index, column=2, pady=3)
-
-            png_cb = ctk.CTkCheckBox(
-                table, text="", variable=png_var, width=24
-            )
-            png_cb.grid(row=row_index, column=3, pady=3)
-
-            self.export_result_rows[kind] = (
-                label_widget, text_cb, npz_widget, png_cb,
-            )
-
+            self.export_result_rows[kind] = (label_widget, text_cb, png_cb)
             if kind == "extrema":
                 self.extremes_output_widgets.extend([text_cb, png_cb])
             elif kind == "envelopes":
                 self.envelopes_output_widgets.extend([text_cb, png_cb])
             elif kind == "knn":
-                self.knn_output_widgets.extend([text_cb, npz_widget, png_cb])
+                self.knn_output_widgets.extend([text_cb, png_cb])
             elif kind == "statistics":
                 self.statistics_output_widgets.extend([text_cb, png_cb])
 
-        # Вейвлеты рассчитываются всегда, поэтому их строка всегда видима.
-        # Остальные строки покажет _update_export_rows_visibility().
         self._update_export_rows_visibility()
-
-        # NPY больше не является пользовательским форматом экспорта CWT.
         self.wavelet_numpy_var.set(False)
 
     def _update_export_rows_visibility(self):
@@ -7628,12 +7954,8 @@ class App(TkinterApp):
             font=AppTheme.section_title_font(), anchor="w"
         ).pack(fill="x", padx=5, pady=(0, 6))
 
-        block_size_label = ctk.CTkLabel(
-            self.statistics_section.content,
-            text="Размеры блоков масштабов (через запятую)",
-            font=AppTheme.caption_font(), anchor="w"
-        )
-        self.statistics_section.add_widget(block_size_label, pady=(2, 2))
+        self._help_label(self.statistics_section.content, "Размеры блоков масштабов (через запятую)", "statistics.blocks",
+                         font=AppTheme.caption_font(), pady=(2, 2))
         self.scale_block_sizes_entry = ctk.CTkEntry(
             self.statistics_section.content, textvariable=self.scale_block_sizes_var,
             placeholder_text="5"
@@ -7658,33 +7980,24 @@ class App(TkinterApp):
             font=AppTheme.section_title_font(), anchor="w"
         ).pack(fill="x", padx=5, pady=(8, 6))
 
-        sync_stride_label = ctk.CTkLabel(
-            self.statistics_section.content, text="Шаг выбора строк",
-            font=AppTheme.caption_font(), anchor="w"
-        )
-        self.statistics_section.add_widget(sync_stride_label, pady=(2, 2))
+        self._help_label(self.statistics_section.content, "Шаг выбора строк", "sync.stride",
+                         font=AppTheme.caption_font(), pady=(2, 2))
         self.sync_stride_entry = ctk.CTkEntry(
             self.statistics_section.content, textvariable=self.sync_stride_var,
             placeholder_text="1"
         )
         self.statistics_section.add_widget(self.sync_stride_entry, pady=(0, 4))
 
-        sync_tolerance_label = ctk.CTkLabel(
-            self.statistics_section.content, text="Допустимое смещение по X, пиксели",
-            font=AppTheme.caption_font(), anchor="w"
-        )
-        self.statistics_section.add_widget(sync_tolerance_label, pady=(2, 2))
+        self._help_label(self.statistics_section.content, "Допустимое смещение по X, пиксели", "sync.tolerance",
+                         font=AppTheme.caption_font(), pady=(2, 2))
         self.sync_tolerance_entry = ctk.CTkEntry(
             self.statistics_section.content, textvariable=self.sync_tolerance_var,
             placeholder_text="1"
         )
         self.statistics_section.add_widget(self.sync_tolerance_entry, pady=(0, 4))
 
-        sync_metric_label = ctk.CTkLabel(
-            self.statistics_section.content, text="Метрика синхронизации",
-            font=AppTheme.caption_font(), anchor="w"
-        )
-        self.statistics_section.add_widget(sync_metric_label, pady=(2, 2))
+        self._help_label(self.statistics_section.content, "Метрика синхронизации", "sync.metric",
+                         font=AppTheme.caption_font(), pady=(2, 2))
         self.sync_metric_selector = ctk.CTkOptionMenu(
             self.statistics_section.content, values=["jaccard", "dice", "phi"],
             variable=self.sync_metric_var, width=180
@@ -7745,10 +8058,9 @@ class App(TkinterApp):
 
     def _setup_knn_section(self):
         """Параметры KNN, lossless NPZ и ограниченная PNG-визуализация."""
-        ctk.CTkLabel(
-            self.knn_section.content, text="Количество ближайших точек:",
-            font=AppTheme.body_font(), anchor="w"
-        ).pack(fill="x", padx=5, pady=(0, 4))
+        self._help_label(self.knn_section.content,
+                         "Количество ближайших точек:", "knn.k",
+                         padx=5, pady=(0, 4))
         self.entry_near_point = ctk.CTkEntry(
             self.knn_section.content, textvariable=self.knn_text_var,
             placeholder_text="5"
@@ -7763,13 +8075,6 @@ class App(TkinterApp):
             font=AppTheme.body_font(), anchor="w"
         ).pack(fill="x", padx=5, pady=(0, 6))
 
-        self.knn_npz_checkbox = ctk.CTkCheckBox(
-            self.knn_section.content,
-            text="Данные NPZ — полный быстрый формат (рекомендуется)",
-            variable=self.knn_bool_npz_var
-        )
-        self.knn_section.add_widget(self.knn_npz_checkbox, fill="x")
-
         self.knn_text_checkbox = ctk.CTkCheckBox(
             self.knn_section.content,
             text="Данные TXT — человекочитаемый экспорт",
@@ -7783,15 +8088,9 @@ class App(TkinterApp):
         )
         self.knn_section.add_widget(self.knn_image_checkbox, fill="x")
 
-        ctk.CTkLabel(
-            self.knn_section.content,
-            text=(
-                "Максимум исходных точек для PNG. "
-                "0 = отрисовать все; на численные KNN/NPZ это не влияет:"
-            ),
-            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w", justify="left", wraplength=600
-        ).pack(fill="x", padx=5, pady=(10, 4))
+        self._help_label(self.knn_section.content,
+                         "Максимум точек для PNG:", "knn.png_limit",
+                         font=AppTheme.caption_font(), padx=5, pady=(10, 4))
         self.knn_png_max_points_entry = ctk.CTkEntry(
             self.knn_section.content,
             textvariable=self.knn_png_max_points_var,
@@ -7801,20 +8100,11 @@ class App(TkinterApp):
 
         existing_knn_widgets = list(getattr(self, "knn_output_widgets", []))
         self.knn_output_widgets = existing_knn_widgets + [
-            self.knn_npz_checkbox, self.knn_text_checkbox, self.knn_image_checkbox
+            self.knn_text_checkbox, self.knn_image_checkbox
         ]
 
     def _setup_intermediate_section(self):
         """Настройка секции промежуточных вычислений"""
-        info_label = ctk.CTkLabel(
-            self.intermediate_section.content,
-            text="Дополнительные выходные данные:",
-            font=AppTheme.body_font(),
-            anchor="w",
-            wraplength=0
-        )
-        self.intermediate_section.add_widget(info_label, pady=(0, 10))
-
         self.print_channels_txt_checkbox = ctk.CTkCheckBox(
             self.intermediate_section.content,
             text="Исходные матрицы RGB",
@@ -7872,22 +8162,57 @@ class App(TkinterApp):
         )
 
     def safe_destroy(self):
-        running = lambda: any(t is not None and t.is_alive() for t in
-                              (getattr(self, '_compute_thread', None), getattr(self, '_ml_thread', None)))
-        if running():
-            if not getattr(self, '_waiting_to_close', False):
-                self._waiting_to_close = True
-                if ((self._compute_thread is not None and self._compute_thread.is_alive())
-                        or (self._ml_thread is not None and self._ml_thread.is_alive())):
-                    self._request_cancel()
-                def finish_close():
-                    if running():
-                        self.after_safe(100, finish_close)
-                    else:
-                        super(App, self).safe_destroy()
-                self.after_safe(100, finish_close)
+        """Handle the Windows close button without indefinite worker polling.
+
+        Computation/ML workers are daemon threads, so after requesting a
+        cooperative cancellation we can always terminate the GUI. Never wait
+        without a deadline: CUDA calls may not be interruptible immediately.
+        """
+        if getattr(self, "_is_destroyed", False):
             return
-        super().safe_destroy()
+        import time as _time
+
+        if not self._waiting_to_close:
+            self._waiting_to_close = True
+            self._close_started_at = _time.monotonic()
+            print("[Shutdown] Window close requested", flush=True)
+
+        running = [thread for thread in (
+            getattr(self, "_compute_thread", None),
+            getattr(self, "_ml_thread", None),
+        ) if thread is not None and thread.is_alive()]
+        if not running:
+            print("[Shutdown] No active workers; closing window", flush=True)
+            super().safe_destroy()
+            return
+
+        # A second click does not launch additional cancellation requests.
+        if not getattr(self, "_close_cancel_sent", False):
+            self._close_cancel_sent = True
+            print("[Shutdown] Requesting worker cancellation", flush=True)
+            try:
+                self.progress_manager.run_control.cancel()
+            except Exception as error:
+                print(f"[Shutdown] Cancellation request failed: {error}", flush=True)
+
+        elapsed = _time.monotonic() - self._close_started_at
+        if elapsed >= 5.0:
+            print("[Shutdown] Worker timeout (5 s); closing GUI", flush=True)
+            # Workers must not keep the interpreter running after Tk exits.
+            # Both _compute_thread and _ml_thread are started as daemon threads.
+            super().safe_destroy()
+            return
+
+        # Avoid scheduling multiple polling chains if the titlebar is clicked
+        # several times while a worker is stopping.
+        if not getattr(self, "_close_poll_pending", False):
+            self._close_poll_pending = True
+
+            def poll_close():
+                self._close_poll_pending = False
+                self.safe_destroy()
+
+            self.after_safe(100, poll_close)
 
     def safe_compute(self):
         """Безопасный запуск вычислений в отдельном потоке"""
@@ -8218,6 +8543,7 @@ class App(TkinterApp):
                             f"Контрольная точка признаков сохранена: {checkpoint}"
                         )
                     self.progress_manager.run_control.check()
+                    self._persist_experiment_task(task)
                     self.run_history.add_run(
                         task=task,
                         status="completed",
@@ -8227,12 +8553,14 @@ class App(TkinterApp):
                     )
                     self.progress_manager.log_info(f'Результаты {task.task_name} сохранены')
                 except RunCancelled as error:
+                    self._persist_experiment_task(task)
                     self.run_history.add_run(task=task, status='cancelled',
                                              duration_seconds=time.time() - task_started,
                                              settings=snapshot, error_message=str(error))
                     self.progress_manager.save_run_log(task.task_folder_path, header='Запуск отменён; результаты частичные')
                     raise
                 except Exception as error:
+                    self._persist_experiment_task(task)
                     self.run_history.add_run(
                         task=task,
                         status="failed",
@@ -8266,7 +8594,7 @@ class App(TkinterApp):
                            self.tasks_panel.grid_remove, axis='width')
         frame = self.progress_manager.frame
         animate_visibility(frame, progress_visible,
-                           lambda: frame.pack(fill='x', padx=20, pady=(4, 10)), frame.pack_forget)
+                           lambda: frame.pack(fill='x', padx=AppTheme.WINDOW_PADDING + AppTheme.PANEL_GAP, pady=(4, 10)), frame.pack_forget)
         self.tasks_toggle.configure(fg_color=AppTheme.NAV_HOVER if self._tasks_visible else 'transparent')
         self.progress_toggle.configure(fg_color=AppTheme.NAV_HOVER if self._progress_visible else 'transparent')
 
@@ -8287,12 +8615,21 @@ class App(TkinterApp):
 
     def _open_result_viewer(self, task=None):
         task = task or self.current_task
-        self._show_saved_results(task.task_folder_path if task else '')
+        self._show_saved_results(self.image_processor.root_folder_path)
+
+    @staticmethod
+    def _experiment_folder(folder):
+        """Resolve a stored task path to its experiment; support legacy roots."""
+        if not folder:
+            return ''
+        path = Path(folder)
+        if path.name.startswith('task_') and path.parent.is_dir():
+            return str(path.parent)
+        return str(path)
 
     def _show_saved_results(self, folder):
         self._show_workspace()
         self._ensure_workspace_tab("Результаты")
-        self.results_panel.category.set('Все результаты')
         self.results_panel.load_folder(folder, force=True)
         self.workspace_tabs.set("Результаты")
 

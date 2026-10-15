@@ -58,16 +58,12 @@ class StageExecution:
 @dataclass
 class ExecutionProtocol:
     requested_backend: str = "auto"
-    strict_backend: bool = False
     stages: dict[str, StageExecution] = field(default_factory=dict)
     warnings: list[BackendWarning] = field(default_factory=list)
 
-    def reset(self, *, requested_backend: str | None = None,
-              strict_backend: bool | None = None) -> None:
+    def reset(self, *, requested_backend: str | None = None) -> None:
         if requested_backend is not None:
             self.requested_backend = str(requested_backend)
-        if strict_backend is not None:
-            self.strict_backend = bool(strict_backend)
         self.stages.clear()
         self.warnings.clear()
 
@@ -97,7 +93,6 @@ class ExecutionProtocol:
     def to_dict(self) -> dict[str, Any]:
         return {
             "requested_backend": self.requested_backend,
-            "strict_backend": self.strict_backend,
             "stages": {name: asdict(stage) for name, stage in self.stages.items()},
             "warnings": [asdict(warning) for warning in self.warnings],
         }
@@ -163,8 +158,6 @@ def fallback_or_raise(protocol: ExecutionProtocol | None, stage: str,
     mapped = classify_gpu_exception(exc)
     if mapped is None:
         raise exc
-    if protocol is not None and protocol.strict_backend:
-        raise mapped from exc
     if protocol is not None:
         protocol.record_fallback(
             stage,

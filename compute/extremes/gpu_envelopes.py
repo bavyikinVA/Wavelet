@@ -1,10 +1,15 @@
-"""Sparse GPU extraction of extrema of the project's PCHIP envelopes.
+"""Vectorized sparse GPU extraction of the project's PCHIP-envelope extrema.
 
-The production pipeline does not rasterize the dense PCHIP curve.  Because
-PCHIP is shape-preserving and monotone between monotone support values, local
-extrema of the interpolant occur only at support knots or exact-value support
-plateaus.  The GPU implementation therefore applies the same sparse rule as
-the CPU implementation directly to support coordinates and values.
+The production point pipeline never needs to rasterize a dense PCHIP curve.
+For shape-preserving PCHIP, local extrema of the interpolant can occur only at
+support knots (or at the midpoint of an exactly flat run of support knots).
+
+Older GPU code processed every row/column separately and called ``cp.asnumpy``
+for every line.  That produced thousands of tiny launches and host/device
+synchronizations.  This implementation performs grouping, plateau compression,
+local-extrema selection and coordinate reconstruction as a few vectorized CuPy
+operations for the whole 2-D map, then transfers the final compact Nx2 result
+once.
 """
 from __future__ import annotations
 
@@ -13,79 +18,171 @@ import numpy as np
 from compute.backend_policy import classify_gpu_exception
 
 
-def _group_points(points, line_count: int, direction: str):
-    groups = [[] for _ in range(int(line_count))]
-    arr = np.asarray(points, dtype=np.int32).reshape(-1, 2) if len(points) else np.empty((0, 2), np.int32)
-    coord_idx, line_idx = (0, 1) if direction == "row" else (1, 0)
-    for point in arr:
-        line = int(point[line_idx])
-        if 0 <= line < line_count:
-            groups[line].append(int(point[coord_idx]))
-    return [np.unique(np.asarray(g, dtype=np.int32)) if g else np.empty(0, np.int32) for g in groups]
-
-
 class GPUEnvelopeProcessor:
     def __init__(self, max_gpu_memory_mb=6000):
         self.max_gpu_memory = int(max_gpu_memory_mb) * 1024 * 1024
+        self._cached_host_id = None
+        self._cached_shape = None
+        self._cached_gpu = None
 
-    @staticmethod
-    def _sparse_line_gpu(signal_gpu, support, *, lower=False):
+    def _coefs_gpu(self, coefs):
         import cupy as cp
 
-        support = np.asarray(support, dtype=np.int32)
-        if support.size < 3:
-            return np.empty(0, dtype=np.int32)
-        support_gpu = cp.asarray(support)
-        values = signal_gpu[support_gpu]
+        if isinstance(coefs, cp.ndarray):
+            arr = coefs
+            if arr.dtype != cp.float32:
+                arr = arr.astype(cp.float32, copy=False)
+            return arr
 
-        # Start a run whenever the exact support value changes. Exact equality
-        # matches the CPU rule and dense PCHIP plateau semantics.
-        changes = cp.empty(values.size, dtype=cp.bool_)
-        changes[0] = True
-        changes[1:] = values[1:] != values[:-1]
-        starts = cp.flatnonzero(changes)
+        host = np.asarray(coefs)
+        cache_key = id(coefs)
+        if (
+            self._cached_gpu is not None
+            and self._cached_host_id == cache_key
+            and self._cached_shape == tuple(host.shape)
+        ):
+            return self._cached_gpu
+
+        arr = cp.asarray(host, dtype=cp.float32)
+        self._cached_host_id = cache_key
+        self._cached_shape = tuple(host.shape)
+        self._cached_gpu = arr
+        return arr
+
+    @staticmethod
+    def _normalize_points(points):
+        arr = np.asarray(points, dtype=np.int32)
+        if arr.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        return np.ascontiguousarray(arr.reshape(-1, 2), dtype=np.int32)
+
+    @staticmethod
+    def _sparse_points_gpu(coefs_gpu, points, direction: str, *, lower: bool):
+        import cupy as cp
+
+        host_points = GPUEnvelopeProcessor._normalize_points(points)
+        if len(host_points) < 3:
+            return np.empty((0, 2), dtype=np.int32)
+
+        pts = cp.asarray(host_points, dtype=cp.int32)
+        if direction == "row":
+            line = pts[:, 1]
+            coord = pts[:, 0]
+            line_limit = int(coefs_gpu.shape[0])
+            coord_limit = int(coefs_gpu.shape[1])
+        elif direction == "col":
+            line = pts[:, 0]
+            coord = pts[:, 1]
+            line_limit = int(coefs_gpu.shape[1])
+            coord_limit = int(coefs_gpu.shape[0])
+        else:
+            raise ValueError("direction должен быть 'row' или 'col'")
+
+        valid = (
+            (line >= 0) & (line < line_limit)
+            & (coord >= 0) & (coord < coord_limit)
+        )
+        pts = pts[valid]
+        if pts.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+
+        if direction == "row":
+            line = pts[:, 1]
+            coord = pts[:, 0]
+        else:
+            line = pts[:, 0]
+            coord = pts[:, 1]
+
+        # One scalar key is enough because coordinates are non-negative image
+        # indices and coord < coord_limit.  Sorting by this key groups each line
+        # and orders its support positions in one GPU sort.
+        key = line.astype(cp.int64) * np.int64(coord_limit) + coord.astype(cp.int64)
+        order = cp.argsort(key)
+        line = line[order]
+        coord = coord[order]
+
+        # Remove accidental duplicate support coordinates.  CPU _clean_support
+        # uses np.unique, so this preserves exact parity.
+        unique_mask = cp.empty(line.size, dtype=cp.bool_)
+        unique_mask[0] = True
+        if line.size > 1:
+            unique_mask[1:] = (line[1:] != line[:-1]) | (coord[1:] != coord[:-1])
+        line = line[unique_mask]
+        coord = coord[unique_mask]
+        if line.size < 3:
+            return np.empty((0, 2), dtype=np.int32)
+
+        if direction == "row":
+            values = coefs_gpu[line, coord]
+        else:
+            values = coefs_gpu[coord, line]
+
+        # A new run starts when either the line changes or the exact support
+        # value changes.  Exact equality intentionally mirrors the CPU rule:
+        # only an exactly flat PCHIP interval is a plateau.
+        run_start_mask = cp.empty(line.size, dtype=cp.bool_)
+        run_start_mask[0] = True
+        run_start_mask[1:] = (
+            (line[1:] != line[:-1]) | (values[1:] != values[:-1])
+        )
+        starts = cp.flatnonzero(run_start_mask).astype(cp.int32, copy=False)
         if starts.size < 3:
-            return np.empty(0, dtype=np.int32)
+            return np.empty((0, 2), dtype=np.int32)
+
         ends = cp.empty_like(starts)
         ends[:-1] = starts[1:] - 1
-        ends[-1] = values.size - 1
+        ends[-1] = line.size - 1
+
+        run_line = line[starts]
         run_values = values[starts]
+        if run_line.size < 3:
+            return np.empty((0, 2), dtype=np.int32)
 
+        same_line = (
+            (run_line[1:-1] == run_line[:-2])
+            & (run_line[1:-1] == run_line[2:])
+        )
         if lower:
-            mask = (run_values[1:-1] < run_values[:-2]) & (run_values[1:-1] < run_values[2:])
+            extrema_mask = (
+                same_line
+                & (run_values[1:-1] < run_values[:-2])
+                & (run_values[1:-1] < run_values[2:])
+            )
         else:
-            mask = (run_values[1:-1] > run_values[:-2]) & (run_values[1:-1] > run_values[2:])
-        selected = cp.flatnonzero(mask) + 1
-        if selected.size == 0:
-            return np.empty(0, dtype=np.int32)
+            extrema_mask = (
+                same_line
+                & (run_values[1:-1] > run_values[:-2])
+                & (run_values[1:-1] > run_values[2:])
+            )
 
-        start_x = support_gpu[starts[selected]]
-        end_x = support_gpu[ends[selected]]
-        return cp.asnumpy((start_x + end_x) // 2).astype(np.int32, copy=False)
+        selected = cp.flatnonzero(extrema_mask).astype(cp.int32, copy=False) + 1
+        if selected.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+
+        start_coord = coord[starts[selected]]
+        end_coord = coord[ends[selected]]
+        midpoint = (start_coord + end_coord) // 2
+        selected_line = run_line[selected]
+
+        if direction == "row":
+            out = cp.stack((midpoint, selected_line), axis=1)
+        else:
+            out = cp.stack((selected_line, midpoint), axis=1)
+
+        return cp.asnumpy(out).astype(np.int32, copy=False)
 
     def _get(self, coefs, max_points, min_points, direction):
         try:
-            import cupy as cp
-            coefs_gpu = coefs if isinstance(coefs, cp.ndarray) else cp.asarray(coefs, dtype=cp.float32)
-            if coefs_gpu.dtype != cp.float32:
-                coefs_gpu = coefs_gpu.astype(cp.float32, copy=False)
+            coefs_gpu = self._coefs_gpu(coefs)
             if coefs_gpu.ndim != 2:
                 raise ValueError("Огибающие ожидают двумерную матрицу коэффициентов")
 
-            line_count = coefs_gpu.shape[0] if direction == "row" else coefs_gpu.shape[1]
-            max_groups = _group_points(max_points, line_count, direction)
-            min_groups = _group_points(min_points, line_count, direction)
-            upper, lower = [], []
-            for line in range(line_count):
-                signal = coefs_gpu[line] if direction == "row" else coefs_gpu[:, line]
-                up = self._sparse_line_gpu(signal, max_groups[line], lower=False)
-                lo = self._sparse_line_gpu(signal, min_groups[line], lower=True)
-                if direction == "row":
-                    upper.extend((int(x), line) for x in up)
-                    lower.extend((int(x), line) for x in lo)
-                else:
-                    upper.extend((line, int(y)) for y in up)
-                    lower.extend((line, int(y)) for y in lo)
+            upper = self._sparse_points_gpu(
+                coefs_gpu, max_points, direction, lower=False
+            )
+            lower = self._sparse_points_gpu(
+                coefs_gpu, min_points, direction, lower=True
+            )
             return upper, lower
         except Exception as exc:
             mapped = classify_gpu_exception(exc)

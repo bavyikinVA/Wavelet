@@ -12,7 +12,10 @@ from sklearn.neighbors import NearestNeighbors
 from result_naming import knn_stem, point_type_parts
 from compute.backend_policy import GPU_FALLBACK_ERRORS, GPUUnavailableError, ExecutionProtocol
 from compute.numerics import COMPUTE_DTYPE, COMPUTE_DTYPE_NAME
-from compute.knn.result_format import make_compact_neighbors, neighbor_arrays
+from compute.knn.result_format import (
+    make_compact_neighbors, neighbor_arrays, is_compact_neighbors,
+    make_disk_knn_payload,
+)
 
 logger = logging.getLogger("WaveletApp")
 
@@ -77,8 +80,6 @@ class KNNProcessor:
         # Пытаемся использовать GPU если он был запрошен и доступен.
         if self.use_gpu and (self.gpu_processor is None or not self.gpu_processor.is_available()):
             exc = GPUUnavailableError("GPU KNN processor is unavailable")
-            if protocol is not None and protocol.strict_backend:
-                raise exc
             if protocol is not None:
                 protocol.record_fallback(
                     stage, reason=exc.__class__.__name__, message=str(exc)
@@ -93,13 +94,14 @@ class KNNProcessor:
             try:
                 result = self.gpu_processor.find_k_nearest_neighbors(points, k)
                 if protocol is not None:
-                    protocol.record_stage(stage, actual_backend="gpu", dtype=COMPUTE_DTYPE_NAME)
+                    protocol.record_stage(
+                        stage, actual_backend="gpu", dtype=COMPUTE_DTYPE_NAME,
+                        details=dict(getattr(self.gpu_processor, "last_details", {}) or {}),
+                    )
                 if log_callback:
                     log_callback("KNN вычислен на GPU")
                 return result
             except GPU_FALLBACK_ERRORS as exc:
-                if protocol is not None and protocol.strict_backend:
-                    raise
                 if protocol is not None:
                     protocol.record_fallback(
                         stage, reason=exc.__class__.__name__, message=str(exc)
@@ -278,10 +280,6 @@ def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image
             + (0 if compact_angles is None else compact_angles.nbytes)
         )
         _profile_stat(profiling_stats, "stored_bytes", int(compact_bytes))
-        results[extreme_type] = {
-            "points": points,
-            "neighbors": neighbors_with_angles,
-        }
 
         feature_axis, point_kind = point_type_parts(extreme_type)
         file_stem = knn_stem(
@@ -294,8 +292,9 @@ def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image
         # NPZ is the primary complete machine-readable representation.  It
         # stores the exact KNN arrays without converting millions of links to
         # decimal text and is independent from the optional TXT/PNG exports.
+        npz_path = None
         if print_npz_var:
-            save_knn_npz(
+            npz_path = save_knn_npz(
                 os.path.join(scale_folder_path, npz_filename),
                 points, neighbors_with_angles, scale, channel, extreme_type, k,
                 original_image=original_image, source_direction=source_direction,
@@ -321,12 +320,26 @@ def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image
                 profiling=profiling,
                 profiling_stats=profiling_stats)
 
-    # Matplotlib and temporary Python containers are collected once per
-    # (CWT direction, channel, scale) group instead of after every PNG.
-    # NumPy arrays retained in ``results`` are reference-counted and are not
-    # affected by this collection.
-    with _profile_context(profiling, "gc"):
-        gc.collect()
+        # The canonical NPZ is now the owner of the complete KNN arrays.
+        # Keep only a tiny descriptor in the task so completed experiments do
+        # not pin all point clouds and N*k matrices in process RAM.  If export
+        # failed, retain the in-memory payload as a safety fallback.
+        if npz_path:
+            results[extreme_type] = make_disk_knn_payload(npz_path, len(points))
+            _profile_stat(profiling_stats, "resident_bytes", 0)
+        else:
+            results[extreme_type] = {
+                "points": points,
+                "neighbors": neighbors_with_angles,
+            }
+            _profile_stat(profiling_stats, "resident_bytes", int(compact_bytes))
+
+    # NumPy/CuPy buffers are reference-counted and do not need a full Python
+    # cyclic-GC scan after every KNN group.  Only the optional Matplotlib path
+    # can create object cycles worth collecting here.
+    if print_image_var:
+        with _profile_context(profiling, "gc"):
+            gc.collect()
 
     if log_callback:
         log_callback(f"Завершена обработка KNN для масштаба {scale}")
@@ -341,7 +354,16 @@ def compute_angles_for_neighbors(points: np.ndarray, neighbors, image_coords: bo
     ``theta = atan2(dx, -dy) mod 2*pi``.
     """
     points = np.asarray(points, dtype=COMPUTE_DTYPE)
-    indices, distances, _ = neighbor_arrays(neighbors, point_count=len(points))
+    indices, distances, existing_angles = neighbor_arrays(
+        neighbors, point_count=len(points)
+    )
+    # The production CUDA spatial-grid kernel emits the project direction
+    # angle together with each exact neighbour.  Do not download KNN and then
+    # rebuild N*k coordinate-difference matrices on the CPU.
+    if existing_angles is not None:
+        if is_compact_neighbors(neighbors):
+            return neighbors
+        return make_compact_neighbors(indices, distances, existing_angles)
     if indices.size == 0:
         return make_compact_neighbors(indices, distances, np.empty_like(distances))
 
@@ -477,9 +499,11 @@ def save_knn_npz(filename, points, neighbors_dict, scale, channel, extreme_type,
 
         if log_callback:
             log_callback("KNN NPZ успешно сохранён")
+        return filename
     except Exception as e:
         if log_callback:
             log_callback(f"Ошибка сохранения KNN NPZ: {e}")
+        return None
 
 
 def draw_knn_graph(points, neighbors_dict, scale, channel, extreme_type, filename, k, original_image,
