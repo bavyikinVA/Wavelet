@@ -68,8 +68,6 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 
 import numpy as np
 from PIL import Image
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from Gram_Shmidt import change_channels
 from history.source_image import save_run_image
@@ -2762,11 +2760,18 @@ class ImageProcessor:
 
             task.result = {}
             pipeline_plan = task.resolve_pipeline()
-            # KNN/statistics are materialized again for the current request,
-            # but their upstream CWT/extrema/envelopes may be restored.
+            # Keep valid persisted feature stages available for later ML and
+            # checkpoint saving when only another branch is recomputed.
+            stage_states_before = stage_statuses(task)
             task.knn_results = {}
             task.statistics_results = {}
             task.synchronization_results = {}
+            if any(stage_states_before[name] == "ready" for name in ("knn", "statistics")):
+                restore_feature_checkpoint(task, task.task_folder_path)
+            if stage_states_before["knn"] != "ready":
+                task.knn_results = {}
+            if stage_states_before["statistics"] != "ready":
+                task.statistics_results = {}
             task.ml_result = None
             self.progress.log_info(
                 "План расчёта: "
@@ -2859,6 +2864,8 @@ class ImageProcessor:
                         task.output_extremes_image,
                         pipeline_plan=effective_plan
                     )
+                    # Persist features before claiming their stage is reusable.
+                    save_feature_checkpoint(task, cancel_check=self.progress.run_control.check)
                     if "extrema" in execution_plan:
                         mark_stage_ready(task, "extrema")
                     if "envelopes" in execution_plan:
@@ -2912,7 +2919,9 @@ class ImageProcessor:
                 self.clear_gpu_memory()
             except Exception:
                 pass
-            
+            # One end-of-task cyclic collection is enough. NumPy arrays use
+            # reference counting; repeated full GC inside every KNN group was
+            # measurable overhead and did not release those buffers faster.
             import gc as _task_gc
             _task_gc.collect()
             _rss_after_cleanup = _task_rss()
@@ -3848,7 +3857,7 @@ class App(TkinterApp):
         self.label_custom_scale = None
         self.button_load_scales_file = None
         self.entry_near_point = None
-        self.app_start_button = None
+        # Run control is owned by the permanent task sidebar.
         self.task_widgets = []
         self.compute_settings_section = None
         self.gpu_switch = None
@@ -3934,6 +3943,21 @@ class App(TkinterApp):
         )
         self.tasks_status_label.pack(fill="x", padx=10, pady=(5, 10))
 
+        # Pinned execution controls: independent of scrolling and workspace tab.
+        launch_footer = ctk.CTkFrame(panel)
+        launch_footer.pack(side="bottom", fill="x", padx=10, pady=(6, 12))
+        self.queue_summary_label = ctk.CTkLabel(
+            launch_footer, text="Очередь исследования", anchor="w",
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
+        )
+        self.queue_summary_label.pack(fill="x", padx=10, pady=(8, 4))
+        self.app_start_button = ctk.CTkButton(
+            launch_footer, text="Запустить очередь", command=self.safe_compute,
+            height=AppTheme.PRIMARY_BUTTON_HEIGHT,
+            font=AppTheme.panel_title_font(), fg_color=AppTheme.PRIMARY,
+            hover_color=AppTheme.PRIMARY_HOVER,
+        )
+        self.app_start_button.pack(fill="x", padx=10, pady=(0, 9))
         return panel
 
     def _create_workspace_tabs(self):
@@ -3941,7 +3965,7 @@ class App(TkinterApp):
         yield "Подготовка навигации и загрузки данных…"
         self.workspace_tabs = WorkspaceTabs(
             self.workspace_frame,
-            ("Данные", "Параметры расчёта", "Результаты", "ML", "Предыдущие запуски"),
+            ("Данные", "Параметры расчёта", "ML", "Результаты", "Предыдущие запуски"),
             navigation_master=self.layout_controls,
             hidden_tabs=("Предыдущие запуски",),
         )
@@ -3971,6 +3995,7 @@ class App(TkinterApp):
             # мог ещё находиться в очереди Tk. Пересчитываем доступность при
             # КАЖДОМ входе на вкладку и ещё раз в следующем цикле event loop.
             self._update_ml_tab_state()
+            self._refresh_ml_queue_summary()
             self.after_safe(0, self._refresh_ml_controls_state)
 
     def _ensure_workspace_tab(self, name):
@@ -4249,10 +4274,14 @@ class App(TkinterApp):
             root = experiment['root_path']
             ctk.CTkButton(buttons, text="Продолжить исследование", width=190,
                 command=lambda value=eid: self._restore_experiment(value)).pack(side='left', padx=(0, 8))
-            ctk.CTkButton(buttons, text="Результаты", width=110,
-                command=lambda value=root: self._show_saved_results(value)).pack(side='left', padx=(0, 8))
-            ctk.CTkButton(buttons, text="Открыть папку", width=130,
-                command=lambda value=root: self._open_result_path(value)).pack(side='left')
+            view_button = ctk.CTkButton(buttons, text="Результаты", width=110,
+                command=lambda value=root: self._show_saved_results(value))
+            view_button._read_only_during_compute = True
+            view_button.pack(side='left', padx=(0, 8))
+            folder_button = ctk.CTkButton(buttons, text="Открыть папку", width=130,
+                command=lambda value=root: self._open_result_path(value))
+            folder_button._read_only_during_compute = True
+            folder_button.pack(side='left')
 
     @staticmethod
     def _format_history_snapshot(snapshot):
@@ -4490,237 +4519,65 @@ class App(TkinterApp):
         return panel
 
     def _create_ml_tab(self, parent):
+        """Unified ML-plan editor for pending and already calculated tasks."""
         panel = ctk.CTkFrame(parent, fg_color="transparent")
         panel.pack(fill="both", expand=True)
         scrollable = ScrollableFrame(panel)
         scrollable.pack(fill="both", expand=True)
+        self.ml_page_scrollable = scrollable
         content = scrollable.scrollable_frame
-        self._add_tab_heading(
-            content,
-            "Машинное обучение",
-            "Кластеризация точек по координатам, расстояниям и направлениям KNN."
-        )
+        self._add_tab_heading(content, "Машинное обучение")
 
-        source_frame = ctk.CTkFrame(content)
-        source_frame.pack(fill="x", padx=10, pady=(4, 8))
-        ctk.CTkLabel(
-            source_frame,
-            text="Источник данных",
-            font=AppTheme.section_title_font(),
-            anchor="w"
-        ).pack(fill="x", padx=12, pady=(10, 4))
-        self.ml_source_label = ctk.CTkLabel(
-            source_frame,
-            text="Активная задача не выбрана",
-            font=AppTheme.body_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w",
-            justify="left"
-        )
-        self.ml_source_label.pack(fill="x", padx=12, pady=(0, 10))
-        source_select = ctk.CTkFrame(source_frame, fg_color="transparent")
-        source_select.pack(fill="x", padx=12, pady=(0, 10))
-        ctk.CTkLabel(source_select, text="KNN-набор", font=AppTheme.body_font(), anchor="w").pack(side="left")
-        self.ml_dataset_selector = ctk.CTkOptionMenu(
-            source_select, values=["Нет KNN-наборов"], variable=self.ml_dataset_var,
-            command=lambda _value: self._store_ml_settings_for_current_task(), width=560,
-            state="disabled")
-        self.ml_dataset_selector.pack(side="right")
+        queue_frame = ctk.CTkFrame(content)
+        queue_frame.pack(fill="x", padx=10, pady=(5, 10))
+        ctk.CTkLabel(queue_frame, text="План кластеризации",
+                     font=AppTheme.section_title_font(), anchor="w").pack(
+                         fill="x", padx=12, pady=(12, 5))
+        active_frame = ctk.CTkFrame(queue_frame, fg_color="#173A54", corner_radius=7)
+        active_frame.pack(anchor="w", padx=12, pady=(0, 9))
+        self.ml_queue_task_label = ctk.CTkLabel(
+            active_frame, text="Выберите задачу", anchor="w",
+            font=AppTheme.section_title_font(), text_color="#85CAFC")
+        self.ml_queue_task_label.pack(padx=11, pady=5)
 
-        settings_frame = ctk.CTkFrame(content)
-        settings_frame.pack(fill="x", padx=10, pady=8)
-        ctk.CTkLabel(
-            settings_frame,
-            text="Настройки кластеризации",
-            font=AppTheme.section_title_font(),
-            anchor="w"
-        ).pack(fill="x", padx=12, pady=(10, 6))
+        # The add action stays directly beneath the task, even when the plan is empty.
+        actions = ctk.CTkFrame(queue_frame, fg_color="transparent")
+        actions.pack(fill="x", padx=12, pady=(3, 8))
+        self.ml_queue_new_algorithm = tk.StringVar(value="K-means")
+        ctk.CTkOptionMenu(actions, variable=self.ml_queue_new_algorithm,
+                          values=["K-means", "DBSCAN"], width=145).pack(side="left")
+        ctk.CTkButton(actions, text="+ Добавить алгоритм",
+                      command=self._add_ml_queue_card).pack(side="left", padx=(8, 5))
+        HelpIcon(actions, "ml.add_algorithm").pack(side="left")
 
-        common_grid = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        common_grid.pack(fill="x", padx=12, pady=(0, 8))
-        common_grid.grid_columnconfigure(1, weight=1)
-        self.ml_algorithm_selector = ctk.CTkOptionMenu(
-            common_grid, values=["K-means", "DBSCAN"],
-            variable=self.ml_algorithm_var,
-            command=self._on_ml_algorithm_changed, width=220
-        )
-        self.ml_feature_set_selector = ctk.CTkOptionMenu(
-            common_grid,
-            values=["Геометрия KNN", "Координаты + KNN"],
-            variable=self.ml_feature_set_var, width=260
-        )
-        labels_and_widgets = [
-            ("Алгоритм", self.ml_algorithm_selector),
-            ("Набор признаков", self.ml_feature_set_selector),
-        ]
-        for row, (label_text, widget) in enumerate(labels_and_widgets):
-            ctk.CTkLabel(
-                common_grid, text=label_text, font=AppTheme.body_font(),
-                anchor="w"
-            ).grid(row=row, column=0, sticky="w", padx=(0, 14), pady=4)
-            widget.grid(row=row, column=1, sticky="w", pady=4)
+        # Do not pack an empty CTkFrame: its default 200-pixel height creates
+        # a large blank region when switching to a task with no ML cards.
+        self.ml_queue_cards_frame = ctk.CTkFrame(queue_frame, fg_color="transparent")
 
-        self.ml_standardize_checkbox = ctk.CTkCheckBox(
-            settings_frame,
-            text="Привести признаки к единому масштабу",
-            variable=self.ml_standardize_var,
-        )
-        self.ml_standardize_checkbox.pack(fill="x", padx=12, pady=(2, 8))
-
-        self.ml_algorithm_parameters = ctk.CTkFrame(
-            settings_frame, fg_color="transparent"
-        )
-        self.ml_algorithm_parameters.pack(fill="x", padx=12, pady=(0, 8))
-        self.ml_algorithm_help_label = ctk.CTkLabel(
-            settings_frame, text="", font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY, anchor="w", justify="left",
-            wraplength=760
-        )
-        self.ml_algorithm_help_label.pack(fill="x", padx=12, pady=(0, 8))
-
-        self.ml_run_button = ctk.CTkButton(
-            settings_frame,
-            text="Выполнить кластеризацию",
-            command=self._start_ml_clustering,
-            width=230,
-            height=AppTheme.BUTTON_HEIGHT,
-            state="disabled",
-        )
-        self.ml_run_button.pack(anchor="e", padx=12, pady=(2, 12))
-
-        results_frame = ctk.CTkFrame(content)
-        results_frame.pack(fill="x", padx=10, pady=(8, 12))
-        ctk.CTkLabel(
-            results_frame, text="Результат", font=AppTheme.section_title_font(),
-            anchor="w"
-        ).pack(fill="x", padx=12, pady=(10, 4))
-        self.ml_result_label = ctk.CTkLabel(
-            results_frame,
-            text="Кластеризация ещё не выполнялась",
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w",
-            justify="left",
-            wraplength=760
-        )
-        self.ml_result_label.pack(fill="x", padx=12, pady=(2, 8))
-        ctk.CTkLabel(
-            results_frame,
-            text="Пространственный результат сохраняется как ML-слой. Откройте вкладку «Результаты» и добавьте его через «+ Слой».",
-            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w", justify="left", wraplength=760
-        ).pack(fill="x", padx=12, pady=(0, 6))
-
-        preview_controls = ctk.CTkFrame(results_frame, fg_color="transparent")
-        preview_controls.pack(fill="x", padx=12, pady=(2, 6))
-        self.ml_preview_selector = ctk.CTkOptionMenu(
-            preview_controls,
-            values=[
-                "Кластеры на изображении", "Кластеры в признаках",
-                "По масштабам", "По RGB-каналам"
-            ],
-            command=lambda _value: self._refresh_ml_preview(),
-            width=250,
-            state="disabled",
-        )
-        self.ml_preview_selector.pack(side="left")
-        self.ml_open_folder_button = ctk.CTkButton(
-            preview_controls, text="Открыть папку", width=140,
-            height=AppTheme.SMALL_BUTTON_HEIGHT,
-            command=self._open_ml_result_folder, state="disabled"
-        )
-        self.ml_open_folder_button.pack(side="right")
-
-        self.ml_preview_label = ctk.CTkLabel(
-            results_frame, text="", fg_color=AppTheme.NAV_BACKGROUND,
-            corner_radius=6
-        )
-        self.ml_preview_label.pack(fill="x", padx=12, pady=(4, 12))
-        # CTkLabel не во всех версиях CustomTkinter корректно освобождает
-        # прежний PhotoImage при configure(image=None). Оставляем постоянную
-        # прозрачную заглушку, чтобы Tk никогда не ссылался на уже удалённый
-        # pyimage после смены параметров или повторной кластеризации.
-        empty_preview = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
-        self._ml_empty_preview_image = ctk.CTkImage(
-            light_image=empty_preview,
-            dark_image=empty_preview,
-            size=(1, 1),
-        )
-        self.ml_preview_label.configure(image=self._ml_empty_preview_image)
-        self._on_ml_algorithm_changed(self.ml_algorithm_var.get())
+        self.ml_queue_status_label = ctk.CTkLabel(
+            queue_frame, text="ML-план: пуст", anchor="w",
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY)
+        self.ml_queue_status_label.pack(fill="x", padx=12, pady=(3, 2))
+        run_actions = ctk.CTkFrame(queue_frame, fg_color="transparent")
+        run_actions.pack(fill="x", padx=12, pady=(3, 12))
+        self.ml_queue_run_button = ctk.CTkButton(
+            run_actions, text="Выполнить ML-план", width=215,
+            height=AppTheme.BUTTON_HEIGHT, state="disabled",
+            command=self._start_ml_queue_only)
+        self.ml_queue_run_button.pack(side="left")
+        self.ml_queue_run_hint = ctk.CTkLabel(
+            run_actions, text="Доступно после расчёта KNN", anchor="w",
+            text_color=AppTheme.TEXT_SECONDARY, font=AppTheme.caption_font())
+        self.ml_queue_run_hint.pack(side="left", padx=12)
+        self._ml_cards_task = None
+        self._ml_card_editors = []
+        self._ml_cards_signature = None
+        self._refresh_ml_queue_summary()
         return panel
 
     def _update_ml_tab_state(self):
-        """Обновить источник, настройки и последний результат активной задачи."""
-        page_created = hasattr(self, "ml_source_label")
-        task = getattr(self, "current_task", None)
-        if task is None:
-            if not page_created:
-                return
-            self.ml_source_label.configure(
-                text="Активная задача не выбрана",
-                text_color=AppTheme.TEXT_SECONDARY
-            )
-            self._show_ml_result(None)
-            self._refresh_ml_controls_state()
-            return
-
-        self._loading_task_settings = True
-        has_knn = bool(getattr(task, "knn_results", None))
-        if has_knn:
-            from ml.clustering import knn_dataset_options
-            dataset_options = knn_dataset_options(task.knn_results)
-        else:
-            dataset_options = []
-        self._ml_dataset_options = {item["label"]: item["key"] for item in dataset_options}
-        if page_created:
-            values = list(self._ml_dataset_options) or ["Нет KNN-наборов"]
-            self.ml_dataset_selector.configure(values=values, state="normal" if dataset_options else "disabled")
-            wanted = getattr(task, "ml_dataset_key", None)
-            selected_label = None
-            if wanted is not None:
-                selected_label = next((label for label, key in self._ml_dataset_options.items()
-                                       if tuple(key) == tuple(wanted)), None)
-            if selected_label is None and dataset_options:
-                selected_label = dataset_options[0]["label"]
-                task.ml_dataset_key = dataset_options[0]["key"]
-            self.ml_dataset_var.set(selected_label or "Нет KNN-наборов")
-        source_status = (
-            "KNN-признаки готовы к кластеризации" if has_knn else
-            "KNN-признаки ещё не рассчитаны. На вкладке «Параметры расчёта» "
-            "выберите сценарий «Подготовка данных для ML» и запустите расчёт."
-        )
-        if page_created:
-            self.ml_source_label.configure(
-                text=f"{task.task_name}: {source_status}",
-                text_color=AppTheme.TEXT_ON_DARK if has_knn else AppTheme.TEXT_SECONDARY
-            )
-
-        self.ml_algorithm_var.set(
-            "K-means" if task.ml_algorithm == "kmeans" else "DBSCAN"
-        )
-        point_names = {
-            "all": "Все точки KNN", "max_by_row": "Максимумы по строкам",
-            "min_by_row": "Минимумы по строкам",
-            "max_by_column": "Максимумы по столбцам",
-            "min_by_column": "Минимумы по столбцам",
-        }
-        self.ml_point_filter_var.set(point_names.get(task.ml_point_filter, "Все точки KNN"))
-        self.ml_feature_set_var.set(
-            "Геометрия KNN" if task.ml_feature_set == "knn" else "Координаты + KNN"
-        )
-        self.ml_standardize_var.set(task.ml_standardize)
-        self.ml_n_clusters_var.set(str(task.ml_n_clusters))
-        self.ml_random_state_var.set(str(task.ml_random_state))
-        self.ml_eps_var.set(f"{task.ml_eps:g}")
-        self.ml_min_samples_var.set(str(task.ml_min_samples))
-        self.ml_dbscan_tile_size_var.set(str(getattr(task, "ml_dbscan_tile_size", 256)))
-        self.ml_dbscan_tile_overlap_var.set(str(getattr(task, "ml_dbscan_tile_overlap", 32)))
-        self.ml_dbscan_max_points_var.set(str(getattr(task, "ml_dbscan_max_points_per_tile", 30000)))
-        self._loading_task_settings = False
-        self._on_ml_algorithm_changed(self.ml_algorithm_var.get())
-        self._show_ml_result(task.ml_result)
-        self._refresh_ml_controls_state()
+        """Reflect the current task and KNN availability in the plan editor."""
+        self._refresh_ml_queue_summary()
 
     def _on_ml_algorithm_changed(self, _value=None):
         """Показать параметры выбранного алгоритма без уничтожения CTkEntry.
@@ -4816,52 +4673,29 @@ class App(TkinterApp):
         self._refresh_ml_controls_state()
 
     def _refresh_ml_controls_state(self):
-        """Пересчитать доступность ML-контролов из фаз UI-операций.
-
-        Нельзя использовать ``Thread.is_alive()`` для состояния виджетов:
-        callback завершения уже выполняется в Tk-потоке, когда worker ещё может
-        оставаться alive до выхода из своей функции. Именно это окно гонки
-        оставляло параметры ML заблокированными после готового KNN/ML.
-        Проверки ``is_alive()`` остаются только в командах запуска, где они
-        защищают от реального параллельного старта второй операции.
-        """
-        if not hasattr(self, "ml_run_button"):
+        """Only the optional ML-only run depends on already available KNN."""
+        if not hasattr(self, "ml_queue_run_button"):
             return
-
         task = getattr(self, "current_task", None)
-        has_knn = bool(task is not None and getattr(task, "knn_results", None))
-        compute_locked = bool(getattr(self, "_compute_ui_locked", False))
-        ml_locked = bool(getattr(self, "_ml_ui_locked", False))
-        editable = ml_controls_editable(
-            knn_ready=has_knn,
-            compute_locked=compute_locked,
-            ml_locked=ml_locked,
-        )
-        state = "normal" if editable else "disabled"
+        ready = bool(task is not None and getattr(task, "knn_results", None))
+        has_plan = bool(task is not None and getattr(task, "ml_plan", None))
+        busy = bool(getattr(self, "_compute_ui_locked", False)
+                    or getattr(self, "_ml_ui_locked", False))
+        self.ml_queue_run_button.configure(
+            state="normal" if ready and has_plan and not busy else "disabled",
+            text="ML выполняется…" if getattr(self, "_ml_ui_locked", False)
+                 else "Выполнить ML-план")
+        if not ready:
+            hint = "Доступно после расчёта KNN"
+        elif not has_plan:
+            hint = "Добавьте хотя бы один алгоритм"
+        elif busy:
+            hint = "Ожидайте завершения вычислений"
+        else:
+            hint = ""
+        self.ml_queue_run_hint.configure(text=hint)
 
-        for widget_name in (
-            "ml_dataset_selector",
-            "ml_algorithm_selector",
-            "ml_feature_set_selector",
-            "ml_standardize_checkbox",
-        ):
-            widget = getattr(self, widget_name, None)
-            if widget is not None:
-                widget.configure(state=state)
-
-        for entry in getattr(self, "_ml_parameter_entries", []):
-            try:
-                if entry.winfo_exists():
-                    entry.configure(state=state)
-            except Exception:
-                pass
-
-        self.ml_run_button.configure(
-            state=state,
-            text=("Выполняется..." if ml_locked else "Выполнить кластеризацию")
-        )
-
-    def _store_ml_settings(self, task):
+    def _store_ml_settings(self, task, require_dataset=True):
         point_filters = {
             "Все точки KNN": "all", "Максимумы по строкам": "max_by_row",
             "Минимумы по строкам": "min_by_row",
@@ -4870,9 +4704,9 @@ class App(TkinterApp):
         }
         task.ml_algorithm = "kmeans" if self.ml_algorithm_var.get() == "K-means" else "dbscan"
         selected_dataset = self._ml_dataset_options.get(self.ml_dataset_var.get())
-        if selected_dataset is None:
+        if selected_dataset is None and require_dataset:
             raise ValueError("Не выбран KNN-набор")
-        task.ml_dataset_key = tuple(selected_dataset)
+        task.ml_dataset_key = tuple(selected_dataset) if selected_dataset is not None else None
         task.ml_point_filter = "all"
         task.ml_feature_set = (
             "knn" if self.ml_feature_set_var.get() == "Геометрия KNN"
@@ -4987,7 +4821,7 @@ class App(TkinterApp):
                 cancel_callback=self.progress_manager.run_control.check,
             )
             task.ml_result = result
-            save_feature_checkpoint(task)
+            save_feature_checkpoint(task, cancel_check=self.progress_manager.run_control.check)
             self.progress_manager.save_run_log(
                 task.task_folder_path,
                 header=(
@@ -5889,6 +5723,8 @@ class App(TkinterApp):
 
     def _create_gs_3d_panel(self, parent, title, column, padx):
         """Создать встроенную интерактивную 3D-панель Matplotlib."""
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
         box = ctk.CTkFrame(parent, fg_color="transparent")
         box.grid(row=0, column=column, sticky="nsew", padx=padx)
         ctk.CTkLabel(
@@ -6236,9 +6072,14 @@ class App(TkinterApp):
             processor.current_task_index = -1
             processor.experiment_id = experiment_id
             processor.root_folder_path = record['root_path']
+            recovery_messages = []
             for row in saved_tasks:
                 task = ProcessingTask()
-                task.apply_settings_snapshot(__import__('json').loads(row['settings_json']))
+                try:
+                    task.apply_settings_snapshot(__import__('json').loads(row['settings_json']))
+                except (ValueError, TypeError, KeyError, AttributeError) as error:
+                    recovery_messages.append(f"Задача {row['name']}: настройки недоступны ({error}).")
+                    continue
                 task.task_id = row['task_number']
                 task.task_name = row['name']
                 task.persistent_id = row['id']
@@ -6251,17 +6092,33 @@ class App(TkinterApp):
                         b, g, r = cv2.split(image)
                         task.data = [r, g, b]
                         task.data_copy = [channel.copy() for channel in task.data]
+                if task.original_image is None:
+                    recovery_messages.append(f"Задача {task.task_name}: исходное изображение недоступно. "
+                                             "Сохранённые результаты остаются доступны для просмотра.")
                 if task.task_folder_path and os.path.isdir(task.task_folder_path):
                     try:
                         restore_feature_checkpoint(task, task.task_folder_path)
+                        recovery_messages.extend(f"Задача {task.task_name}: {message}" for message in task.recovery_warnings)
                     except Exception as error:
                         self.progress_manager.log_error(
                             f"Не удалось восстановить KNN задачи {task.task_id}: {error}"
                         )
+                        recovery_messages.append(f"Задача {task.task_name}: не удалось восстановить KNN ({error}).")
+                else:
+                    recovery_messages.append(f"Задача {task.task_name}: каталог результатов недоступен.")
                 processor.tasks.append(task)
+            for message in recovery_messages:
+                self.progress_manager.log_error(message)
+            if recovery_messages:
+                mb.showwarning("Исследование открыто с замечаниями",
+                    "\n\n".join(recovery_messages[:10]) +
+                    ("\n\nОстальные сообщения — в журнале." if len(recovery_messages) > 10 else "") +
+                    "\n\nАвтоматический пересчёт не запускался.")
             if not processor.tasks:
+                self.current_task = None
                 self._show_workspace()
-                self.add_new_task()
+                self._update_ui_for_current_task()
+                self._update_tasks_display()
                 return
             processor.current_task_index = 0
             self.current_task = processor.tasks[0]
@@ -6458,6 +6315,7 @@ class App(TkinterApp):
         button_frame.pack(fill="x", padx=10, pady=(3, 7))
 
         def make_task_active():
+            self._save_ml_queue_cards()
             self.current_task = task
             self.image_processor.set_current_task(task.task_id)
             self._update_ui_for_current_task()
@@ -6860,7 +6718,7 @@ class App(TkinterApp):
 
         self.app_start_button.configure(
             state="normal",
-            text="Запустить задачу",
+            text="Запустить очередь",
             fg_color=AppTheme.PRIMARY,
             hover_color=AppTheme.PRIMARY_HOVER
         )
@@ -7429,6 +7287,7 @@ class App(TkinterApp):
 
     def _update_pipeline_controls_state(self):
         """Синхронизировать доступность этапов, настроек и экспортов."""
+        self._refresh_ml_queue_summary()
         task = getattr(self, "current_task", None)
         stage_widgets = (
             self.calculate_extrema_switch,
@@ -8128,21 +7987,11 @@ class App(TkinterApp):
                                          anchor='w', justify='left', wraplength=650)
         self.memory_label.grid(row=1, column=0, sticky='ew', padx=12)
 
-        self.app_start_button = ctk.CTkButton(
+        ctk.CTkLabel(
             self.compute_section,
-            text="Запустить задачу",
-            command=self.safe_compute,
-            width=220,
-            height=AppTheme.PRIMARY_BUTTON_HEIGHT,
-            font=AppTheme.panel_title_font(),
-            fg_color=AppTheme.PRIMARY,
-            hover_color=AppTheme.PRIMARY_HOVER
-        )
-        self.app_start_button.grid(
-            row=0, column=0, sticky="e",
-            padx=AppTheme.CONTENT_PADDING,
-            pady=AppTheme.CONTENT_PADDING
-        )
+            text="Запуск всей очереди находится внизу панели задач слева.",
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
 
     def _refresh_memory_estimate(self):
         try:
@@ -8245,6 +8094,7 @@ class App(TkinterApp):
             task.extrema_distance = distance
             task.extrema_prominence = prominence
         self._store_settings_for_current_task()
+        self._save_ml_queue_cards()  # Tk variables are read in the GUI thread, before worker starts.
         self._refresh_memory_estimate()
         self.progress_manager.run_control.reset()
         self.cancel_compute_button.configure(state='normal', text='Отменить расчёт')
@@ -8252,7 +8102,7 @@ class App(TkinterApp):
         # Блокируем UI на время вычислений
         self._disable_ui_during_compute(True)
 
-        self._compute_thread = threading.Thread(target=self._compute_wrapper, args=((task,),))
+        self._compute_thread = threading.Thread(target=self._compute_wrapper, args=(tuple(self.image_processor.tasks),))
         self._compute_thread.daemon = True
         self._compute_thread.start()
 
@@ -8402,9 +8252,409 @@ class App(TkinterApp):
                 self._locked_controls.append((widget, widget.cget('state')))
                 widget.configure(state='disabled')
 
-    def _run_integrated_ml(self, task):
-        """Устаревшая точка входа: ML больше не является этапом анализа."""
-        return None
+    def _add_ml_queue_card(self):
+        from ml.batch_plan import default_configuration
+        task = self.current_task
+        if task is None:
+            return
+        self._save_ml_queue_cards()
+        plan = list(getattr(task, "ml_plan", []))
+        plan.append(default_configuration(
+            "kmeans" if self.ml_queue_new_algorithm.get() == "K-means" else "dbscan"))
+        task.ml_plan = plan
+        self._persist_experiment_task(task)
+        self._render_ml_queue_cards(force=True)
+
+    def _duplicate_ml_queue_card(self, index):
+        """Copy every source filter and algorithm parameter independently."""
+        from copy import deepcopy
+        task = self.current_task
+        if task is None:
+            return
+        self._save_ml_queue_cards()
+        if not 0 <= index < len(task.ml_plan):
+            return
+        task.ml_plan.insert(index + 1, deepcopy(task.ml_plan[index]))
+        self._persist_experiment_task(task)
+        self._render_ml_queue_cards(force=True)
+
+    def _remove_ml_queue_card(self, index):
+        task = self.current_task
+        if task is None:
+            return
+        self._save_ml_queue_cards()
+        if not 0 <= index < len(task.ml_plan):
+            return
+        task.ml_plan.pop(index)
+        self._persist_experiment_task(task)
+        self._render_ml_queue_cards(force=True)
+
+    def _save_ml_queue_cards(self):
+        task = getattr(self, "current_task", None)
+        if (getattr(self, '_ml_rendering_cards', False)
+                or task is None or getattr(self, "_ml_cards_task", None) is not task):
+            return
+        for index, variables in getattr(self, "_ml_card_editors", []):
+            if index >= len(task.ml_plan):
+                continue
+            cfg = task.ml_plan[index]
+            for key, control in variables.items():
+                cfg[key] = control() if callable(control) else control.get()
+        self._persist_experiment_task(task)
+        self._refresh_ml_queue_count()
+
+    def _render_ml_queue_cards(self, force=False):
+        """Task-aware ML cards: no hand-entered codes for channels or point types."""
+        from ml.batch_plan import task_source_choices
+        from utils.ml_multi_dropdown import MLMultiDropdown, MLSingleDropdown
+        task = getattr(self, "current_task", None)
+        if not hasattr(self, "ml_queue_cards_frame"):
+            return
+        choices = task_source_choices(task) if task is not None else {}
+        signature = (getattr(task, 'analysis_mode', None), tuple(
+            (key, tuple(choices[key])) for key in ('channels', 'scales', 'directions', 'point_types')
+        )) if task is not None else None
+        same_task = task is getattr(self, "_ml_cards_task", None)
+        if same_task and not force and signature == getattr(self, '_ml_cards_signature', None):
+            return
+        if same_task and not force:
+            self._save_ml_queue_cards()  # only for source-option changes; add/delete already saved
+        if not same_task:
+            scrollable = getattr(self, 'ml_page_scrollable', None)
+            if scrollable is not None:
+                # After reflow, a new task should start at the top of its plan,
+                # not at the scroll position of the previous task's long cards.
+                self.after_idle(lambda selected=task, view=scrollable:
+                    view.canvas.yview_moveto(0) if getattr(self, 'current_task', None) is selected
+                    and view.winfo_exists() else None)
+        self._ml_rendering_cards = True
+        self._ml_cards_task = task
+        self._ml_cards_signature = signature
+        for widget in self.ml_queue_cards_frame.winfo_children():
+            widget.destroy()
+        self._ml_card_editors = []
+        plan = list(getattr(task, 'ml_plan', [])) if task is not None else []
+        if not plan:
+            self.ml_queue_cards_frame.pack_forget()
+        elif not self.ml_queue_cards_frame.winfo_manager():
+            self.ml_queue_cards_frame.pack(
+                fill='x', padx=12, pady=(0, 2), before=self.ml_queue_status_label)
+        if task is None:
+            self.ml_queue_task_label.configure(text="Выберите активную задачу")
+            self._ml_rendering_cards = False
+            return
+        self.ml_queue_task_label.configure(text=f"●  Активная задача: {task.task_name}")
+        for index, cfg in enumerate(getattr(task, 'ml_plan', [])):
+            algorithm = str(cfg.get('algorithm', 'kmeans')).lower()
+            algorithm_name = 'K-means' if algorithm == 'kmeans' else 'DBSCAN'
+            card = ctk.CTkFrame(self.ml_queue_cards_frame, corner_radius=9,
+                                fg_color=AppTheme.NAV_HOVER)
+            card.pack(fill='x', pady=5)
+            heading = ctk.CTkFrame(card, fg_color='transparent')
+            heading.pack(fill='x', padx=12, pady=(8, 3))
+            ctk.CTkLabel(heading, text=f'{index + 1}. {algorithm_name}',
+                         font=AppTheme.section_title_font()).pack(side='left')
+            HelpIcon(heading, 'ml.kmeans' if algorithm == 'kmeans'
+                     else 'ml.dbscan').pack(side='left', padx=(7, 0))
+            ctk.CTkButton(heading, text='Удалить', width=84, fg_color='transparent',
+                          border_width=1, command=lambda i=index: self._remove_ml_queue_card(i)
+                          ).pack(side='right', padx=(7, 0))
+            ctk.CTkButton(heading, text='Дублировать настройки', width=180,
+                          fg_color='transparent', border_width=1,
+                          command=lambda i=index: self._duplicate_ml_queue_card(i)
+                          ).pack(side='right')
+
+            ctk.CTkLabel(card, text='Настройки источника данных',
+                         font=AppTheme.section_title_font(), anchor='w').pack(
+                             fill='x', padx=12, pady=(8, 3))
+            source = ctk.CTkFrame(card, fg_color='transparent')
+            source.pack(anchor='w', padx=12, pady=(0, 5))
+            source.grid_columnconfigure(1, weight=0, minsize=450)
+            variables = {}
+            row = 0
+
+            def add_label(parent, number, title, help_key=None):
+                # A shared row keeps info icons beside labels without shifting
+                # the right-aligned entry/dropdown column.
+                label_row = ctk.CTkFrame(parent, fg_color='transparent')
+                label_row.grid(row=number, column=0, sticky='w',
+                               padx=(0, 12), pady=3)
+                ctk.CTkLabel(label_row, text=title, anchor='w',
+                             font=AppTheme.body_font()).pack(side='left')
+                if help_key:
+                    HelpIcon(label_row, help_key).pack(
+                        side='left', padx=(7, 0))
+
+            for key, label, description in (
+                ('channels', 'Каналы', 'каналы'),
+                ('scales', 'Масштабы', 'масштабы'),
+            ):
+                add_label(source, row, label, f'ml.{key}')
+                selector = MLMultiDropdown(source, options=choices[key],
+                                           value=cfg.get(key, '*'), subject=description,
+                                           on_change=lambda _value: self._save_ml_queue_cards())
+                selector.grid(row=row, column=1, sticky='ew', pady=2)
+                variables[key] = selector
+                row += 1
+
+            add_label(source, row, 'Тип CWT', 'ml.directions')
+            direction_options = [('*', 'Все направления'), *choices['directions']]
+            direction_menu = MLSingleDropdown(
+                source, options=direction_options, value=cfg.get('directions', '*'),
+                on_change=lambda _value: self._save_ml_queue_cards())
+            direction_menu.grid(row=row, column=1, sticky='ew', pady=2)
+            variables['directions'] = direction_menu
+            row += 1
+
+            add_label(source, row, 'Типы точек', 'ml.point_types')
+            type_selector = MLMultiDropdown(source, options=choices['point_types'],
+                value=cfg.get('point_types', '*'), subject='типы точек',
+                on_change=lambda _value: self._save_ml_queue_cards())
+            type_selector.grid(row=row, column=1, sticky='ew', pady=2)
+            variables['point_types'] = type_selector
+            row += 1
+
+            add_label(source, row, 'Признаки', 'ml.features')
+            feature_mapping = {
+                'Координаты': 'coordinates',
+                'Расстояния и углы KNN': 'knn',
+                'Координаты + KNN': 'coordinates_knn',
+            }
+            feature_menu = MLSingleDropdown(
+                source,
+                options=[(code, label) for label, code in feature_mapping.items()],
+                value=cfg.get('feature_set', 'knn'),
+                on_change=lambda _value: self._save_ml_queue_cards())
+            feature_menu.grid(row=row, column=1, sticky='ew', pady=2)
+            variables['feature_set'] = feature_menu
+
+            ctk.CTkLabel(card, text=f'Параметры {algorithm_name}',
+                         anchor='w', font=AppTheme.section_title_font()).pack(
+                             fill='x', padx=12, pady=(8, 3))
+            params = ctk.CTkFrame(card, fg_color='transparent')
+            params.pack(anchor='w', padx=12, pady=(0, 3))
+            params.grid_columnconfigure(1, weight=0, minsize=450)
+            def add_entry(number, key, caption, fallback, help_key):
+                add_label(params, number, caption, help_key)
+                value_var = tk.StringVar(value=str(cfg.get(key, fallback)))
+                entry = ctk.CTkEntry(params, textvariable=value_var, height=31)
+                entry.grid(row=number, column=1, sticky='ew', pady=2)
+                entry.bind('<FocusOut>', lambda _event: self._save_ml_queue_cards())
+                entry.bind('<Return>', lambda _event: self._save_ml_queue_cards())
+                variables[key] = value_var
+
+            if algorithm == 'kmeans':
+                add_entry(0, 'k_values', 'Количество кластеров k',
+                          '5', 'ml.kmeans.k')
+                add_entry(1, 'random_state', 'Random state',
+                          42, 'ml.random_state')
+            else:
+                add_entry(0, 'eps_values', 'Радиус соседства ε (eps)',
+                          '0.8', 'ml.dbscan.eps')
+                add_entry(1, 'min_samples_values', 'Минимум точек в соседстве',
+                          '5', 'ml.dbscan.min_samples')
+                advanced = ctk.CTkFrame(card, fg_color='transparent')
+                advanced.pack(anchor='w', padx=12, pady=(2, 4))
+                ctk.CTkLabel(advanced, text='Дополнительно · обработка DBSCAN по тайлам',
+                             font=AppTheme.body_font(), anchor='w').pack(fill='x', pady=(0, 4))
+                advanced_grid = ctk.CTkFrame(advanced, fg_color='transparent')
+                advanced_grid.pack(anchor='w')
+                advanced_grid.grid_columnconfigure(1, weight=0, minsize=450)
+                for advanced_row, key, caption, default, help_key in (
+                    (0, 'dbscan_tile_size', 'Размер тайла (пиксели)',
+                     256, 'ml.dbscan.tile_size'),
+                    (1, 'dbscan_tile_overlap', 'Перекрытие тайлов (пиксели)',
+                     32, 'ml.dbscan.tile_overlap'),
+                    (2, 'dbscan_max_points_per_tile', 'Максимум точек на тайл',
+                     30000, 'ml.dbscan.max_points'),
+                ):
+                    add_label(advanced_grid, advanced_row, caption, help_key)
+                    variable = tk.StringVar(value=str(cfg.get(key, default)))
+                    ctk.CTkEntry(advanced_grid, textvariable=variable, height=31).grid(
+                        row=advanced_row, column=1, sticky='ew', pady=2)
+                    variables[key] = variable
+                    variable.trace_add('write', lambda *_args: self._save_ml_queue_cards())
+
+            standardize_var = tk.BooleanVar(value=bool(cfg.get('standardize', True)))
+            variables['standardize'] = standardize_var
+            standardize_row = ctk.CTkFrame(card, fg_color='transparent')
+            standardize_row.pack(anchor='w', padx=12, pady=(5, 10))
+            ctk.CTkCheckBox(
+                standardize_row,
+                text='Стандартизовать признаки перед кластеризацией',
+                variable=standardize_var,
+                command=self._save_ml_queue_cards,
+            ).pack(side='left')
+            HelpIcon(standardize_row, 'ml.standardize').pack(
+                side='left', padx=(9, 0))
+            self._ml_card_editors.append((index, variables))
+        self._ml_rendering_cards = False
+        self._refresh_ml_queue_count()
+
+    def _refresh_ml_queue_count(self):
+        task = getattr(self, "current_task", None)
+        plan = getattr(task, "ml_plan", []) if task else []
+        preview = ""
+        if plan:
+            try:
+                from ml.batch_plan import preview_task_ml_operations
+                count = len(preview_task_ml_operations(task))
+                preview = f" · {count} отдельных ML-расчётов"
+            except ValueError as error:
+                preview = f" · Ошибка плана: {error}"
+        if hasattr(self, "ml_queue_status_label"):
+            self.ml_queue_status_label.configure(
+                text=f"ML-план задачи: {len(plan)} конфигураций{preview}")
+        if hasattr(self, "queue_summary_label") and hasattr(self, "image_processor"):
+            tasks = self.image_processor.tasks
+            count = sum(len(getattr(t, "ml_plan", [])) for t in tasks)
+            self.queue_summary_label.configure(text=f"{len(tasks)} задач · {count} ML-конфигураций")
+        self._refresh_ml_controls_state()
+
+    def _refresh_ml_queue_summary(self):
+        self._render_ml_queue_cards()
+        self._refresh_ml_queue_count()
+
+    def _start_ml_queue_only(self):
+        """Run the plan of the active, already calculated task, without CWT/KNN."""
+        from ml.batch_plan import expand_task_ml
+        task = getattr(self, "current_task", None)
+        if (self._workspace_is_busy() or self._ml_ui_locked
+                or self._compute_ui_locked):
+            mb.showwarning("ML", "Дождитесь завершения текущих вычислений")
+            return
+        if task is None or not getattr(task, "knn_results", None):
+            mb.showwarning("ML", "Сначала рассчитайте KNN для активной задачи")
+            return
+        self._save_ml_queue_cards()
+        if not getattr(task, "ml_plan", None):
+            mb.showwarning("ML", "Добавьте конфигурацию алгоритма")
+            return
+        try:
+            operations = expand_task_ml(task)
+            if not operations:
+                raise ValueError("В ML-плане нет операций")
+            if not task.task_folder_path or not os.path.isdir(task.task_folder_path):
+                raise ValueError("Не найден каталог задачи с вычисленными KNN")
+        except ValueError as error:
+            mb.showerror("ML-план", str(error))
+            return
+        self._persist_experiment_task(task)
+        self.progress_manager.run_control.reset()
+        stages = [
+            f"{task.task_name} · ML {i}/{len(operations)} · {op['algorithm']} · {tuple(op['dataset_key'])}"
+            for i, op in enumerate(operations, 1)
+        ]
+        self.progress_manager.begin_run(
+            f"{task.task_name} · дополнительный ML", stages)
+        self._ml_ui_locked = True
+        self._refresh_ml_controls_state()
+        self.cancel_compute_button.configure(state="normal", text="Отменить расчёт")
+        self._ml_thread = threading.Thread(
+            target=self._ml_queue_only_worker,
+            args=(task, operations), daemon=True)
+        self._ml_thread.start()
+
+    def _ml_queue_only_worker(self, task, operations):
+        """Run only ML; all GUI finishing work runs back in the Tk thread."""
+        try:
+            result = self._run_integrated_ml(task, operations)
+        except RunCancelled:
+            self.after_safe(0, self.progress_manager.cancel_run)
+        except Exception as error:
+            self.progress_manager.log_error(
+                f"Ошибка дополнительного ML: {error}\n{traceback.format_exc()}")
+            self.after_safe(0, lambda msg=str(error):
+                            self.progress_manager.fail_run(f"Ошибка ML: {msg}"))
+        else:
+            self.after_safe(0, self._refresh_history_tab)
+            self.after_safe(0, lambda t=task, summary=result:
+                            self._finish_ml_queue_only_success(t, summary))
+        finally:
+            self.after_safe(0, self._finish_ml_queue_only)
+
+    def _finish_ml_queue_only_success(self, task, summary):
+        done = summary["completed"]
+        errors = summary["failed"]
+        if done == 0 and errors:
+            self.progress_manager.fail_run(
+                f"ML-план: все {errors} операций завершились ошибкой")
+            return
+        message = f"ML-план: готово {done}"
+        if errors:
+            message += f", ошибок {errors}"
+        self.progress_manager.finish_run(
+            message,
+            result_callback=lambda: self._show_saved_results(
+                self.image_processor.root_folder_path),
+            folder_callback=lambda: self._open_result_path(task.task_folder_path),
+            history_callback=self._show_history_page,
+        )
+        self._show_saved_results(self.image_processor.root_folder_path)
+
+    def _finish_ml_queue_only(self):
+        self._ml_ui_locked = False
+        self.cancel_compute_button.configure(state="disabled", text="Отменить расчёт")
+        self._refresh_ml_controls_state()
+
+    def _run_integrated_ml(self, task, operations=None):
+        """Execute explicit KNN/algorithm operations, preserving each result."""
+        from ml.batch_plan import expand_task_ml
+        operations = operations if operations is not None else expand_task_ml(task)
+        # An empty plan must not import sklearn or switch Matplotlib's backend.
+        if operations:
+            from ml.clustering import run_clustering
+        completed = 0
+        failed = 0
+        for index, config in enumerate(operations, 1):
+            self.progress_manager.run_control.check()
+            algorithm = config["algorithm"]
+            dataset_key = tuple(config["dataset_key"])
+            stage_name = (f"{task.task_name} · ML {index}/{len(operations)} · "
+                          f"{algorithm} · {dataset_key}")
+            self.progress_manager.begin_stage(stage_name)
+            started = time.time()
+            try:
+                result = run_clustering(
+                    knn_results=task.knn_results,
+                    algorithm=algorithm, output_root=task.task_folder_path,
+                    image=task.original_image,
+                    point_filter=config.get("point_filter", "all"),
+                    feature_set=config.get("feature_set", "knn"),
+                    standardize=bool(config.get("standardize", True)),
+                    n_clusters=int(config.get("n_clusters", 5)),
+                    random_state=int(config.get("random_state", 42)),
+                    eps=float(config.get("eps", 0.8)),
+                    min_samples=int(config.get("min_samples", 5)),
+                    dataset_key=dataset_key,
+                    dbscan_tile_size=int(config.get("dbscan_tile_size", 256)),
+                    dbscan_tile_overlap=int(config.get("dbscan_tile_overlap", 32)),
+                    dbscan_max_points_per_tile=int(config.get("dbscan_max_points_per_tile", 30000)),
+                    cancel_callback=self.progress_manager.run_control.check,
+                )
+                task.ml_result = result
+                completed += 1
+                self.run_history.add_run(
+                    task=task, status="completed", run_type="ml",
+                    duration_seconds=time.time() - started,
+                    settings={**task.settings_snapshot(), "ml_configuration": config},
+                    ml_algorithm=algorithm, output_path=result["output_dir"],
+                )
+            except RunCancelled:
+                raise
+            except Exception as error:
+                failed += 1
+                self.progress_manager.log_error(
+                    f"ML {index}/{len(operations)} ({dataset_key}): {error}; "
+                    "следующие конфигурации продолжаются")
+                self.run_history.add_run(
+                    task=task, status="failed", run_type="ml",
+                    duration_seconds=time.time() - started,
+                    settings={**task.settings_snapshot(), "ml_configuration": config},
+                    ml_algorithm=algorithm, error_message=str(error),
+                )
+        self._persist_experiment_task(task)
+        return {"completed": completed, "failed": failed}
 
     def _history_ml_summary(self, task):
         result = task.ml_result
@@ -8481,12 +8731,28 @@ class App(TkinterApp):
             timer = time.time()
             total_tasks = len(tasks)
             current_task_num = 0
+            from ml.batch_plan import preview_task_ml_operations
+            ml_operations_by_task = {}
+            for planned_task in tasks:
+                try:
+                    ml_operations_by_task[id(planned_task)] = preview_task_ml_operations(planned_task)
+                except ValueError as error:
+                    raise ValueError(f"{planned_task.task_name}: {error}") from error
             execution_stages = []
             for planned_task in tasks:
+                planned_stages = planned_task.execution_stage_names()
                 execution_stages.extend(
                     f"{planned_task.task_name} · {stage}"
-                    for stage in planned_task.execution_stage_names()
+                    for stage in planned_stages[:-1]
                 )
+                operations = ml_operations_by_task[id(planned_task)]
+                execution_stages.extend(
+                    f"{planned_task.task_name} · ML {i}/{len(operations)} · "
+                    f"{op['algorithm']} · {tuple(op['dataset_key'])}"
+                    for i, op in enumerate(operations, 1)
+                )
+                execution_stages.append(
+                    f"{planned_task.task_name} · {planned_stages[-1]}")
             self.progress_manager.begin_run(
                 f"Исследование · {', '.join(task.task_name for task in tasks)}", execution_stages
             )
@@ -8520,9 +8786,9 @@ class App(TkinterApp):
                         self.image_processor.create_task_folder(task)
                         save_run_image(task)
                     snapshot = task.settings_snapshot()
-                    # На странице параметров расчёта выполняется только подготовка
-                    # признаков. ML-алгоритмы запускаются исключительно на вкладке «ML».
                     self.image_processor.compute_for_task(task)
+                    if getattr(task, "ml_plan", []):
+                        self._run_integrated_ml(task, ml_operations_by_task[id(task)])
                     self.progress_manager.begin_stage(
                         f"{task.task_name} · Сохранение результатов"
                     )
@@ -8537,7 +8803,7 @@ class App(TkinterApp):
                     self.progress_manager.save_run_log(
                         task.task_folder_path, header=log_header
                     )
-                    checkpoint = save_feature_checkpoint(task)
+                    checkpoint = save_feature_checkpoint(task, cancel_check=self.progress_manager.run_control.check)
                     if checkpoint:
                         self.progress_manager.log_info(
                             f"Контрольная точка признаков сохранена: {checkpoint}"
@@ -8557,7 +8823,10 @@ class App(TkinterApp):
                     self.run_history.add_run(task=task, status='cancelled',
                                              duration_seconds=time.time() - task_started,
                                              settings=snapshot, error_message=str(error))
-                    self.progress_manager.save_run_log(task.task_folder_path, header='Запуск отменён; результаты частичные')
+                    try:
+                        self.progress_manager.save_run_log(task.task_folder_path, header='Запуск отменён; результаты частичные')
+                    except OSError as log_error:
+                        self.progress_manager.log_error(f"Не удалось сохранить журнал отмены: {log_error}")
                     raise
                 except Exception as error:
                     self._persist_experiment_task(task)

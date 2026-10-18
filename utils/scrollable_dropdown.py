@@ -125,6 +125,10 @@ class _ScrollableDropdown:
                         fg_color=_ACTIVE if s else _HOVER), add='+')
                     widget.bind('<Leave>', lambda event, r=row, s=selected: r.configure(
                         fg_color=_ACTIVE if s else 'transparent'), add='+')
+            # Newly populated rows must also catch the wheel when a search
+            # rebuilds the list.  Otherwise only dragging the scrollbar works.
+            from utils.mousewheel import bind_popup_mousewheel
+            bind_popup_mousewheel(popup, frame)
 
         search_var.trace_add('write', populate)
         populate()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import zipfile
 from pathlib import Path
 from typing import Iterable
 
@@ -78,45 +79,42 @@ def save_point_cache(task_folder, artifact, cwt_axis, feature_axis, channel, sca
     return path
 
 
-def _load_txt_points(path: Path, *, as_array: bool = False):
-    if not path.is_file():
+def _validated_points(data):
+    array = np.asarray(data)
+    if array.ndim != 2 or array.shape[1] != 2 or array.dtype.kind not in "iuf":
         return None
-    if path.stat().st_size == 0:
-        empty = np.empty((0, 2), dtype=np.int32)
-        return empty if as_array else []
-    try:
-        data = np.loadtxt(path, delimiter=",", ndmin=2)
-    except ValueError:
-        empty = np.empty((0, 2), dtype=np.int32)
-        return empty if as_array else []
-    if data.size == 0:
-        empty = np.empty((0, 2), dtype=np.int32)
-        return empty if as_array else []
-    array = np.asarray(data[:, :2], dtype=np.int32).reshape(-1, 2)
-    return array if as_array else array.tolist()
+    if not np.isfinite(array).all() or (array < 0).any():
+        return None
+    if (array > np.iinfo(np.int32).max).any() or (array != np.floor(array)).any():
+        return None
+    return np.ascontiguousarray(array, dtype=np.int32)
 
 
 def load_point_cache(task_folder, artifact, cwt_axis, feature_axis, channel, scale, kind, *, as_array=False):
-    """Load a point artifact; supports new cache plus legacy TXT/NPZ exports."""
+    """Malformed canonical caches are missing, never silently empty results."""
     cache = point_cache_path(task_folder, artifact, cwt_axis, feature_axis, channel, scale, kind)
-    if cache.is_file():
-        data = np.asarray(np.load(cache, allow_pickle=False), dtype=np.int32).reshape(-1, 2)
-        return data if as_array else data.tolist()
-
     stem = point_stem(artifact, cwt_axis, feature_axis, channel, scale, kind)
     scale_dir = Path(task_folder) / "scales" / scale_folder_name(scale)
     stage = "envelopes" if artifact == "env" else "extremes"
-    for source_dir in (scale_dir / stage, scale_dir):
-        txt_points = _load_txt_points(source_dir / f"{stem}.txt", as_array=as_array)
-        if txt_points is not None:
-            return txt_points
-        npz_path = source_dir / f"{stem}.npz"
-        if npz_path.is_file():
-            with np.load(npz_path, allow_pickle=False) as payload:
-                points = payload.get("points")
-                if points is not None:
-                    array = np.asarray(points, dtype=np.int32).reshape(-1, 2)
-                    return array if as_array else array.tolist()
+    candidates = [cache]
+    for directory in (scale_dir / stage, scale_dir):
+        candidates.extend([directory / f"{stem}.txt", directory / f"{stem}.npz"])
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            if path.suffix == ".txt":
+                data = (np.empty((0, 2), dtype=np.int32) if path.stat().st_size == 0
+                        else np.loadtxt(path, delimiter=",", ndmin=2))
+            elif path.suffix == ".npz":
+                with np.load(path, allow_pickle=False) as payload:
+                    data = payload["points"]
+            else:
+                data = np.load(path, allow_pickle=False)
+            points = _validated_points(data)
+            return None if points is None else (points if as_array else points.tolist())
+        except (OSError, ValueError, EOFError, KeyError, zipfile.BadZipFile):
+            return None
     return None
 
 
@@ -147,17 +145,25 @@ def point_bundle_available(task, *, envelope: bool) -> bool:
     if getattr(task, "process_columns", True):
         axes.append("col")
     channels = list(getattr(task, "analysis_channel_codes", [])) or list(task.analysis_channel_codes_for_settings())
+    if not axes or not channels or not len(task.scales):
+        return False
     for cwt_axis in axes:
         for channel in channels:
             for scale in np.asarray(task.scales):
                 for feature_axis in ("row", "col"):
                     for kind in kinds:
-                        if load_point_cache(folder, artifact, cwt_axis, feature_axis, channel, scale, kind) is None:
+                        points = load_point_cache(folder, artifact, cwt_axis, feature_axis, channel, scale, kind, as_array=True)
+                        if points is None:
                             return False
+                        image = getattr(task, "original_image", None)
+                        if image is not None and len(points):
+                            height, width = image.shape[:2]
+                            if (points[:, 0] >= width).any() or (points[:, 1] >= height).any():
+                                return False
     return True
 
 
-def load_complete_cwt(task):
+def load_complete_cwt(task, *, validate_only=False):
     """Restore the full selected 1D CWT from the lossless preview .npy files."""
     folder = Path(getattr(task, "task_folder_path", ""))
     if not folder.is_dir() or getattr(task, "analysis_mode", "1d") != "1d":
@@ -169,6 +175,10 @@ def load_complete_cwt(task):
     if getattr(task, "process_columns", True):
         axes.append((1, "col"))
     channels = list(getattr(task, "analysis_channel_codes", [])) or list(task.analysis_channel_codes_for_settings())
+    if not axes or not channels or not len(task.scales):
+        return None
+    image = getattr(task, "original_image", None)
+    expected_shape = tuple(image.shape[:2]) if image is not None else None
     result = {}
     for type_data, cwt_axis in axes:
         per_channel = []
@@ -182,10 +192,26 @@ def load_complete_cwt(task):
                     path = legacy if legacy.is_file() else path
                 if not path.is_file():
                     return None
-                array = np.load(path, allow_pickle=False)
-                if array.ndim != 2:
+                try:
+                    array = np.load(path, allow_pickle=False, mmap_mode="r")
+                    if (array.ndim != 2 or array.dtype.kind not in "fiu"
+                            or (expected_shape is not None and array.shape != expected_shape)):
+                        return None
+                    if expected_shape is None:
+                        expected_shape = array.shape
+                    # Bounded temporary memory even for large coefficient matrices.
+                    for start in range(0, len(array), 256):
+                        if not np.isfinite(array[start:start + 256]).all():
+                            return None
+                    if not validate_only:
+                        per_scale.append(np.array(array, dtype=np.float32))
+                except (OSError, ValueError, EOFError):
                     return None
-                per_scale.append(np.asarray(array, dtype=np.float32))
-            per_channel.append(np.stack(per_scale, axis=0))
-        result[type_data] = np.stack(per_channel, axis=0)
-    return result
+                finally:
+                    if "array" in locals() and isinstance(array, np.memmap):
+                        array._mmap.close()
+            if not validate_only:
+                per_channel.append(np.stack(per_scale, axis=0))
+        if not validate_only:
+            result[type_data] = np.stack(per_channel, axis=0)
+    return True if validate_only else result

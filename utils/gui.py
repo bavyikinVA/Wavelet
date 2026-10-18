@@ -143,22 +143,42 @@ class ScrollableFrame(ctk.CTkFrame):
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
 
-        # Привязываем события мыши для скроллинга
-        self.canvas.bind("<Enter>", self._bind_mousewheel)
-        self.canvas.bind("<Leave>", self._unbind_mousewheel)
+        # Install once per application, not once per page.  The old Enter/Leave
+        # bind_all/unbind_all approach hijacked other scrollable popups and
+        # stopped working when the pointer was over a descendant control.
+        self._install_wheel_dispatcher()
 
-    def _bind_mousewheel(self, event):
-        """Привязка колесика мыши"""
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+    def _install_wheel_dispatcher(self):
+        from utils.mousewheel import scroll_units
+        root = self.winfo_toplevel()
+        if getattr(root, '_wavelets_scroll_dispatcher_installed', False):
+            return
+        root._wavelets_scroll_dispatcher_installed = True
 
-    def _unbind_mousewheel(self, event):
-        """Отвязка колесика мыши"""
-        self.canvas.unbind_all("<MouseWheel>")
+        def dispatch(event):
+            delta = scroll_units(event)
+            if not delta:
+                return
+            try:
+                widget = root.winfo_containing(event.x_root, event.y_root)
+            except tk.TclError:
+                return
+            while widget is not None:
+                # CTkScrollableFrame has its own wheel handlers.  A popup also
+                # uses widget-level bindings (before the global 'all' tag).
+                if isinstance(widget, ctk.CTkScrollableFrame):
+                    return
+                if isinstance(widget, ScrollableFrame):
+                    try:
+                        widget.canvas.yview_scroll(delta, 'units')
+                        return 'break'
+                    except tk.TclError:
+                        return
+                widget = getattr(widget, 'master', None)
 
-    def _on_mousewheel(self, event):
-        """Обработка скроллинга колесиком мыши"""
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
+        root.bind_all('<MouseWheel>', dispatch, add='+')
+        root.bind_all('<Button-4>', dispatch, add='+')
+        root.bind_all('<Button-5>', dispatch, add='+')
 
 class ResizablePanedWindow(ctk.CTkFrame):
     """Разделяемое окно с возможностью изменения размеров панелей"""

@@ -1,10 +1,3 @@
-"""Clustering of point features produced by the in-memory KNN stage.
-
-The module has no GUI dependencies.  Long-running operations expose optional
-progress and cancellation callbacks so a GUI can stay responsive and show the
-real stage currently being executed.
-"""
-
 from __future__ import annotations
 
 import csv
@@ -29,6 +22,7 @@ from compute.knn.result_format import (
 )
 
 from .errors import ClusteringError
+from .validation import validate_ml_parameters
 
 
 POINT_TYPE_LABELS = {
@@ -230,7 +224,9 @@ def extract_knn_features(
     if len(records) < 3:
         raise ClusteringError("Недостаточно KNN-точек в выбранном наборе")
 
-    if feature_set == "knn":
+    if feature_set == "coordinates":
+        feature_names = ["x", "y"]
+    elif feature_set == "knn":
         feature_names = ["distance_mean", "distance_std", "angle_sin_mean",
                          "angle_cos_mean", "angle_concentration"]
     elif feature_set == "coordinates_knn":
@@ -644,6 +640,19 @@ def run_clustering(
     dbscan_max_points_per_tile: int = 30000,
 ) -> dict:
     """Cluster one selected KNN dataset with bounded-memory large-data paths."""
+    parameters = validate_ml_parameters(dict(
+        algorithm=algorithm, n_clusters=n_clusters, random_state=random_state,
+        eps=eps, min_samples=min_samples, dbscan_tile_size=dbscan_tile_size,
+        dbscan_tile_overlap=dbscan_tile_overlap,
+        dbscan_max_points_per_tile=dbscan_max_points_per_tile))
+    algorithm = parameters['algorithm']
+    n_clusters = parameters['n_clusters']
+    random_state = parameters['random_state']
+    eps = parameters['eps']
+    min_samples = parameters['min_samples']
+    dbscan_tile_size = parameters['dbscan_tile_size']
+    dbscan_tile_overlap = parameters['dbscan_tile_overlap']
+    dbscan_max_points_per_tile = parameters['dbscan_max_points_per_tile']
     timings = {}
     def timed(name, fn):
         started = time.perf_counter()
@@ -660,6 +669,7 @@ def run_clustering(
         progress_callback=progress_callback, cancel_callback=cancel_callback))
     values = table.values
     point_count = len(values)
+    validate_ml_parameters(parameters, point_count)
 
     _notify(progress_callback, "scaling", 0.0, f"Стандартизация {point_count:,} точек…")
     model_values = timed("standardization",
@@ -671,8 +681,6 @@ def run_clustering(
     tiled = False
     model_kind = algorithm
     if algorithm == "kmeans":
-        if n_clusters < 2 or n_clusters >= point_count:
-            raise ClusteringError("Для K-means число кластеров должно быть от 2 до числа точек минус 1")
         if point_count >= int(minibatch_threshold):
             model = MiniBatchKMeans(n_clusters=int(n_clusters), random_state=int(random_state),
                                     batch_size=int(minibatch_size), n_init="auto")
@@ -685,10 +693,6 @@ def run_clustering(
         labels = timed("clustering", lambda: model.fit_predict(model_values))
         _notify(progress_callback, "clustering", 1.0, f"{algorithm_name}: кластеризация завершена")
     elif algorithm == "dbscan":
-        if eps <= 0:
-            raise ClusteringError("Радиус DBSCAN должен быть больше нуля")
-        if min_samples < 2:
-            raise ClusteringError("Минимум точек DBSCAN должен быть не меньше 2")
         algorithm_name = "DBSCAN (локальный сеточный)"
         tiled = True
         _notify(progress_callback, "clustering", 0.0,

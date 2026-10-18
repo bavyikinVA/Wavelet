@@ -55,11 +55,8 @@ logs/
 .coverage
 coverage.xml
 htmlcov/
+# Source tests and reproducible benchmarks must be versioned in Git.
 tests/
-test_*.py
-benchmarks/
-Tests/
-
 # =========================
 # Build / package artifacts
 # =========================
@@ -115,3 +112,11 @@ processed/
 processed_images/
 
 cross_spectra/
+
+test_images/
+gaussian_validation_inputs/
+docs/
+create_test_images.py
+gaussian_cwt_validation.py
+patch_viewer.py
+Инструкция*.md

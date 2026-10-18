@@ -1,16 +1,22 @@
 """Stage-level validity model for incremental scientific calculations."""
 from __future__ import annotations
 
+from history.atomic_io import atomic_write_text
+
 import hashlib
 import json
 from pathlib import Path
 from typing import Dict
 
+from history.artifact_validation import feature_stage_available
 from history.pipeline_resume import cwt_signature, load_complete_cwt, point_bundle_available
 
 STATE_FILENAME = ".pipeline_state.json"
 STATE_SCHEMA_VERSION = 1
 STAGE_ORDER = ("wavelet", "extrema", "envelopes", "knn", "statistics")
+STAGE_DEPENDENCIES = {"wavelet": (), "extrema": ("wavelet",),
+                      "envelopes": ("extrema",), "knn": ("envelopes",),
+                      "statistics": ("envelopes",)}
 STAGE_LABELS = {
     "wavelet": "Вейвлеты",
     "extrema": "Экстремумы",
@@ -72,9 +78,11 @@ def load_stage_state(task) -> dict:
         return {"schema_version": STATE_SCHEMA_VERSION, "stages": {}}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
+    except (OSError, ValueError, TypeError):
         return {"schema_version": STATE_SCHEMA_VERSION, "stages": {}}
     if not isinstance(payload, dict):
+        return {"schema_version": STATE_SCHEMA_VERSION, "stages": {}}
+    if not isinstance(payload.get("stages", {}), dict):
         return {"schema_version": STATE_SCHEMA_VERSION, "stages": {}}
     payload.setdefault("stages", {})
     return payload
@@ -86,7 +94,7 @@ def save_stage_state(task, state: dict) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     state["schema_version"] = STATE_SCHEMA_VERSION
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
 
 
 def mark_stage_ready(task, stage: str) -> None:
@@ -102,7 +110,7 @@ def _legacy_ready(task, stage: str) -> bool:
     """Best-effort readiness for runs created before stage-state metadata."""
     if stage == "wavelet":
         try:
-            return load_complete_cwt(task) is not None
+            return load_complete_cwt(task, validate_only=True) is not None
         except Exception:
             return False
     if stage == "extrema":
@@ -115,6 +123,8 @@ def _legacy_ready(task, stage: str) -> bool:
             return point_bundle_available(task, envelope=True)
         except Exception:
             return False
+    if stage in {"knn", "statistics"}:
+        return feature_stage_available(task, stage)
     return False
 
 
@@ -128,8 +138,11 @@ def stage_statuses(task) -> Dict[str, str]:
     for stage in STAGE_ORDER:
         entry = stored.get(stage)
         if isinstance(entry, dict) and entry.get("signature"):
-            statuses[stage] = "ready" if entry.get("signature") == signatures[stage] else "stale"
-        elif _legacy_ready(task, stage):
+            if entry.get("signature") != signatures[stage]:
+                statuses[stage] = "stale"
+            else:
+                statuses[stage] = "ready" if entry.get("status") == "ready" and _legacy_ready(task, stage) else "missing"
+        elif stage not in {"knn", "statistics"} and _legacy_ready(task, stage):
             # Legacy artifacts are safe only when the task's remembered CWT
             # signature still matches the current scientific inputs.
             last_cwt = getattr(task, "last_completed_cwt_signature", None)
@@ -142,9 +155,9 @@ def stage_statuses(task) -> Dict[str, str]:
 
     # Dependency invalidation: a downstream stage cannot remain ready when an
     # upstream stage is stale/missing, even if its own old signature exists.
-    for upstream, downstream in zip(STAGE_ORDER, STAGE_ORDER[1:]):
-        if statuses[upstream] != "ready" and statuses[downstream] == "ready":
-            statuses[downstream] = "stale"
+    for stage, dependencies in STAGE_DEPENDENCIES.items():
+        if statuses[stage] == "ready" and any(statuses[parent] != "ready" for parent in dependencies):
+            statuses[stage] = "stale"
     return statuses
 
 

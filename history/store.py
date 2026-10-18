@@ -1,4 +1,4 @@
-"""Persistent experiment -> task -> run model (schema v2; test data reset)."""
+"""Current experiment -> task -> run schema. No legacy conversion or reset."""
 import json
 import os
 import sqlite3
@@ -43,13 +43,6 @@ class RunHistoryStore:
 
     def _initialize(self):
         with self._connect() as db:
-            version = db.execute('PRAGMA user_version').fetchone()[0]
-            if version < 2:
-                # The development-stage database is intentionally reset, not migrated.
-                db.execute('DROP TABLE IF EXISTS research_runs')
-                db.execute('DROP TABLE IF EXISTS runs')
-                db.execute('DROP TABLE IF EXISTS tasks')
-                db.execute('DROP TABLE IF EXISTS experiments')
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS experiments (
                     id TEXT PRIMARY KEY,
@@ -85,7 +78,6 @@ class RunHistoryStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_tasks_experiment ON tasks(experiment_id, task_number);
                 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, id);
-                PRAGMA user_version = 2;
             ''')
 
     def ensure_experiment(self, experiment_id, root_path, name=None):
