@@ -19,6 +19,8 @@ class MLMultiDropdown(ctk.CTkFrame):
     def __init__(self, master, *, options, value='*', subject='значения',
                  on_change=None, **kwargs):
         super().__init__(master, fg_color='transparent', **kwargs)
+        from utils.tk_lifecycle import install_callback_cleanup
+        install_callback_cleanup(self)
         self._choice_pairs = [(str(code), str(label)) for code, label in options]
         self._subject = subject
         self._on_change = on_change
@@ -199,6 +201,8 @@ class MLSingleDropdown(ctk.CTkFrame):
 
     def __init__(self, master, *, options, value, on_change=None, **kwargs):
         super().__init__(master, fg_color='transparent', **kwargs)
+        from utils.tk_lifecycle import install_callback_cleanup
+        install_callback_cleanup(self)
         self._choice_pairs = [(str(code), str(label)) for code, label in options]
         self._on_change = on_change
         self._selected_code = ''

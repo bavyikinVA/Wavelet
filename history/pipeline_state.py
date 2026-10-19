@@ -194,7 +194,9 @@ def format_stage_status(task) -> str:
 
 def format_execution_plan(task) -> str:
     plan = minimal_execution_plan(task)
+    ml = bool(task.resolve_pipeline().ml)
+    suffix = "; ML-план проверяется по операциям после KNN" if ml else ""
     if not plan:
-        return "Все выбранные этапы уже актуальны — пересчёт не требуется"
+        return "Выбранные вычислительные этапы актуальны — пересчёт не требуется" + suffix
     labels = [STAGE_LABELS[s] for s in plan]
-    return "Будет рассчитано: " + " → ".join(labels)
+    return "Будет рассчитано: " + " → ".join(labels) + suffix

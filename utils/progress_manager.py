@@ -417,13 +417,17 @@ class ProgressManager:
                 file.write(self._log_document())
             self.log_info(f"Журнал сохранён: {filename}")
 
-    def save_run_log(self, output_dir, header=None):
+    def save_run_log(self, output_dir, header=None, *, append=False):
         if not output_dir:
             return ""
         os.makedirs(output_dir, exist_ok=True)
         path = os.path.join(output_dir, "run_log.txt")
-        with open(path, "w", encoding="utf-8") as file:
-            file.write(self._log_document(header))
+        from history.atomic_io import atomic_write_text
+        document = self._log_document(header)
+        if append and os.path.isfile(path):
+            with open(path, encoding="utf-8") as file:
+                document = file.read().rstrip() + "\n\n" + document
+        atomic_write_text(path, document)
         return path
 
     def reset(self):

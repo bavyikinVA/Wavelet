@@ -137,6 +137,16 @@ class RunHistoryStore:
         FROM runs r JOIN tasks t ON r.task_id=t.id
         JOIN experiments e ON t.experiment_id=e.id'''
 
+    def find_ml_operation(self, task, operation_id, output_path):
+        """Find a committed operation without scanning a truncated history page."""
+        with self._connect() as db:
+            row = db.execute("""SELECT id FROM runs WHERE task_id=? AND run_type='ml'
+                AND status='completed' AND output_path=?
+                AND json_extract(settings_json, '$.ml_operation_id')=?
+                ORDER BY id DESC LIMIT 1""",
+                (task.persistent_id, output_path, operation_id)).fetchone()
+        return row['id'] if row else None
+
     def list_runs(self, limit=100):
         with self._connect() as db:
             rows = db.execute(self._RUN_SELECT + ' ORDER BY r.id DESC LIMIT ?', (int(limit),)).fetchall()

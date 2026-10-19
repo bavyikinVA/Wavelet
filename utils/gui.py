@@ -12,6 +12,8 @@ class TkinterApp(ctk.CTk):
 
     def __init__(self):
         super().__init__()
+        from utils.tk_lifecycle import install_callback_cleanup
+        install_callback_cleanup(self)
         self._is_destroyed = False
         self._pending_callbacks = {}  # Словарь активных after callbacks
         self._child_windows = []  # Список дочерних окон

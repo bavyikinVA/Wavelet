@@ -233,6 +233,7 @@ def _pipeline_manifest(task) -> dict:
         "knn": bool(plan.knn_requested),
         "statistics": bool(plan.statistics_requested),
         "synchronization": bool(plan.synchronization_requested),
+        "ml": bool(plan.ml_requested),
     }
     resolved = {
         "wavelet": True,
@@ -241,6 +242,7 @@ def _pipeline_manifest(task) -> dict:
         "knn": bool(plan.knn),
         "statistics": bool(plan.statistics),
         "synchronization": bool(plan.synchronization),
+        "ml": bool(plan.ml),
     }
     return {
         "preset": str(getattr(task, "pipeline_preset", "Пользовательский")),
@@ -399,12 +401,8 @@ def _execution_summary(protocol) -> dict:
 
 
 def _write_json_atomic(path: Path, document: dict) -> None:
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(
-        json.dumps(_json_value(document), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temp_path.replace(path)
+    from history.atomic_io import atomic_write_text
+    atomic_write_text(path, json.dumps(_json_value(document), ensure_ascii=False, indent=2))
 
 
 def write_channel_manifest(task, task_folder: str | Path) -> Path:
@@ -442,6 +440,8 @@ def write_channel_manifest(task, task_folder: str | Path) -> Path:
     document["pipeline"] = _pipeline_manifest(task)
     document["parameters"] = _scientific_parameters_manifest(task)
     document["exports"] = _exports_manifest(task)
+    document["ml"] = {"plan": _json_value(getattr(task, "ml_plan", [])),
+                      "dependency": "knn", "operation_journal": ".ml_operations.json"}
 
     protocol = getattr(task, "execution_protocol", None)
     if protocol is not None:

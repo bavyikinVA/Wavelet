@@ -63,6 +63,8 @@ def expand_ml_plan(plan, datasets, max_operations=5000):
     operations = []
     for index, raw in enumerate(plan):
         cfg = deepcopy(raw)
+        cfg.pop('rerun_selected', None)
+        cfg.pop('_execution_mode', None)
         algorithm = str(cfg.get('algorithm', 'kmeans')).lower()
         if algorithm not in {'kmeans', 'dbscan'}:
             raise ValueError(f'ML-карточка {index+1}: неизвестный алгоритм {algorithm}')

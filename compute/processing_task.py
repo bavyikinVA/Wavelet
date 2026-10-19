@@ -441,7 +441,7 @@ class ProcessingTask:
         synchronization = bool(
             self.calculate_synchronization and self.process_rows
         )
-        ml_requested = False
+        ml_requested = bool(self.ml_plan)
         envelopes = bool(point_pipeline_available and (
             self.calculate_envelopes or knn or statistics or synchronization
         ))
@@ -461,7 +461,7 @@ class ProcessingTask:
             knn=knn,
             statistics=statistics,
             synchronization=synchronization,
-            ml=False,
+            ml=bool(ml_requested and knn),
             maxima_required=bool(
                 statistics
                 or synchronization

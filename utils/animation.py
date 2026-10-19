@@ -3,6 +3,8 @@ import time
 
 
 def animate_visibility(widget, visible, show, hide, axis='height', duration_ms=180):
+    from utils.tk_lifecycle import install_callback_cleanup
+    install_callback_cleanup(widget)
     state = getattr(widget, '_disclosure', None)
     scale = widget._get_widget_scaling()
     if state is None:

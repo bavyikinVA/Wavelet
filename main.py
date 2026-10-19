@@ -6,7 +6,6 @@ from uuid import uuid4
 from pathlib import Path
 from dataclasses import replace
 
-
 warnings.filterwarnings(
     "ignore",
     message=r"cupyx\.jit\.rawkernel is experimental.*",
@@ -50,10 +49,10 @@ def setup_cuda_environment():
     print("CUDA путь не найден")
     return None
 
+
 # настройки для подавления предупреждений
 os.environ['CUPY_CUDA_DISABLE_CUBIN_CACHE'] = '1'
 os.environ['CUPY_CACHE_DIR'] = os.path.join(os.path.expanduser('~'), '.cupy', 'cache')
-
 
 import threading
 import time
@@ -64,6 +63,7 @@ from multiprocessing import Pool, freeze_support
 from tkinter import messagebox as mb
 
 import customtkinter as ctk
+
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 import numpy as np
@@ -129,6 +129,7 @@ def process_row_static(args_):
     from compute.wavelets.cpu_wavelet import morlet_wavelet_with_padding
     row_data, scales_ = args_
     return morlet_wavelet_with_padding(row_data, scales_)
+
 
 def process_column_static(args_):
     col_idx, column_data, scales_ = args_
@@ -598,7 +599,6 @@ class ImageProcessor:
         self.progress.log_info(f"Вейвлет-преобразование завершено за {elapsed_time:.2f} секунд")
 
         return data_3_channel
-
 
     def compute_wavelets(self, task, info_out):
         self.progress.update_progress(0.1, "Подготовка данных для вейвлет-преобразования...")
@@ -1141,7 +1141,7 @@ class ImageProcessor:
                     current_operation += 1
                     scale_value = task.scales[scale_index]
                     progress = 0.1 + (
-                        current_operation / max(total_operations, 1)
+                            current_operation / max(total_operations, 1)
                     ) * 0.8
                     self.progress.update_progress(
                         progress,
@@ -1165,7 +1165,7 @@ class ImageProcessor:
                         "prominence": extrema_prominence,
                     }
                     filtered_extrema = (
-                        extrema_distance > 1 or extrema_prominence > 0.0
+                            extrema_distance > 1 or extrema_prominence > 0.0
                     )
                     extrema_stage = (
                         f"extrema:{cwt_axis}:{channel_code}:{float(scale_value):g}"
@@ -1344,8 +1344,8 @@ class ImageProcessor:
                                         channel_code, scale_value, "lower"
                                     )
                                 envelope_cache_complete = (
-                                    (not max_var or cached_upper is not None)
-                                    and (not min_var or cached_lower is not None)
+                                        (not max_var or cached_upper is not None)
+                                        and (not min_var or cached_lower is not None)
                                 )
 
                             total_envelope_input_points += len(raw_max) + len(raw_min)
@@ -1378,8 +1378,8 @@ class ImageProcessor:
                         if plan.envelopes:
                             total_envelope_points += len(upper_points) + len(lower_points)
                         if (
-                            plan.envelopes and max_var and resume_cache_folder
-                            and not envelope_cache_complete
+                                plan.envelopes and max_var and resume_cache_folder
+                                and not envelope_cache_complete
                         ):
                             _write_point_cache(
                                 "cache_write_envelopes",
@@ -1387,8 +1387,8 @@ class ImageProcessor:
                                 channel_code, scale_value, "upper", upper_points
                             )
                         if (
-                            plan.envelopes and min_var and resume_cache_folder
-                            and not envelope_cache_complete
+                                plan.envelopes and min_var and resume_cache_folder
+                                and not envelope_cache_complete
                         ):
                             _write_point_cache(
                                 "cache_write_envelopes",
@@ -1406,7 +1406,7 @@ class ImageProcessor:
                             )
 
                         if plan.synchronization and (
-                            cwt_axis == "row" and feature_axis == "row"
+                                cwt_axis == "row" and feature_axis == "row"
                         ):
                             row_upper_points_by_scale[scale_value] = upper_points
 
@@ -1415,7 +1415,7 @@ class ImageProcessor:
                             if stats["slice_index"] is None:
                                 dimension = 0 if feature_axis == "row" else 1
                                 stats["slice_index"] = (
-                                    coefs_2d.shape[dimension] // 2
+                                        coefs_2d.shape[dimension] // 2
                                 )
                             selected_upper = (
                                 upper_points if plan.envelopes else raw_max
@@ -1564,16 +1564,16 @@ class ImageProcessor:
                 # Synchronization retains its existing, explicitly row-based
                 # scientific meaning. It is not silently applied to columns.
                 if (
-                    plan.synchronization
-                    and cwt_axis == "row"
-                    and row_upper_points_by_scale
+                        plan.synchronization
+                        and cwt_axis == "row"
+                        and row_upper_points_by_scale
                 ):
                     self._save_row_synchronization(
                         task=task,
                         channel_name=channel_name,
                         channel_code=channel_code,
                         scales=statistics_by_axis["row"]["scales"]
-                        or list(row_upper_points_by_scale),
+                               or list(row_upper_points_by_scale),
                         upper_points_by_scale=row_upper_points_by_scale,
                         scale_block_sizes=scale_block_sizes,
                         row_sync_stride=row_sync_stride,
@@ -1584,9 +1584,9 @@ class ImageProcessor:
         point_pipeline_seconds = _profile_time.perf_counter() - point_pipeline_started
         point_pipeline_rss_end = current_rss_bytes()
         scientific_stage_seconds = (
-            extrema_profile.compute_seconds
-            + envelope_profile.compute_seconds
-            + (knn_total_profile.compute_seconds if plan.knn else 0.0)
+                extrema_profile.compute_seconds
+                + envelope_profile.compute_seconds
+                + (knn_total_profile.compute_seconds if plan.knn else 0.0)
         )
         point_overhead_seconds = sum(
             profile.compute_seconds for profile in point_profiles.values()
@@ -2356,7 +2356,6 @@ class ImageProcessor:
                 pass
             return None, csv_path
 
-
     @staticmethod
     def build_binary_row_from_points(points, row_index, width, tolerance=0):
         """
@@ -2599,7 +2598,8 @@ class ImageProcessor:
                 if len(block_scales) == 0:
                     continue
 
-                block_label = f"{block_scales[0]}-{block_scales[-1]}" if block_scales[0] != block_scales[-1] else str(block_scales[0])
+                block_label = f"{block_scales[0]}-{block_scales[-1]}" if block_scales[0] != block_scales[-1] else str(
+                    block_scales[0])
 
                 # Для каждой строки строим бинарный ряд по X, объединяя масштабы блока через OR.
                 row_binary_events = {}
@@ -3203,9 +3203,11 @@ class App(TkinterApp):
         self.layout_controls.pack(fill='x', padx=8, pady=2)
         self.tasks_toggle = IconButton(self.layout_controls, 'sidebar', 'Панель задач', self._toggle_tasks_panel)
         self.tasks_toggle.pack(side='left', padx=3)
-        self.progress_toggle = IconButton(self.layout_controls, 'bottom', 'Панель выполнения', self._toggle_progress_panel)
+        self.progress_toggle = IconButton(self.layout_controls, 'bottom', 'Панель выполнения',
+                                          self._toggle_progress_panel)
         self.progress_toggle.pack(side='left', padx=3)
-        IconButton(self.layout_controls, 'focus', 'Фокус на рабочей области', self._toggle_focus_layout).pack(side='left', padx=3)
+        IconButton(self.layout_controls, 'focus', 'Фокус на рабочей области', self._toggle_focus_layout).pack(
+            side='left', padx=3)
 
         # Глобальная навигация находится отдельно от этапов текущего исследования.
         nav_button_style = dict(
@@ -3256,7 +3258,7 @@ class App(TkinterApp):
         self.tasks_panel.configure(width=AppTheme.SIDEBAR_WIDTH)
         self.tasks_panel.pack_propagate(False)
         self.sidebar_grip = ctk.CTkFrame(self.tasks_panel, width=6, corner_radius=0,
-                                        fg_color=AppTheme.BORDER, cursor='sb_h_double_arrow')
+                                         fg_color=AppTheme.BORDER, cursor='sb_h_double_arrow')
         self.sidebar_grip.place(relx=1, rely=0, relheight=1, anchor='ne')
         self.sidebar_grip.bind('<B1-Motion>', self._resize_tasks_panel)
         self.workspace_frame = ctk.CTkFrame(
@@ -3732,6 +3734,7 @@ class App(TkinterApp):
                     self.use_gpu_var.set(enabled)
                     self.compute_device_var.set("gpu" if enabled else "cpu")
                     self._update_gpu_section()
+
                 self.after(0, finish)
 
         threading.Thread(target=worker, daemon=True, name="device-detection").start()
@@ -3751,7 +3754,6 @@ class App(TkinterApp):
 
         # Даём Tk/CustomTkinter завершить перерасчёт размеров интерфейса.
         self.after_safe(200, self._final_adjustment)
-
 
     def _final_adjustment(self):
         """Финальная корректировка размеров"""
@@ -4212,9 +4214,10 @@ class App(TkinterApp):
                 continue
             task_rows = self.run_history.list_tasks(experiment['id'])
             search_blob = ' '.join([experiment['name'], experiment['root_path'], experiment['id']]
-                + [row['name'] for row in task_rows]
-                + [str(value) for r in experiment_runs for value in (
-                    r.get('task_name',''), r.get('ml_algorithm',''), r.get('researcher_note',''), r.get('image_path',''))]).casefold()
+                                   + [row['name'] for row in task_rows]
+                                   + [str(value) for r in experiment_runs for value in (
+                r.get('task_name', ''), r.get('ml_algorithm', ''), r.get('researcher_note', ''),
+                r.get('image_path', ''))]).casefold()
             if query and query not in search_blob:
                 continue
             filtered.append((experiment, task_rows, experiment_runs))
@@ -4236,7 +4239,8 @@ class App(TkinterApp):
         if hasattr(self, 'history_prev_button'):
             self.history_prev_button.configure(state="normal" if self.history_page > 1 else "disabled")
         if hasattr(self, 'history_next_button'):
-            self.history_next_button.configure(state="normal" if self.history_page < self.history_total_pages else "disabled")
+            self.history_next_button.configure(
+                state="normal" if self.history_page < self.history_total_pages else "disabled")
         parent = self.history_scrollable.scrollable_frame
         if not selected:
             label = ctk.CTkLabel(parent, text="Исследования не найдены",
@@ -4250,10 +4254,10 @@ class App(TkinterApp):
             self.history_cards.append(card)
             ctk.CTkLabel(card, text=experiment['name'], font=AppTheme.section_title_font(),
                          anchor='w').pack(fill='x', padx=12, pady=(9, 2))
-            ctk.CTkLabel(card, text=(f"Создано: {experiment['created_at'].replace('T',' ')} · "
-                f"Задач: {len(tasks)} · Запусков: {len(task_runs)} · ML: {experiment['ml_count']}"),
-                text_color=AppTheme.TEXT_SECONDARY, anchor='w',
-                font=AppTheme.caption_font()).pack(fill='x', padx=12, pady=(0, 4))
+            ctk.CTkLabel(card, text=(f"Создано: {experiment['created_at'].replace('T', ' ')} · "
+                                     f"Задач: {len(tasks)} · Запусков: {len(task_runs)} · ML: {experiment['ml_count']}"),
+                         text_color=AppTheme.TEXT_SECONDARY, anchor='w',
+                         font=AppTheme.caption_font()).pack(fill='x', padx=12, pady=(0, 4))
             for row in tasks:
                 nested = [r for r in task_runs if r['task_id'] == row['id']]
                 ml = sum(r['run_type'] == 'ml' for r in nested)
@@ -4261,25 +4265,25 @@ class App(TkinterApp):
                 if nested:
                     info += ' · Последний: ' + nested[0]['status']
                 ctk.CTkLabel(card, text=info, anchor='w',
-                    font=AppTheme.caption_font()).pack(fill='x', padx=22, pady=1)
+                             font=AppTheme.caption_font()).pack(fill='x', padx=22, pady=1)
                 for run in nested:
                     label = ("ML " + run['ml_algorithm'].upper()) if run['run_type'] == 'ml' else 'CWT / конвейер'
                     ctk.CTkLabel(card,
-                        text=f"    {run['created_at'].replace('T',' ')} · {label} · {run['status']}",
-                        text_color=AppTheme.TEXT_SECONDARY,
-                        font=AppTheme.caption_font(), anchor='w').pack(fill='x', padx=32, pady=0)
+                                 text=f"    {run['created_at'].replace('T', ' ')} · {label} · {run['status']}",
+                                 text_color=AppTheme.TEXT_SECONDARY,
+                                 font=AppTheme.caption_font(), anchor='w').pack(fill='x', padx=32, pady=0)
             buttons = ctk.CTkFrame(card, fg_color='transparent')
             buttons.pack(fill='x', padx=12, pady=(7, 10))
             eid = experiment['id']
             root = experiment['root_path']
             ctk.CTkButton(buttons, text="Продолжить исследование", width=190,
-                command=lambda value=eid: self._restore_experiment(value)).pack(side='left', padx=(0, 8))
+                          command=lambda value=eid: self._restore_experiment(value)).pack(side='left', padx=(0, 8))
             view_button = ctk.CTkButton(buttons, text="Результаты", width=110,
-                command=lambda value=root: self._show_saved_results(value))
+                                        command=lambda value=root: self._show_saved_results(value))
             view_button._read_only_during_compute = True
             view_button.pack(side='left', padx=(0, 8))
             folder_button = ctk.CTkButton(buttons, text="Открыть папку", width=130,
-                command=lambda value=root: self._open_result_path(value))
+                                          command=lambda value=root: self._open_result_path(value))
             folder_button._read_only_during_compute = True
             folder_button.pack(side='left')
 
@@ -4532,7 +4536,7 @@ class App(TkinterApp):
         queue_frame.pack(fill="x", padx=10, pady=(5, 10))
         ctk.CTkLabel(queue_frame, text="План кластеризации",
                      font=AppTheme.section_title_font(), anchor="w").pack(
-                         fill="x", padx=12, pady=(12, 5))
+            fill="x", padx=12, pady=(12, 5))
         active_frame = ctk.CTkFrame(queue_frame, fg_color="#173A54", corner_radius=7)
         active_frame.pack(anchor="w", padx=12, pady=(0, 9))
         self.ml_queue_task_label = ctk.CTkLabel(
@@ -4561,10 +4565,11 @@ class App(TkinterApp):
         run_actions = ctk.CTkFrame(queue_frame, fg_color="transparent")
         run_actions.pack(fill="x", padx=12, pady=(3, 12))
         self.ml_queue_run_button = ctk.CTkButton(
-            run_actions, text="Выполнить ML-план", width=215,
+            run_actions, text="Выполнить план", width=215,
             height=AppTheme.BUTTON_HEIGHT, state="disabled",
             command=self._start_ml_queue_only)
         self.ml_queue_run_button.pack(side="left")
+        HelpIcon(run_actions, "ml.execute_plan").pack(side="left", padx=(10, 0))
         self.ml_queue_run_hint = ctk.CTkLabel(
             run_actions, text="Доступно после расчёта KNN", anchor="w",
             text_color=AppTheme.TEXT_SECONDARY, font=AppTheme.caption_font())
@@ -4645,8 +4650,8 @@ class App(TkinterApp):
                 self._ml_dbscan_parameter_entries,
             )
             self._ml_parameter_entries = (
-                self._ml_kmeans_parameter_entries
-                + self._ml_dbscan_parameter_entries
+                    self._ml_kmeans_parameter_entries
+                    + self._ml_dbscan_parameter_entries
             )
             self._ml_parameter_widgets_built = True
 
@@ -4684,7 +4689,7 @@ class App(TkinterApp):
         self.ml_queue_run_button.configure(
             state="normal" if ready and has_plan and not busy else "disabled",
             text="ML выполняется…" if getattr(self, "_ml_ui_locked", False)
-                 else "Выполнить ML-план")
+            else "Выполнить план")
         if not ready:
             hint = "Доступно после расчёта KNN"
         elif not has_plan:
@@ -4953,22 +4958,23 @@ class App(TkinterApp):
         )
         self.ml_result_label.configure(
             text=(
-                f"Алгоритм: {result['algorithm_name']}; точек: {result.get('point_count', len(result.get('records', []))):,}\n"
-                f"Набор: {result.get('dataset', {}).get('channel', '—')} · a={result.get('dataset', {}).get('scale', '—')} · "
-                f"{result.get('dataset', {}).get('point_type_name', '—')} · {result.get('dataset', {}).get('direction', '—')}\n"
-                + ((f"Локальный сеточный DBSCAN: тайлов {result.get('dbscan_statistics', {}).get('tiles', '—')}\n")
-                   if result.get("tiled") else
-                   (f"Кластеров: {metrics['cluster_count']}; шумовых точек: {metrics['noise_count']}\n"))
-                + f"Результат: {counts}\n"
-                + (("DBSCAN: локальные ID тайлов не являются глобальными кластерами; "
-                    "основной показатель — устойчивость аномалии A∈[0,1].\n") if result.get("tiled") else
-                   (f"Silhouette: {self._format_metric(metrics['silhouette'])}{sample_text}; "
-                    f"Davies–Bouldin: {self._format_metric(metrics['davies_bouldin'])}; "
-                    f"Calinski–Harabasz: {self._format_metric(metrics['calinski_harabasz'])}\n"))
-                + (f"Время: {timing_text}\n" if timing_text else "")
-                + (("DBSCAN: анализируйте отдельные ML-слои по масштабу, каналу, типу точек и направлению во вкладке «Результаты»."
-                    ) if result.get("tiled") else
-                   "Silhouette: ближе к 1 — лучше; Davies–Bouldin: меньше — лучше; Calinski–Harabasz: больше — лучше.")
+                    f"Алгоритм: {result['algorithm_name']}; точек: {result.get('point_count', len(result.get('records', []))):,}\n"
+                    f"Набор: {result.get('dataset', {}).get('channel', '—')} · a={result.get('dataset', {}).get('scale', '—')} · "
+                    f"{result.get('dataset', {}).get('point_type_name', '—')} · {result.get('dataset', {}).get('direction', '—')}\n"
+                    + ((f"Локальный сеточный DBSCAN: тайлов {result.get('dbscan_statistics', {}).get('tiles', '—')}\n")
+                       if result.get("tiled") else
+                       (f"Кластеров: {metrics['cluster_count']}; шумовых точек: {metrics['noise_count']}\n"))
+                    + f"Результат: {counts}\n"
+                    + (("DBSCAN: локальные ID тайлов не являются глобальными кластерами; "
+                        "основной показатель — устойчивость аномалии A∈[0,1].\n") if result.get("tiled") else
+                       (f"Silhouette: {self._format_metric(metrics['silhouette'])}{sample_text}; "
+                        f"Davies–Bouldin: {self._format_metric(metrics['davies_bouldin'])}; "
+                        f"Calinski–Harabasz: {self._format_metric(metrics['calinski_harabasz'])}\n"))
+                    + (f"Время: {timing_text}\n" if timing_text else "")
+                    + ((
+                           "DBSCAN: анализируйте отдельные ML-слои по масштабу, каналу, типу точек и направлению во вкладке «Результаты»."
+                           ) if result.get("tiled") else
+                       "Silhouette: ближе к 1 — лучше; Davies–Bouldin: меньше — лучше; Calinski–Harabasz: больше — лучше.")
             ),
             text_color=AppTheme.TEXT_ON_DARK,
         )
@@ -5035,10 +5041,10 @@ class App(TkinterApp):
             data_ready
             and len(task.scales) > 0
             and (
-                (task.analysis_mode == "1d" and (
-                    task.process_rows or task.process_columns
-                ))
-                or (task.analysis_mode == "2d" and task.orientations)
+                    (task.analysis_mode == "1d" and (
+                            task.process_rows or task.process_columns
+                    ))
+                    or (task.analysis_mode == "2d" and task.orientations)
             )
         )
         if getattr(self, "data_next_button", None) is not None:
@@ -5050,7 +5056,6 @@ class App(TkinterApp):
                 state="normal" if analysis_ready else "disabled"
             )
 
-    
     @staticmethod
     def _help_label(parent, text, key, *, font=None, padx=0, pady=0):
         """Label with inline info icon placed without breaking layout."""
@@ -5158,7 +5163,6 @@ class App(TkinterApp):
         #     justify="left",
         #     wraplength=420
         # ).pack(fill="x", pady=(8, 0), padx=(5, 0))
-
 
     def _setup_analysis_mode_section(self, parent, manage_geometry=True):
         """Создать отдельный блок выбора режима анализа."""
@@ -5272,9 +5276,9 @@ class App(TkinterApp):
             self.two_d_section.grid_remove()
             self.extremes_section.grid()
             for section in (
-                self.pipeline_section,
-                self.stage_settings_section,
-                self.export_section,
+                    self.pipeline_section,
+                    self.stage_settings_section,
+                    self.export_section,
             ):
                 if not section.winfo_manager():
                     section.pack(fill="x", padx=5, pady=4, before=self.intermediate_section)
@@ -5287,8 +5291,8 @@ class App(TkinterApp):
             self.extremes_section.grid_remove()
             self.two_d_section.grid()
             for section in (
-                self.pipeline_section,
-                self.stage_settings_section,
+                    self.pipeline_section,
+                    self.stage_settings_section,
             ):
                 section.pack_forget()
             # Экспорт оставляем: для 2D доступны вейвлетные результаты.
@@ -5433,7 +5437,6 @@ class App(TkinterApp):
             anchor="w", justify="left"
         ).pack(fill="x", padx=(28, 0), pady=(2, 0))
 
-
     @staticmethod
     def _get_cpu_display_info():
         """Короткое человекочитаемое описание CPU без обязательных зависимостей."""
@@ -5442,8 +5445,8 @@ class App(TkinterApp):
             try:
                 import winreg
                 with winreg.OpenKey(
-                    winreg.HKEY_LOCAL_MACHINE,
-                    r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
+                        winreg.HKEY_LOCAL_MACHINE,
+                        r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
                 ) as key:
                     name = str(winreg.QueryValueEx(key, "ProcessorNameString")[0]).strip()
             except Exception:
@@ -5474,7 +5477,6 @@ class App(TkinterApp):
         self._update_compute_settings_display()
         self._update_gpu_section()
 
-
     def toggle_gpu_backend(self):
         """Обратная совместимость со старым переключателем GPU."""
         self.compute_device_var.set("gpu" if self.use_gpu_var.get() else "cpu")
@@ -5486,9 +5488,9 @@ class App(TkinterApp):
             return
 
         knn_gpu_available = (
-            self.image_processor.backend.use_gpu and
-            self.image_processor._knn_processor is not None and
-            self.image_processor._knn_processor.is_gpu_available()
+                self.image_processor.backend.use_gpu and
+                self.image_processor._knn_processor is not None and
+                self.image_processor._knn_processor.is_gpu_available()
         )
 
         # Обновляем информацию о KNN
@@ -6098,7 +6100,8 @@ class App(TkinterApp):
                 if task.task_folder_path and os.path.isdir(task.task_folder_path):
                     try:
                         restore_feature_checkpoint(task, task.task_folder_path)
-                        recovery_messages.extend(f"Задача {task.task_name}: {message}" for message in task.recovery_warnings)
+                        recovery_messages.extend(
+                            f"Задача {task.task_name}: {message}" for message in task.recovery_warnings)
                     except Exception as error:
                         self.progress_manager.log_error(
                             f"Не удалось восстановить KNN задачи {task.task_id}: {error}"
@@ -6111,9 +6114,9 @@ class App(TkinterApp):
                 self.progress_manager.log_error(message)
             if recovery_messages:
                 mb.showwarning("Исследование открыто с замечаниями",
-                    "\n\n".join(recovery_messages[:10]) +
-                    ("\n\nОстальные сообщения — в журнале." if len(recovery_messages) > 10 else "") +
-                    "\n\nАвтоматический пересчёт не запускался.")
+                               "\n\n".join(recovery_messages[:10]) +
+                               ("\n\nОстальные сообщения — в журнале." if len(recovery_messages) > 10 else "") +
+                               "\n\nАвтоматический пересчёт не запускался.")
             if not processor.tasks:
                 self.current_task = None
                 self._show_workspace()
@@ -6364,8 +6367,8 @@ class App(TkinterApp):
         if self.current_task and self.current_task.task_id == task.task_id:
             task_frame.configure(border_color=AppTheme.ACTIVE_BORDER, border_width=2)
         self._task_cards[id(task)] = dict(frame=task_frame, title=task_title, mode=mode_badge,
-                                         status=task_status, image=image_label, scales=scales_label,
-                                         lines=line_label)
+                                          status=task_status, image=image_label, scales=scales_label,
+                                          lines=line_label)
 
     @staticmethod
     def _get_task_status(task):
@@ -6546,10 +6549,10 @@ class App(TkinterApp):
             self.morlet_omega0_var.set(f"{self.current_task.morlet_omega0:g}")
             self.morlet_anisotropy_var.set(f"{self.current_task.morlet_anisotropy:g}")
             self.channel_representation_var.set({
-                "rgb": "RGB",
-                "grayscale": "Grayscale",
-                "gram_schmidt": "Gram–Schmidt",
-            }.get(self.current_task.channel_representation, "RGB"))
+                                                    "rgb": "RGB",
+                                                    "grayscale": "Grayscale",
+                                                    "gram_schmidt": "Gram–Schmidt",
+                                                }.get(self.current_task.channel_representation, "RGB"))
             self.rgb_channel_mode_var.set(
                 "Один канал"
                 if self.current_task.rgb_channel_mode == "single"
@@ -6910,7 +6913,8 @@ class App(TkinterApp):
         if not self.calculate_knn_var.get():
             self.calculate_knn_var.set(True)
             self._on_pipeline_controls_changed()
-            self._set_workflow_status('KNN включён: будут рассчитаны необходимые предыдущие этапы', AppTheme.TEXT_ON_DARK)
+            self._set_workflow_status('KNN включён: будут рассчитаны необходимые предыдущие этапы',
+                                      AppTheme.TEXT_ON_DARK)
 
     def update_knn_for_current_task(self, *args):
         """Обновление KNN для текущей задачи при изменении поля"""
@@ -7124,7 +7128,6 @@ class App(TkinterApp):
         self.pipeline_stage_status_label = None  # Вместо общей строки — отдельные метки.
         self.pipeline_execution_plan_label = None
 
-
         # Синхронизация пока остаётся частью вычислительной модели, но не входит
         # в набор пользовательских сценариев этой страницы.
         self.calculate_sync_switch = None
@@ -7202,7 +7205,7 @@ class App(TkinterApp):
                 added.append("огибающие")
             if added:
                 status_message = (
-                    "Для KNN автоматически включены: " + ", ".join(added) + "."
+                        "Для KNN автоматически включены: " + ", ".join(added) + "."
                 )
 
         elif changed_stage == "statistics" and statistics:
@@ -7215,9 +7218,9 @@ class App(TkinterApp):
                 added.append("огибающие")
             if added:
                 status_message = (
-                    "Для статистик автоматически включены: "
-                    + ", ".join(added)
-                    + "."
+                        "Для статистик автоматически включены: "
+                        + ", ".join(added)
+                        + "."
                 )
 
         # -------------------------------------------------------------
@@ -7238,9 +7241,9 @@ class App(TkinterApp):
                 disabled.append("статистики")
             if disabled:
                 status_message = (
-                    "Экстремумы отключены → также отключены: "
-                    + ", ".join(disabled)
-                    + "."
+                        "Экстремумы отключены → также отключены: "
+                        + ", ".join(disabled)
+                        + "."
                 )
 
         elif changed_stage == "envelopes" and not envelopes:
@@ -7253,9 +7256,9 @@ class App(TkinterApp):
                 disabled.append("статистики")
             if disabled:
                 status_message = (
-                    "Огибающие отключены → также отключены: "
-                    + ", ".join(disabled)
-                    + "."
+                        "Огибающие отключены → также отключены: "
+                        + ", ".join(disabled)
+                        + "."
                 )
 
         # Финальная страховка: комбинация всегда должна удовлетворять DAG.
@@ -7417,7 +7420,6 @@ class App(TkinterApp):
         )
         self.min_checkbox.pack(side="left")
 
-        
         # Настройки фильтрации экстремумов
         extrema_filter_row = ctk.CTkFrame(
             self.extrema_settings_card,
@@ -7476,7 +7478,6 @@ class App(TkinterApp):
             width=110
         )
         self.extrema_prominence_entry.pack(side="left", padx=(29, 0))
-
 
         # -------------------------------------------------------------
         # KNN и углы
@@ -7586,10 +7587,10 @@ class App(TkinterApp):
             # Огибающие могут быть выбраны без отдельной карточки параметров.
             has_stages = bool(
                 is_1d and task is not None and (
-                    task.calculate_extrema
-                    or task.calculate_envelopes
-                    or task.calculate_knn
-                    or task.calculate_statistics
+                        task.calculate_extrema
+                        or task.calculate_envelopes
+                        or task.calculate_knn
+                        or task.calculate_statistics
                 )
             )
             section = self.stage_settings_section
@@ -7617,8 +7618,8 @@ class App(TkinterApp):
             row = index // 2
             column = index % 2
             is_last_single = (
-                index == len(visible_cards) - 1
-                and len(visible_cards) % 2 == 1
+                    index == len(visible_cards) - 1
+                    and len(visible_cards) % 2 == 1
             )
             if is_last_single:
                 card.grid(
@@ -7749,7 +7750,6 @@ class App(TkinterApp):
         )
         self.wavelet_section.add_widget(self.wavelet_numpy_checkbox, fill="x")
 
-
     def _setup_output_extremes_section(self):
         """Настройка секции вывода точек экстремумов"""
         info_label = ctk.CTkLabel(
@@ -7813,7 +7813,8 @@ class App(TkinterApp):
             font=AppTheme.section_title_font(), anchor="w"
         ).pack(fill="x", padx=5, pady=(0, 6))
 
-        self._help_label(self.statistics_section.content, "Размеры блоков масштабов (через запятую)", "statistics.blocks",
+        self._help_label(self.statistics_section.content, "Размеры блоков масштабов (через запятую)",
+                         "statistics.blocks",
                          font=AppTheme.caption_font(), pady=(2, 2))
         self.scale_block_sizes_entry = ctk.CTkEntry(
             self.statistics_section.content, textvariable=self.scale_block_sizes_var,
@@ -8158,9 +8159,9 @@ class App(TkinterApp):
                 # GPU может быть принципиально недоступен. После расчёта
                 # не делаем его активным только ради общего unlock.
                 if (
-                    not disable
-                    and widget is getattr(self, "gpu_radio", None)
-                    and hasattr(self, "image_processor")
+                        not disable
+                        and widget is getattr(self, "gpu_radio", None)
+                        and hasattr(self, "image_processor")
                 ):
                     info = self.image_processor.get_backend_info()
                     gpu_enabled = bool(
@@ -8298,6 +8299,8 @@ class App(TkinterApp):
             if index >= len(task.ml_plan):
                 continue
             cfg = task.ml_plan[index]
+            cfg.pop('rerun_selected', None)
+            cfg.pop('_execution_mode', None)
             for key, control in variables.items():
                 cfg[key] = control() if callable(control) else control.get()
         self._persist_experiment_task(task)
@@ -8325,8 +8328,8 @@ class App(TkinterApp):
                 # After reflow, a new task should start at the top of its plan,
                 # not at the scroll position of the previous task's long cards.
                 self.after_idle(lambda selected=task, view=scrollable:
-                    view.canvas.yview_moveto(0) if getattr(self, 'current_task', None) is selected
-                    and view.winfo_exists() else None)
+                                view.canvas.yview_moveto(0) if getattr(self, 'current_task', None) is selected
+                                                               and view.winfo_exists() else None)
         self._ml_rendering_cards = True
         self._ml_cards_task = task
         self._ml_cards_signature = signature
@@ -8355,7 +8358,7 @@ class App(TkinterApp):
             ctk.CTkLabel(heading, text=f'{index + 1}. {algorithm_name}',
                          font=AppTheme.section_title_font()).pack(side='left')
             HelpIcon(heading, 'ml.kmeans' if algorithm == 'kmeans'
-                     else 'ml.dbscan').pack(side='left', padx=(7, 0))
+            else 'ml.dbscan').pack(side='left', padx=(7, 0))
             ctk.CTkButton(heading, text='Удалить', width=84, fg_color='transparent',
                           border_width=1, command=lambda i=index: self._remove_ml_queue_card(i)
                           ).pack(side='right', padx=(7, 0))
@@ -8366,7 +8369,7 @@ class App(TkinterApp):
 
             ctk.CTkLabel(card, text='Настройки источника данных',
                          font=AppTheme.section_title_font(), anchor='w').pack(
-                             fill='x', padx=12, pady=(8, 3))
+                fill='x', padx=12, pady=(8, 3))
             source = ctk.CTkFrame(card, fg_color='transparent')
             source.pack(anchor='w', padx=12, pady=(0, 5))
             source.grid_columnconfigure(1, weight=0, minsize=450)
@@ -8386,8 +8389,8 @@ class App(TkinterApp):
                         side='left', padx=(7, 0))
 
             for key, label, description in (
-                ('channels', 'Каналы', 'каналы'),
-                ('scales', 'Масштабы', 'масштабы'),
+                    ('channels', 'Каналы', 'каналы'),
+                    ('scales', 'Масштабы', 'масштабы'),
             ):
                 add_label(source, row, label, f'ml.{key}')
                 selector = MLMultiDropdown(source, options=choices[key],
@@ -8408,8 +8411,8 @@ class App(TkinterApp):
 
             add_label(source, row, 'Типы точек', 'ml.point_types')
             type_selector = MLMultiDropdown(source, options=choices['point_types'],
-                value=cfg.get('point_types', '*'), subject='типы точек',
-                on_change=lambda _value: self._save_ml_queue_cards())
+                                            value=cfg.get('point_types', '*'), subject='типы точек',
+                                            on_change=lambda _value: self._save_ml_queue_cards())
             type_selector.grid(row=row, column=1, sticky='ew', pady=2)
             variables['point_types'] = type_selector
             row += 1
@@ -8430,10 +8433,11 @@ class App(TkinterApp):
 
             ctk.CTkLabel(card, text=f'Параметры {algorithm_name}',
                          anchor='w', font=AppTheme.section_title_font()).pack(
-                             fill='x', padx=12, pady=(8, 3))
+                fill='x', padx=12, pady=(8, 3))
             params = ctk.CTkFrame(card, fg_color='transparent')
             params.pack(anchor='w', padx=12, pady=(0, 3))
             params.grid_columnconfigure(1, weight=0, minsize=450)
+
             def add_entry(number, key, caption, fallback, help_key):
                 add_label(params, number, caption, help_key)
                 value_var = tk.StringVar(value=str(cfg.get(key, fallback)))
@@ -8461,12 +8465,12 @@ class App(TkinterApp):
                 advanced_grid.pack(anchor='w')
                 advanced_grid.grid_columnconfigure(1, weight=0, minsize=450)
                 for advanced_row, key, caption, default, help_key in (
-                    (0, 'dbscan_tile_size', 'Размер тайла (пиксели)',
-                     256, 'ml.dbscan.tile_size'),
-                    (1, 'dbscan_tile_overlap', 'Перекрытие тайлов (пиксели)',
-                     32, 'ml.dbscan.tile_overlap'),
-                    (2, 'dbscan_max_points_per_tile', 'Максимум точек на тайл',
-                     30000, 'ml.dbscan.max_points'),
+                        (0, 'dbscan_tile_size', 'Размер тайла (пиксели)',
+                         256, 'ml.dbscan.tile_size'),
+                        (1, 'dbscan_tile_overlap', 'Перекрытие тайлов (пиксели)',
+                         32, 'ml.dbscan.tile_overlap'),
+                        (2, 'dbscan_max_points_per_tile', 'Максимум точек на тайл',
+                         30000, 'ml.dbscan.max_points'),
                 ):
                     add_label(advanced_grid, advanced_row, caption, help_key)
                     variable = tk.StringVar(value=str(cfg.get(key, default)))
@@ -8498,8 +8502,8 @@ class App(TkinterApp):
         if plan:
             try:
                 from ml.batch_plan import preview_task_ml_operations
-                count = len(preview_task_ml_operations(task))
-                preview = f" · {count} отдельных ML-расчётов"
+                from ml.queue_policy import plan_summary
+                preview = " · " + plan_summary(preview_task_ml_operations(task))
             except ValueError as error:
                 preview = f" · Ошибка плана: {error}"
         if hasattr(self, "ml_queue_status_label"):
@@ -8507,8 +8511,20 @@ class App(TkinterApp):
                 text=f"ML-план задачи: {len(plan)} конфигураций{preview}")
         if hasattr(self, "queue_summary_label") and hasattr(self, "image_processor"):
             tasks = self.image_processor.tasks
-            count = sum(len(getattr(t, "ml_plan", [])) for t in tasks)
-            self.queue_summary_label.configure(text=f"{len(tasks)} задач · {count} ML-конфигураций")
+            from ml.batch_plan import preview_task_ml_operations
+            total = 0
+            sources = 0
+            invalid = 0
+            for planned in tasks:
+                try:
+                    expanded = preview_task_ml_operations(planned)
+                    total += len(expanded)
+                    sources += len({tuple(op['dataset_key']) for op in expanded})
+                except ValueError:
+                    invalid += 1
+            note = f" · Ошибки плана: {invalid}" if invalid else ""
+            self.queue_summary_label.configure(
+                text=f"{len(tasks)} задач · {sources} наборов KNN · {total} операций ML{note}")
         self._refresh_ml_controls_state()
 
     def _refresh_ml_queue_summary(self):
@@ -8531,6 +8547,7 @@ class App(TkinterApp):
             mb.showwarning("ML", "Добавьте конфигурацию алгоритма")
             return
         try:
+            from ml.queue_policy import plan_summary
             operations = expand_task_ml(task)
             if not operations:
                 raise ValueError("В ML-плане нет операций")
@@ -8547,6 +8564,7 @@ class App(TkinterApp):
         ]
         self.progress_manager.begin_run(
             f"{task.task_name} · дополнительный ML", stages)
+        self.progress_manager.log_info(plan_summary(operations))
         self._ml_ui_locked = True
         self._refresh_ml_controls_state()
         self.cancel_compute_button.configure(state="normal", text="Отменить расчёт")
@@ -8557,21 +8575,29 @@ class App(TkinterApp):
 
     def _ml_queue_only_worker(self, task, operations):
         """Run only ML; all GUI finishing work runs back in the Tk thread."""
+        report_rows = []
         try:
-            result = self._run_integrated_ml(task, operations)
+            result = self._run_integrated_ml(task, operations, report_rows=report_rows)
         except RunCancelled:
+            self.progress_manager.log_info("Дополнительная ML-очередь отменена")
             self.after_safe(0, self.progress_manager.cancel_run)
         except Exception as error:
             self.progress_manager.log_error(
                 f"Ошибка дополнительного ML: {error}\n{traceback.format_exc()}")
             self.after_safe(0, lambda msg=str(error):
-                            self.progress_manager.fail_run(f"Ошибка ML: {msg}"))
+            self.progress_manager.fail_run(f"Ошибка ML: {msg}"))
         else:
             self.after_safe(0, self._refresh_history_tab)
             self.after_safe(0, lambda t=task, summary=result:
-                            self._finish_ml_queue_only_success(t, summary))
+            self._finish_ml_queue_only_success(t, summary))
         finally:
+            try:
+                self.progress_manager.save_run_log(task.task_folder_path,
+                    header=f"Дополнительный ML · {task.task_name}", append=True)
+            except OSError as error:
+                self.progress_manager.log_error(f"Не удалось сохранить журнал ML: {error}")
             self.after_safe(0, self._finish_ml_queue_only)
+            self._complete_ml_report(report_rows, task.task_folder_path)
 
     def _finish_ml_queue_only_success(self, task, summary):
         done = summary["completed"]
@@ -8590,22 +8616,51 @@ class App(TkinterApp):
             folder_callback=lambda: self._open_result_path(task.task_folder_path),
             history_callback=self._show_history_page,
         )
-        self._show_saved_results(self.image_processor.root_folder_path)
 
     def _finish_ml_queue_only(self):
         self._ml_ui_locked = False
         self.cancel_compute_button.configure(state="disabled", text="Отменить расчёт")
         self._refresh_ml_controls_state()
 
-    def _run_integrated_ml(self, task, operations=None):
+    def _complete_ml_report(self, rows, folder):
+        """Show the in-memory report on the GUI thread; never write report files."""
+        if not rows:
+            return
+        self.after_safe(0, lambda: self._show_ml_report(rows, folder))
+
+    def _show_ml_report(self, rows, folder):
+        from utils.ml_run_report import MLRunReport
+        previous = getattr(self, '_ml_report_window', None)
+        if previous is not None and previous.winfo_exists():
+            previous.destroy()
+
+        def continue_ml():
+            self._show_workspace()
+            self._ensure_workspace_tab('ML')
+            self.workspace_tabs.set('ML')
+
+        self._ml_report_window = MLRunReport(
+            self, rows,
+            on_results=lambda: self._show_saved_results(self._experiment_folder(folder)),
+            on_continue=continue_ml)
+
+    def _run_integrated_ml(self, task, operations=None, report_rows=None):
         """Execute explicit KNN/algorithm operations, preserving each result."""
         from ml.batch_plan import expand_task_ml
         operations = operations if operations is not None else expand_task_ml(task)
         # An empty plan must not import sklearn or switch Matplotlib's backend.
         if operations:
-            from ml.clustering import run_clustering
+            from ml.clustering import run_clustering, select_knn_dataset
+            from ml.operation_state import OperationJournal
+            journal = OperationJournal(task.task_folder_path,
+                                       self.progress_manager.run_control.check, self.progress_manager.log_error)
+        from ml.run_report import new_row, set_result
+        rows = [new_row(task, config) for config in operations]
+        if report_rows is not None:
+            report_rows.extend(rows)
         completed = 0
         failed = 0
+        measured_seconds = []
         for index, config in enumerate(operations, 1):
             self.progress_manager.run_control.check()
             algorithm = config["algorithm"]
@@ -8614,7 +8669,33 @@ class App(TkinterApp):
                           f"{algorithm} · {dataset_key}")
             self.progress_manager.begin_stage(stage_name)
             started = time.time()
+            identity = None
+            row = rows[index - 1]
             try:
+                identity = journal.identity(config, select_knn_dataset(task.knn_results, dataset_key))
+                reused = journal.reusable(identity)
+                row['operation_id'] = identity
+                if reused is not None:
+                    lookup = getattr(self.run_history, 'find_ml_operation', None)
+                    if lookup is not None and lookup(task, identity, reused['output_dir']) is None:
+                        self.run_history.add_run(task=task, status='completed', run_type='ml',
+                            duration_seconds=journal.entries[identity].get('duration_seconds', 0),
+                            settings={**task.settings_snapshot(), 'ml_configuration': config,
+                                      'ml_operation_id': identity},
+                            ml_algorithm=algorithm, output_path=reused['output_dir'])
+                    if journal.entries[identity]['status'] == 'saving':
+                        journal.save(identity, 'completed')
+                    journal.record_reuse(identity, config)
+                    self.progress_manager.log_info(
+                        f"ML {index}/{len(operations)}: использован готовый результат; "
+                        f"operation={identity}; параметры={config}; каталог={reused['output_dir']}")
+                    task.ml_result = reused
+                    set_result(row, 'reused', reused)
+                    completed += 1
+                    continue
+                journal.save(identity, "running", configuration=config)
+                self.progress_manager.log_info(
+                    f"ML {index}/{len(operations)}: выполнение; operation={identity}; параметры={config}")
                 result = run_clustering(
                     knn_results=task.knn_results,
                     algorithm=algorithm, output_root=task.task_folder_path,
@@ -8632,17 +8713,38 @@ class App(TkinterApp):
                     dbscan_max_points_per_tile=int(config.get("dbscan_max_points_per_tile", 30000)),
                     cancel_callback=self.progress_manager.run_control.check,
                 )
-                task.ml_result = result
-                completed += 1
+                measured_seconds.append(time.time() - started)
+                completion = journal.completion_details(result)
+                journal.save(identity, 'saving', **completion)
                 self.run_history.add_run(
                     task=task, status="completed", run_type="ml",
                     duration_seconds=time.time() - started,
-                    settings={**task.settings_snapshot(), "ml_configuration": config},
+                    settings={**task.settings_snapshot(), "ml_configuration": config, "ml_operation_id": identity},
                     ml_algorithm=algorithm, output_path=result["output_dir"],
                 )
+                journal.save(identity, "completed", **completion)
+                self.progress_manager.log_info(
+                    f"ML {index}/{len(operations)}: завершено; operation={identity}; "
+                    f"время={time.time() - started:.3f} с; каталог={result['output_dir']}")
+                task.ml_result = completion['result']
+                set_result(row, 'completed', completion['result'])
+                completed += 1
             except RunCancelled:
+                row['status'] = 'cancelled'
+                self.progress_manager.log_info(
+                    f"ML {index}/{len(operations)}: отменено; operation={identity}; параметры={config}")
+                if identity is not None and journal.entries.get(identity, {}).get('status') == 'running':
+                    journal.save(identity, "cancelled", configuration=config)
                 raise
             except Exception as error:
+                row.update(status='failed', error=str(error))
+                if identity is not None and journal.entries.get(identity, {}).get('status') == 'saving':
+                    set_result(row, 'saving', journal.entries[identity]['result'])
+                    self.progress_manager.log_error(
+                        f"ML: результаты сохранены, фиксация истории прервана: {error}; повторите запуск")
+                    raise
+                if identity is not None:
+                    journal.save(identity, "failed", configuration=config, error=str(error))
                 failed += 1
                 self.progress_manager.log_error(
                     f"ML {index}/{len(operations)} ({dataset_key}): {error}; "
@@ -8650,9 +8752,22 @@ class App(TkinterApp):
                 self.run_history.add_run(
                     task=task, status="failed", run_type="ml",
                     duration_seconds=time.time() - started,
-                    settings={**task.settings_snapshot(), "ml_configuration": config},
+                    settings={**task.settings_snapshot(), "ml_configuration": config, "ml_operation_id": identity},
                     ml_algorithm=algorithm, error_message=str(error),
                 )
+            finally:
+                result = None
+                import gc
+                gc.collect()
+                elapsed = time.time() - started
+                import psutil
+                rss = psutil.Process().memory_info().rss / (1024 * 1024)
+                eta = ((sum(measured_seconds) / len(measured_seconds)) * (len(operations) - index)
+                       if measured_seconds else None)
+                eta_text = f"; оценка остатка ~{eta:.1f} с" if eta is not None else ""
+                self.progress_manager.log_info(
+                    f"ML: обработано {index}/{len(operations)}; последняя операция {elapsed:.2f} с; "
+                    f"RSS={rss:.1f} MiB{eta_text}")
         self._persist_experiment_task(task)
         return {"completed": completed, "failed": failed}
 
@@ -8727,12 +8842,14 @@ class App(TkinterApp):
                 )
                 return
 
+        report_rows = []
+        ml_operations_by_task = {}
+        ml_started_tasks = set()
         try:
             timer = time.time()
             total_tasks = len(tasks)
             current_task_num = 0
             from ml.batch_plan import preview_task_ml_operations
-            ml_operations_by_task = {}
             for planned_task in tasks:
                 try:
                     ml_operations_by_task[id(planned_task)] = preview_task_ml_operations(planned_task)
@@ -8788,7 +8905,8 @@ class App(TkinterApp):
                     snapshot = task.settings_snapshot()
                     self.image_processor.compute_for_task(task)
                     if getattr(task, "ml_plan", []):
-                        self._run_integrated_ml(task, ml_operations_by_task[id(task)])
+                        ml_started_tasks.add(id(task))
+                        self._run_integrated_ml(task, ml_operations_by_task[id(task)], report_rows=report_rows)
                     self.progress_manager.begin_stage(
                         f"{task.task_name} · Сохранение результатов"
                     )
@@ -8824,7 +8942,8 @@ class App(TkinterApp):
                                              duration_seconds=time.time() - task_started,
                                              settings=snapshot, error_message=str(error))
                     try:
-                        self.progress_manager.save_run_log(task.task_folder_path, header='Запуск отменён; результаты частичные')
+                        self.progress_manager.save_run_log(task.task_folder_path,
+                                                           header='Запуск отменён; результаты частичные')
                     except OSError as log_error:
                         self.progress_manager.log_error(f"Не удалось сохранить журнал отмены: {log_error}")
                     raise
@@ -8842,7 +8961,7 @@ class App(TkinterApp):
             elapsed_time = time.time() - timer
             self.after_safe(0, self._refresh_history_tab)
             self.after_safe(0, self._update_pipeline_controls_state)
-            self.after_safe(0, lambda: self.show_success_message(elapsed_time, total_tasks))
+            self.after_safe(0, lambda: self.show_success_message(elapsed_time, total_tasks, ml_report=bool(report_rows)))
 
         except RunCancelled:
             raise
@@ -8850,6 +8969,12 @@ class App(TkinterApp):
             self.progress_manager.log_error(f"Критическая ошибка: {str(e)}")
             self.progress_manager.fail_run(f"Ошибка вычислений: {str(e)}")
             self.after_safe(0, self._refresh_history_tab)
+        finally:
+            from ml.run_report import new_row
+            for task in tasks:
+                if id(task) not in ml_started_tasks:
+                    report_rows.extend(new_row(task, op) for op in ml_operations_by_task.get(id(task), []))
+            self._complete_ml_report(report_rows, self.image_processor.root_folder_path)
 
     def _toggle_tasks_panel(self):
         self._apply_panel_layout(not self._tasks_visible, self._progress_visible)
@@ -8863,7 +8988,8 @@ class App(TkinterApp):
                            self.tasks_panel.grid_remove, axis='width')
         frame = self.progress_manager.frame
         animate_visibility(frame, progress_visible,
-                           lambda: frame.pack(fill='x', padx=AppTheme.WINDOW_PADDING + AppTheme.PANEL_GAP, pady=(4, 10)), frame.pack_forget)
+                           lambda: frame.pack(fill='x', padx=AppTheme.WINDOW_PADDING + AppTheme.PANEL_GAP,
+                                              pady=(4, 10)), frame.pack_forget)
         self.tasks_toggle.configure(fg_color=AppTheme.NAV_HOVER if self._tasks_visible else 'transparent')
         self.progress_toggle.configure(fg_color=AppTheme.NAV_HOVER if self._progress_visible else 'transparent')
 
@@ -8902,11 +9028,14 @@ class App(TkinterApp):
         self.results_panel.load_folder(folder, force=True)
         self.workspace_tabs.set("Результаты")
 
-    def show_success_message(self, elapsed_time: float, total_tasks: int):
+    def show_success_message(self, elapsed_time: float, total_tasks: int, ml_report=False):
         self._update_ml_tab_state()
+
         def show_results_action():
             self._open_result_viewer()
-        self._open_result_viewer()
+
+        if not ml_report:
+            self._open_result_viewer()
         self.progress_manager.finish_run(
             f"Завершено: {total_tasks} задач · {format_time(elapsed_time)}",
             result_callback=show_results_action,
@@ -8915,6 +9044,7 @@ class App(TkinterApp):
             ),
             history_callback=self._show_history_page,
         )
+
 
 def format_time(seconds):
     hours = int(seconds // 3600)
@@ -8925,6 +9055,7 @@ def format_time(seconds):
 
 if __name__ == '__main__':
     freeze_support()  # for multiprocess
+
 
     def main():
         try:

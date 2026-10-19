@@ -33,6 +33,8 @@ class _ScrollableDropdown:
         self._dropdown_search = dropdown_search
         self._popup = None
         super().__init__(*args, **kwargs)
+        from utils.tk_lifecycle import install_callback_cleanup
+        install_callback_cleanup(self)
 
     def _open_dropdown_menu(self):
         if self.cget('state') == 'disabled':
@@ -81,6 +83,9 @@ class _ScrollableDropdown:
             self._close_popup()
             if self.winfo_exists():
                 self._dropdown_callback(value)
+            # The popup and its binding commands no longer exist. Stop this
+            # click before Tk dispatches it to the former Toplevel bindtag.
+            return 'break'
 
         def populate(*_):
             if self._popup is not popup:

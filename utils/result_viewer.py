@@ -738,6 +738,8 @@ class ArtifactPane(ctk.CTkFrame):
 class ResultsPanel(ctk.CTkFrame):
     def __init__(self, parent):
         super().__init__(parent, fg_color='transparent')
+        from utils.tk_lifecycle import install_callback_cleanup
+        install_callback_cleanup(self)
         self.folder = ''
         self.artifacts = []
         self._updating_items = False
