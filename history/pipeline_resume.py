@@ -75,7 +75,9 @@ def save_point_cache(task_folder, artifact, cwt_axis, feature_axis, channel, sca
         array = np.empty((0, 2), dtype=np.int32)
     else:
         array = array.reshape(-1, 2)
-    np.save(path, array, allow_pickle=False)
+    from history.atomic_io import atomic_binary_writer
+    with atomic_binary_writer(path) as stream:
+        np.save(stream, array, allow_pickle=False)
     return path
 
 

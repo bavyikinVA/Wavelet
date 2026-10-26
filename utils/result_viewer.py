@@ -64,6 +64,22 @@ def _result_direction(item):
     return mapping.get(value, 'Без направления')
 
 
+def _configure_filter_menu(menu, values, *, fallback, enabled=True, preferred=None):
+    """Atomically replace options and reset stale selections, even when disabled.
+
+    CTkComboBox.set() can leave its text unchanged for disabled entries.  Make
+    the entry writable *before* setting the new value, and return the validated
+    value instead of reading mutable widget state during filtering.
+    """
+    current = menu.get()
+    selected = (preferred if preferred in values else
+                current if current in values else fallback)
+    menu.configure(values=values, state='normal')
+    menu.set(selected)
+    menu.configure(state='readonly' if enabled else 'disabled')
+    return selected
+
+
 class ArtifactPane(ctk.CTkFrame):
     def __init__(self, parent, title, settings_frames=None):
         super().__init__(parent, fg_color=AppTheme.NAV_BACKGROUND,
@@ -97,59 +113,83 @@ class ArtifactPane(ctk.CTkFrame):
         ctk.CTkLabel(header, text=title, font=AppTheme.section_title_font()).pack(side='left')
         self.details_visible = False
         # Settings live in the permanent side panel, not above the plot.
-        selection = self.selection = ctk.CTkFrame(settings_frames[0] if settings_frames else self, fg_color='transparent')
+        self.selection = ctk.CTkFrame(settings_frames[0] if settings_frames else self, fg_color='transparent')
+        self.selection.grid_columnconfigure(0, weight=1)
+        filter_border = ctk.CTkFrame(self.selection, fg_color=AppTheme.NAV_HOVER, corner_radius=6)
+        filter_border.grid(row=0, column=0, sticky='ew')
+        selection = self.filter_frame = ctk.CTkFrame(filter_border, fg_color='transparent')
+        selection.pack(fill='x', padx=8, pady=8)
         selection.grid_columnconfigure((0, 1), weight=1, uniform='filters')
+        ctk.CTkLabel(selection, text='Фильтры', font=AppTheme.section_title_font()).grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 6))
         self.task_selector = ScrollableComboBox(
-            selection, values=['Все задачи'], state='readonly', width=260,
+            selection, values=['Все задачи'], state='readonly', width=220,
             command=lambda _value: self.set_items(self._experiment_items))
         self.task_selector.set('Все задачи')
         ctk.CTkLabel(selection, text='Задача исследования', anchor='w', height=20).grid(
-            row=0, column=0, columnspan=2, sticky='w')
-        self.task_selector.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(0, 6))
+            row=1, column=0, columnspan=2, sticky='w')
+        self.task_selector.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(0, 6))
         self._experiment_items = []
         self.group_selector = ScrollableComboBox(
-            selection, values=['Все типы'], state='readonly', width=260,
+            selection, values=['Все типы'], state='readonly', width=220,
             command=lambda _value: self._on_group_changed())
         self.group_selector.set('Все типы')
-        self.group_selector.grid(row=3, column=0, columnspan=2, sticky='ew', pady=(0, 6))
+        self.group_selector.grid(row=4, column=0, columnspan=2, sticky='ew', pady=(0, 6))
         ctk.CTkLabel(selection, text='Тип результата', anchor='w', height=20).grid(
-            row=2, column=0, columnspan=2, sticky='w')
+            row=3, column=0, columnspan=2, sticky='w')
+        self.direction_label = ctk.CTkLabel(selection, text='Направление CWT', anchor='w', height=20)
+        self.direction_label.grid(row=5, column=0, columnspan=2, sticky='w')
         self.direction_selector = ScrollableComboBox(
-            selection, values=['Все направления'], state='readonly', width=260,
+            selection, values=['Все направления'], state='readonly', width=220,
             command=lambda _value: self.filter_parameters())
         self.direction_selector.set('Все направления')
-        ctk.CTkLabel(selection, text='Направление', anchor='w', height=20).grid(
-            row=4, column=0, columnspan=2, sticky='w')
-        self.direction_selector.grid(row=5, column=0, columnspan=2, sticky='ew', pady=(0, 6))
+        self.direction_selector.grid(row=6, column=0, columnspan=2, sticky='ew', pady=(0, 6))
         self.parameters = {}
         self.parameter_labels = {}
         for column, key, label in [(0, 'scale', 'Масштаб, пикс.'),
                                     (1, 'channel', 'Канал')]:
             caption = ctk.CTkLabel(selection, text=label, anchor='w', height=20)
-            caption.grid(row=6, column=column, sticky='w', padx=(0, 3) if column == 0 else (3, 0))
+            caption.grid(row=7, column=column, sticky='w', padx=(0, 3) if column == 0 else (3, 0))
             self.parameter_labels[key] = caption
-            menu = ScrollableComboBox(selection, values=['Все'], state='readonly', width=125,
+            menu = ScrollableComboBox(selection, values=['Все'], state='readonly', width=100,
                                       command=lambda value, k=key: self.filter_parameters(k))
             menu.set('Все')
             menu.configure(state='disabled')
-            menu.grid(row=7, column=column, sticky='ew', padx=(0, 3) if column == 0 else (3, 0), pady=(0, 6))
+            menu.grid(row=8, column=column, sticky='ew', padx=(0, 3) if column == 0 else (3, 0), pady=(0, 6))
             self.parameters[key] = menu
         # Retain the orientation filter for 2D results, below the compact pair.
         self.parameter_labels['orientation'] = ctk.CTkLabel(
             selection, text='Ориентация, °', anchor='w', height=20)
-        self.parameter_labels['orientation'].grid(row=8, column=0, columnspan=2, sticky='w')
+        self.parameter_labels['orientation'].grid(row=9, column=0, columnspan=2, sticky='w')
         self.parameters['orientation'] = ScrollableComboBox(
-            selection, values=['Все'], state='readonly', width=260,
+            selection, values=['Все'], state='readonly', width=220,
             command=lambda value: self.filter_parameters('orientation'))
         self.parameters['orientation'].set('Все')
         self.parameters['orientation'].configure(state='disabled')
-        self.parameters['orientation'].grid(row=9, column=0, columnspan=2, sticky='ew', pady=(0, 6))
-        ctk.CTkLabel(selection, text='Конкретный результат', anchor='w', height=20).grid(
-            row=10, column=0, columnspan=2, sticky='w')
-        self.selector = ScrollableComboBox(selection, values=['Нет файлов'], width=260,
+        self.parameters['orientation'].grid(row=10, column=0, columnspan=2, sticky='ew', pady=(0, 6))
+        ctk.CTkLabel(self.selection, text='Результат', anchor='w', height=20).grid(
+            row=1, column=0, sticky='w', pady=(12, 0))
+        self.selector = ScrollableComboBox(self.selection, values=['Нет файлов'], width=220,
                                           dropdown_wide=True, dropdown_search=True,
                                           state='readonly', command=self.show_selected)
-        self.selector.grid(row=11, column=0, columnspan=2, sticky='ew', pady=(0, 2))
+        self.selector.grid(row=2, column=0, sticky='ew', pady=(0, 2))
+        for key, label, rownum in [('feature_axis', 'Ось поиска точек', 11), ('point_kind', 'Тип точек', 13), ('algorithm', 'Алгоритм ML', 15)]:
+            caption = ctk.CTkLabel(selection, text=label, anchor='w')
+            caption.grid(row=rownum, column=0, columnspan=2, sticky='w')
+            menu = ScrollableComboBox(selection, values=['Все'], state='readonly', width=220,
+                                      command=lambda value, k=key: self.filter_parameters(k))
+            menu.set('Все')
+            menu.grid(row=rownum+1, column=0, columnspan=2, sticky='ew', pady=(0, 6))
+            self.parameter_labels[key] = caption
+            self.parameters[key] = menu
+        self.ml_details_open = False
+        self.ml_details_button = ctk.CTkButton(selection, text='▸ Параметры ML', anchor='w',
+            fg_color=AppTheme.NAV_HOVER, command=self.toggle_ml_details)
+        self.ml_details_button.grid(row=17, column=0, columnspan=2, sticky='ew')
+        self.ml_details = ctk.CTkLabel(selection, text='', justify='left', anchor='w', wraplength=255)
+        self.ml_details.grid(row=18, column=0, columnspan=2, sticky='ew')
+        self.ml_details.grid_remove()
+        self.add_layer_button = ctk.CTkButton(self.selection, text='+ слой', command=self.open_layer_picker)
+        self.add_layer_button.grid(row=3, column=0, sticky='ew', pady=(8, 3))
         self.filter_hint = ctk.CTkLabel(selection, text='', anchor='w', height=0,
                                        font=AppTheme.caption_font())
         self.filter_hint.grid_remove()
@@ -203,7 +243,7 @@ class ArtifactPane(ctk.CTkFrame):
         self.ax.callbacks.connect('ylim_changed', self.view_changed)
         self.canvas.mpl_connect('motion_notify_event', self.hover)
         self.canvas.mpl_connect('scroll_event', self.scroll_zoom)
-        self.layers = LayerControls(self, master=settings_frames[1], ml_master=settings_frames[2]) if settings_frames else LayerControls(self)
+        self.layers = LayerControls(self, master=settings_frames[1], ml_master=None) if settings_frames else LayerControls(self)
         self.canvas.mpl_connect('resize_event', lambda event: self._queue_view_frame())
         if settings_frames:
             self.settings_frames = settings_frames
@@ -213,30 +253,42 @@ class ArtifactPane(ctk.CTkFrame):
         else:
             self.bind('<Configure>', self._fit_selectors, add='+')
 
-    def _adapt_result_filters(self, item):
-        """Show only the filters meaningful for the selected artifact."""
-        if not item:
+    def toggle_ml_details(self):
+        self.ml_details_open = not self.ml_details_open
+        self.ml_details_button.configure(text=('▾' if self.ml_details_open else '▸') + ' Параметры ML')
+        self._adapt_result_filters(self.selected_item)
+
+    def open_layer_picker(self):
+        from utils.tk_lifecycle import active_widget_root
+        if active_widget_root(self) is None:
             return
-        # Keep scale/channel filters when this family supports them; orientation
-        # is meaningful only for oriented 2-D wavelet outputs.
-        family = item.get('family')
-        related = [a for a in self._catalog_items
-                   if a.get('family') == family] if family else [item]
-        flags = {
-            key: any(a.get(key) is not None for a in related)
-            for key in ('scale', 'orientation', 'channel')
-        }
-        # For image originals do not leave unrelated analysis parameters visible.
-        if item.get('category') == 'Источник':
-            flags = dict.fromkeys(flags, False)
-        for key, visible in flags.items():
-            widgets = (self.parameter_labels[key], self.parameters[key])
-            for widget in widgets:
-                if visible:
-                    widget.grid()
-                else:
-                    widget.grid_remove()
-        self.filter_hint.configure(text='')
+        if getattr(self, 'on_add_layer', None):
+            self.on_add_layer()
+        self.layers.open_layer_picker()
+
+    def _adapt_result_filters(self, item):
+        group = self.group_selector.get()
+        related = [a for a in self._catalog_items if group == 'Все типы' or _result_group(a) == group]
+        for key, menu in self.parameters.items():
+            visible = any(a.get(key) is not None for a in related)
+            for widget in (self.parameter_labels[key], menu):
+                widget.grid() if visible else widget.grid_remove()
+        direction = any(_result_direction(a) != 'Без направления' for a in related)
+        for widget in (self.direction_label, self.direction_selector):
+            widget.grid() if direction else widget.grid_remove()
+        is_ml = bool(item and item.get('category') == 'ML-кластеры')
+        self.ml_details_button.grid() if is_ml else self.ml_details_button.grid_remove()
+        if is_ml and self.ml_details_open:
+            params = item.get('ml_parameters', {})
+            names = {'n_clusters': 'Кластеров', 'eps': 'ε', 'min_samples': 'Мин. соседей',
+                     'feature_set': 'Признаки', 'standardize': 'Стандартизация', 'random_state': 'Random state',
+                     'dbscan_batch_size': 'Вычислительный пакет'}
+            text = ' · '.join(f'{label}: {params[key]}' for key, label in names.items() if key in params)
+            self.ml_details.configure(text=text or 'Параметры не сохранены в журнале этого результата')
+            self.ml_details.grid()
+        else:
+            self.ml_details.grid_remove()
+        self.add_layer_button.configure(state='normal' if self.payload and self.payload.get('spatial') else 'disabled')
 
     def _fit_selectors(self, event):
         # CTkFrame.bind attaches to its canvas, which owns Configure events.
@@ -263,23 +315,29 @@ class ArtifactPane(ctk.CTkFrame):
 
     def set_items(self, items, prefer_source=False):
         self._experiment_items = items
-        tasks = list(dict.fromkeys(a.get('task_id', '') for a in items))
-        self.task_selector.configure(values=['Все задачи'] + tasks,
-                                     state='readonly' if len(tasks) > 1 else 'disabled')
-        if self.task_selector.get() not in tasks:
-            self.task_selector.set('Все задачи')
-        selected_task = self.task_selector.get()
+        self._task_values = {}
+        for a in items:
+            label = a.get('task_name') or a.get('task_id', '')
+            if label in self._task_values and self._task_values[label] != a.get('task_id'):
+                label += ' · ' + a.get('task_id', '')
+            self._task_values[label] = a.get('task_id', '')
+        tasks = list(self._task_values)
+        selected_task = _configure_filter_menu(
+            self.task_selector, ['Все задачи'] + tasks,
+            fallback='Все задачи', enabled=len(tasks) > 1,
+            preferred=tasks[0] if len(tasks) == 1 else None)
         items = [a for a in items if selected_task == 'Все задачи'
-                 or a.get('task_id') == selected_task]
+                 or a.get('task_id') == self._task_values.get(selected_task, selected_task)]
         self._catalog_items = items
         groups = sorted({_result_group(a) for a in items},
                         key=lambda g: (['Исходное изображение', 'CWT', 'Экстремумы',
                                         'Огибающие', 'KNN', 'ML'].index(g)
                                        if g in ['Исходное изображение', 'CWT', 'Экстремумы',
                                                 'Огибающие', 'KNN', 'ML'] else 100, g))
-        self.group_selector.configure(values=['Все типы'] + groups)
-        if self.group_selector.get() not in groups:
-            self.group_selector.set('Все типы')
+        _configure_filter_menu(
+            self.group_selector, ['Все типы'] + groups, fallback='Все типы',
+            preferred=('Исходное изображение'
+                       if prefer_source and 'Исходное изображение' in groups else None))
         self._update_directions()
         self._populate_parameter_values(items, prefer_source=prefer_source)
 
@@ -289,37 +347,38 @@ class ArtifactPane(ctk.CTkFrame):
                     if selected == 'Все типы' or _result_group(a) == selected]
         directions = [value for value in ('По строкам', 'По столбцам', 'Без направления')
                       if any(_result_direction(a) == value for a in relevant)]
-        current = self.direction_selector.get()
-        self.direction_selector.configure(values=['Все направления'] + directions,
-                                          state='readonly' if len(directions) > 1 else 'disabled')
-        self.direction_selector.set(current if current in directions else 'Все направления')
+        _configure_filter_menu(
+            self.direction_selector, ['Все направления'] + directions,
+            fallback='Все направления', enabled=len(directions) > 1)
 
     def _on_group_changed(self):
         self._update_directions()
         self.filter_parameters()
 
     def _populate_parameter_values(self, items, prefer_source=False):
-        for key, menu in self.parameters.items():
-            values = sorted({a[key] for a in items if a.get(key) is not None},
-                            key=float if key != 'channel' else str)
-            menu.configure(values=['Все'] + values, state='readonly')
-            if menu.get() not in values:
-                menu.set('Все')
-            menu.configure(state='readonly' if values else 'disabled')
         self.filter_parameters(prefer_source=prefer_source)
-        unavailable = [label for key, label in [('scale', 'масштаб'), ('orientation', 'ориентация'), ('channel', 'канал')]
-                       if len(self.parameters[key].cget('values')) == 1]
-        self.filter_hint.configure(text='Нет параметров в выбранных данных: ' + ', '.join(unavailable) if unavailable else '')
 
     def filter_parameters(self, changed=None, prefer_source=False):
         group = self.group_selector.get()
         direction = self.direction_selector.get()
         items = [a for a in self._catalog_items
                  if (group == 'Все типы' or _result_group(a) == group)
-                 and (direction == 'Все направления' or _result_direction(a) == direction)
-                 and all(menu.get() == 'Все' or a.get(key) == menu.get()
-                         for key, menu in self.parameters.items())]
+                 and (direction == 'Все направления' or _result_direction(a) == direction)]
+        for key, menu in self.parameters.items():
+            raw_values = sorted({str(a[key]) for a in items if a.get(key) is not None},
+                            key=float if key in ('scale', 'orientation') else str)
+            translations = {'row': 'По строкам', 'col': 'По столбцам', 'max': 'Максимумы',
+                            'min': 'Минимумы', 'upper': 'Верхняя огибающая', 'lower': 'Нижняя огибающая'}
+            mapping = {translations.get(v, v): v for v in raw_values}
+            values = list(mapping)
+            selected = _configure_filter_menu(
+                menu, ['Все'] + values, fallback='Все', enabled=bool(values))
+            if selected != 'Все':
+                raw_value = mapping.get(selected)
+                if raw_value is not None:
+                    items = [a for a in items if str(a.get(key)) == raw_value]
         previous = self.selector.get()
+        previous_path = self.items.get(previous, {}).get('path')
         previous_family = self.items.get(previous, {}).get('family')
         self.items = {}
         for item in items:
@@ -329,13 +388,17 @@ class ArtifactPane(ctk.CTkFrame):
                 item.get('channel'),
                 _result_direction(item) if _result_direction(item) != 'Без направления' else None,
                 {'row': 'Экстремумы по строкам', 'col': 'Экстремумы по столбцам'}.get(item.get('feature_axis')),
-                f"{item['orientation']}°" if item.get('orientation') else None,
+                f"{item['orientation']}°" if item.get('orientation') is not None else None,
                 {'max': 'Максимумы', 'min': 'Минимумы', 'upper': 'Верхняя',
                  'lower': 'Нижняя'}.get(item.get('point_kind')),
-                item.get('file_format')) if value]
+                item.get('algorithm'), item.get('file_format')) if value]
             base = ' · '.join(parts) if parts else Path(item['path']).name
             if self.task_selector.get() == 'Все задачи':
                 base = f"{item.get('task_name', 'Задача')} · {base}"
+            params = item.get('ml_parameters', {})
+            details = [f'{name}={params[key]}' for key, name in [('n_clusters', 'k'), ('eps', 'ε'), ('min_samples', 'min_samples')] if key in params]
+            if details:
+                base += ' · ' + ', '.join(details)
             if item.get('ml_run'):
                 base = f"{base} · {item['ml_run']}"
             label = base
@@ -350,6 +413,7 @@ class ArtifactPane(ctk.CTkFrame):
         if previous not in self.items and previous_family:
             chosen = next((label for label, item in self.items.items()
                            if item.get('family') == previous_family), chosen)
+        chosen = next((label for label, item in self.items.items() if item['path'] == previous_path), chosen)
         if prefer_source:
             chosen = next((label for label, item in self.items.items() if item['category'] == 'Источник'), chosen)
         self.selector.set(chosen)
@@ -513,6 +577,8 @@ class ArtifactPane(ctk.CTkFrame):
         self._refresh_result_details()
         self._rendering = False
         self.view_changed()
+        self.layers.set_base(self.selected_item, self.payload)
+        self._adapt_result_filters(self.selected_item)
         self.layers.redraw()
         if self.on_data_changed is not None:
             self.on_data_changed()
@@ -561,15 +627,20 @@ class ArtifactPane(ctk.CTkFrame):
         return self._natural_limits
 
     def capture_state(self):
-        return dict(group=self.group_selector.get(), direction=self.direction_selector.get(),
+        return dict(task=self.task_selector.get(), group=self.group_selector.get(), direction=self.direction_selector.get(),
                     parameters={k: v.get() for k, v in self.parameters.items()},
                     selected=self.selector.get(), component=self.component.get(),
                     view=self.normalized_view(), details=self.details_visible,
-                    layers=[(l['item']['label'], l['alpha'], l['visible'].get()) for l in self.layers.layers])
+                    layers=[dict(path=l['item']['path'], alpha=l['alpha'],
+                                 visible=l['visible'].get(), marker_scale=l['marker_scale'],
+                                 color=l['color']) for l in self.layers.layers])
 
     def restore_state(self, state):
         self._pending_view = state['view']
         self.component.set(state['component'])
+        if state.get('task') in self.task_selector.cget('values'):
+            self.task_selector.set(state['task'])
+            self.set_items(self._experiment_items)
         group = state.get('group', 'Все типы')
         self.group_selector.set(group if group in self.group_selector.cget('values') else 'Все типы')
         self._update_directions()
@@ -587,14 +658,29 @@ class ArtifactPane(ctk.CTkFrame):
             self.render_payload()
         self.layers.clear()
         if not self.suspended:
-            for label, alpha, visible in state['layers']:
-                if label in self.layers.items:
-                    self.layers.selector.set(label)
-                    self.layers.add_selected()
-                    layer = self.layers.layers[-1]
-                    layer['alpha'] = alpha
-                    layer['slider'].set(alpha)
-                    layer['visible'].set(visible)
+            available = {a['path']: a for a in self.layers._source_items}
+            for saved in state.get('layers', []):
+                # Backward compatible with older in-memory tuple snapshots.
+                if isinstance(saved, dict):
+                    item = available.get(saved['path'])
+                    alpha = saved['alpha']
+                    visible = saved['visible']
+                else:
+                    label, alpha, visible = saved
+                    item = self.layers.items.get(label)
+                if item is None:
+                    continue
+                self.layers.add_item(item)
+                layer = self.layers.layers[-1]
+                layer['alpha'] = alpha
+                layer['slider'].set(alpha)
+                layer['visible'].set(visible)
+                if isinstance(saved, dict):
+                    layer['marker_scale'] = saved.get('marker_scale', 1.0)
+                    layer['size_slider'].set(layer['marker_scale'])
+                    if item['category'] != 'ML-кластеры':
+                        layer['color'] = saved.get('color', layer['color'])
+                        layer['swatch'].configure(fg_color=layer['color'], hover_color=layer['color'])
             if state['details'] != self.details_visible:
                 self.toggle_details()
 
@@ -821,9 +907,9 @@ class ResultsPanel(ctk.CTkFrame):
             command=lambda _value: self._show_sidebar_section())
         self.pane_switch.grid(row=1, column=0, sticky='ew', padx=10, pady=(0, 7))
         self.pane_switch.grid_remove()
-        self.settings_section = tk.StringVar(value='Результат')
+        self.settings_section = tk.StringVar(value='Данные')
         self.section_switch = ctk.CTkSegmentedButton(
-            self.sidebar, values=['Результат', 'Слои', 'ML'],
+            self.sidebar, values=['Данные', 'Слои'],
             variable=self.settings_section,
             command=lambda _value: self._show_sidebar_section())
         self.section_switch.grid(row=2, column=0, sticky='ew', padx=10, pady=(0, 8))
@@ -834,7 +920,7 @@ class ResultsPanel(ctk.CTkFrame):
         self.settings_frames = {}
         for key in ('A', 'B'):
             frames = []
-            for section in ('Результат', 'Слои', 'ML'):
+            for section in ('Данные', 'Слои'):
                 frame = ctk.CTkScrollableFrame(self.settings_container, fg_color='transparent',
                                                corner_radius=0)
                 self.settings_frames[key, section] = frame
@@ -842,6 +928,8 @@ class ResultsPanel(ctk.CTkFrame):
             self.settings_frames[key, 'tuple'] = tuple(frames)
         self.left = ArtifactPane(panes, 'Сравнение A', self.settings_frames['A', 'tuple'])
         self.right = ArtifactPane(panes, 'Сравнение B', self.settings_frames['B', 'tuple'])
+        for key, pane in (('A', self.left), ('B', self.right)):
+            pane.on_add_layer = lambda k=key: self._open_layer_section(k)
         self.sidebar_reopen.pack_forget()
         self._show_sidebar_section()
         self.right.suspended = True
@@ -856,6 +944,11 @@ class ResultsPanel(ctk.CTkFrame):
         panes.bind('<Map>', self.initialize_split)
         panes.bind('<Configure>', self.initialize_split)
         panes.bind('<ButtonRelease-1>', self.remember_split)
+
+    def _open_layer_section(self, key):
+        self.active_pane.set(key)
+        self.settings_section.set('Слои')
+        self._show_sidebar_section()
 
     def _remember_sidebar_width(self, event=None):
         if self._sidebar_open and len(self.workspace_split.panes()) == 2:

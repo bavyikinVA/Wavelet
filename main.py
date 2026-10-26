@@ -311,7 +311,8 @@ class ImageProcessor:
                 filename = source_channel_name(channel) + ".txt"
                 array_2d = task.data_copy[channel]
                 file_path = os.path.join(source_folder, filename)
-                np.savetxt(file_path, array_2d, fmt='%d', delimiter=",")
+                from history.atomic_io import atomic_savetxt
+                atomic_savetxt(file_path, array_2d, fmt='%d', delimiter=",")
                 self.progress.log_info(f"Сохранен файл: {file_path}")
 
     def gram_shmidt_transform_for_task(self, task):
@@ -520,7 +521,8 @@ class ImageProcessor:
                     metadata_folder,
                     centering_mean_name(cwt_axis, channel_code) + ".txt"
                 )
-                np.savetxt(file_mean_path, np.asarray(means), fmt="%.10g")
+                from history.atomic_io import atomic_savetxt
+                atomic_savetxt(file_mean_path, np.asarray(means), fmt="%.10g")
 
             # GPU обработка
             if self.backend.use_gpu:
@@ -710,11 +712,13 @@ class ImageProcessor:
                     phase = np.angle(coefficients)
 
                     if task.output_wavelet_text:
-                        np.savetxt(
+                        from history.atomic_io import atomic_savetxt
+                        atomic_savetxt(
                             os.path.join(output_folder, file_stem + "_magnitude.csv"),
                             magnitude, fmt="%.6g", delimiter=","
                         )
-                        np.savetxt(
+                        from history.atomic_io import atomic_savetxt
+                        atomic_savetxt(
                             os.path.join(output_folder, file_stem + "_phase.csv"),
                             phase, fmt="%.6g", delimiter=","
                         )
@@ -783,7 +787,8 @@ class ImageProcessor:
                 if info_out == 0 or info_out == 10:
                     filename = file_stem + ".txt"
                     file_path = os.path.join(wavelets_folder, filename)
-                    np.savetxt(file_path, array_2d, fmt='%.3f', delimiter=",")
+                    from history.atomic_io import atomic_savetxt
+                    atomic_savetxt(file_path, array_2d, fmt='%.3f', delimiter=",")
                     self.progress.log_debug(f"Сохранен текстовый файл: {file_path}")
 
                 if info_out == 0 or info_out == 1:
@@ -959,8 +964,8 @@ class ImageProcessor:
 
             ``load_point_cache`` already falls back to the scale-folder NPZ, so
             keeping both byte-identical point stores after a successful publish
-            only wastes disk space.  Empty point clouds intentionally keep their
-            tiny cache file because no canonical NPZ is emitted for them.
+            only wastes disk space. Empty layers are published too, replacing
+            obsolete non-empty layers from earlier parameters.
             """
             cache_path = _point_cache_path(
                 resume_cache_folder, artifact, cwt_axis, feature_axis,
@@ -990,12 +995,13 @@ class ImageProcessor:
             viewer/resume schema (``points`` + ``shape``), but turns the write
             into a sequential binary I/O operation.
             """
-            if local_points is None or len(local_points) == 0:
+            if local_points is None:
                 return
             points = _point_np.asarray(local_points, dtype=_point_np.int32).reshape(-1, 2)
             filename = _profile_os.path.join(path, f"{title}.npz")
             with point_profiles["canonical_point_npz"].measure():
-                _point_np.savez(
+                from history.atomic_io import atomic_savez
+                atomic_savez(
                     filename,
                     points=points,
                     shape=_point_np.asarray(native_shape, dtype=_point_np.int32),
@@ -1445,7 +1451,7 @@ class ImageProcessor:
                              task.output_envelopes_image),
                         )
                         for artifact, kind, points, enabled, save_text, save_image in exports:
-                            if not enabled or len(points) == 0:
+                            if not enabled:
                                 continue
                             title = point_stem(
                                 artifact, cwt_axis, feature_axis,
@@ -1925,10 +1931,11 @@ class ImageProcessor:
         compact int32 arrays and compression is disproportionately expensive on
         multi-million-point runs.  The file schema is unchanged.
         """
-        if local_points is None or len(local_points) == 0:
+        if local_points is None:
             return
         points = np.asarray(local_points, dtype=np.int32).reshape(-1, 2)
-        np.savez(
+        from history.atomic_io import atomic_savez
+        atomic_savez(
             os.path.join(path, f"{title}.npz"),
             points=points,
             shape=np.asarray(native_shape, dtype=np.int32),
@@ -1949,7 +1956,8 @@ class ImageProcessor:
         file_path = os.path.join(path, f"{title}.txt")
         try:
             points = np.asarray(local_points, dtype=np.int32).reshape(-1, 2)
-            np.savetxt(file_path, points, fmt="%d, %d")
+            from history.atomic_io import atomic_savetxt
+            atomic_savetxt(file_path, points, fmt="%d, %d")
             print(f"Файл сохранён: {file_path}")
         except Exception as e:
             print(f"Ошибка при сохранении файла {file_path}: {str(e)}")
@@ -2023,7 +2031,8 @@ class ImageProcessor:
             native_shape = (np.asarray(coefs_2d).shape[:2] if coefs_2d is not None
                             else original_img_shape[:2] if original_img_shape is not None else None)
             if native_shape is not None:
-                np.savez_compressed(os.path.join(path, f"{title}.npz"),
+                from history.atomic_io import atomic_savez_compressed
+                atomic_savez_compressed(os.path.join(path, f"{title}.npz"),
                                     points=points, shape=native_shape)
             plt.savefig(filename, bbox_inches='tight', dpi=150)
             plt.close(fig)
@@ -2129,7 +2138,8 @@ class ImageProcessor:
                 return None, csv_path
 
             x = np.arange(len(scales))
-            np.savez_compressed(os.path.join(path, f"{file_base_name}.npz"),
+            from history.atomic_io import atomic_savez_compressed
+            atomic_savez_compressed(os.path.join(path, f"{file_base_name}.npz"),
                                 series=np.column_stack((scales, max_counts)),
                                 labels=['Масштаб', 'Количество максимумов'])
 
@@ -2309,7 +2319,8 @@ class ImageProcessor:
                 return None, csv_path
 
             x = np.arange(len(block_labels))
-            np.savez_compressed(os.path.join(path, f"{file_base_name}.npz"),
+            from history.atomic_io import atomic_savez_compressed
+            atomic_savez_compressed(os.path.join(path, f"{file_base_name}.npz"),
                                 series=np.column_stack((x, block_counts)),
                                 labels=['Блок', 'Количество максимумов'], ticks=block_labels)
 
@@ -2439,7 +2450,8 @@ class ImageProcessor:
 
             sync_matrix = np.asarray(sync_matrix, dtype=float)
             rows = list(rows)
-            np.savez_compressed(os.path.join(path, f"{file_base_name}.npz"), matrix=sync_matrix)
+            from history.atomic_io import atomic_savez_compressed
+            atomic_savez_compressed(os.path.join(path, f"{file_base_name}.npz"), matrix=sync_matrix)
 
             fig, ax = plt.subplots(figsize=(10, 8))
 
@@ -2819,6 +2831,8 @@ class ImageProcessor:
                         )
                         self.progress.update_progress(1.0, "Готовый CWT восстановлен")
                     else:
+                        from history.pipeline_state import invalidate_stages
+                        invalidate_stages(task, ["wavelet"])
                         self.compute_wavelets(task, info_out)
                         mark_stage_ready(task, "wavelet")
                 else:
@@ -2851,6 +2865,8 @@ class ImageProcessor:
                     self.progress.begin_stage(
                         f"{task.task_name} · {task.execution_stage_names()[2]}"
                     )
+                    from history.pipeline_state import invalidate_stages
+                    invalidate_stages(task, point_execution)
                     self.compute_points(
                         task,
                         task.process_rows,
@@ -3314,8 +3330,7 @@ class App(TkinterApp):
                 self.ml_feature_set_var, self.ml_standardize_var,
                 self.ml_n_clusters_var, self.ml_random_state_var,
                 self.ml_eps_var, self.ml_min_samples_var, self.ml_dataset_var,
-                self.ml_dbscan_tile_size_var, self.ml_dbscan_tile_overlap_var,
-                self.ml_dbscan_max_points_var):
+                self.ml_dbscan_batch_size_var):
             variable.trace_add('write', self._store_ml_settings_for_current_task)
 
         # Переменная для GPU/CPU переключения
@@ -3820,9 +3835,7 @@ class App(TkinterApp):
         self.ml_random_state_var = tk.StringVar(value="42")
         self.ml_eps_var = tk.StringVar(value="0.8")
         self.ml_min_samples_var = tk.StringVar(value="5")
-        self.ml_dbscan_tile_size_var = tk.StringVar(value="256")
-        self.ml_dbscan_tile_overlap_var = tk.StringVar(value="32")
-        self.ml_dbscan_max_points_var = tk.StringVar(value="30000")
+        self.ml_dbscan_batch_size_var = tk.StringVar(value="512")
         self._ml_thread = None
         self._ml_preview_image = None
 
@@ -4616,9 +4629,7 @@ class App(TkinterApp):
             dbscan_fields = [
                 ("Радиус соседства ε", self.ml_eps_var),
                 ("Минимум точек", self.ml_min_samples_var),
-                ("Размер пространственного тайла, px", self.ml_dbscan_tile_size_var),
-                ("Перекрытие тайлов, px", self.ml_dbscan_tile_overlap_var),
-                ("Максимум точек в тайле", self.ml_dbscan_max_points_var),
+                ("Размер вычислительного пакета", self.ml_dbscan_batch_size_var),
             ]
 
             def build_group(container, fields, target_entries):
@@ -4668,9 +4679,8 @@ class App(TkinterApp):
         else:
             self._ml_dbscan_parameters_frame.pack(fill="x")
             help_text = (
-                "DBSCAN выполняется локально по пространственным тайлам с перекрытием. "
-                "Все точки участвуют в анализе; перекрытие уменьшает граничные артефакты. "
-                "Номера кластеров разных тайлов не являются глобальными классами."
+                "Глобальный DBSCAN находит произвольное число кластеров в общем пространстве "
+                "признаков; -1 — шум. Размер пакета меняет расход памяти, но не результат."
             )
 
         if getattr(self, "ml_algorithm_help_label", None) is not None:
@@ -4722,9 +4732,7 @@ class App(TkinterApp):
         task.ml_random_state = int(self.ml_random_state_var.get())
         task.ml_eps = float(self.ml_eps_var.get().replace(",", "."))
         task.ml_min_samples = int(self.ml_min_samples_var.get())
-        task.ml_dbscan_tile_size = int(self.ml_dbscan_tile_size_var.get())
-        task.ml_dbscan_tile_overlap = int(self.ml_dbscan_tile_overlap_var.get())
-        task.ml_dbscan_max_points_per_tile = int(self.ml_dbscan_max_points_var.get())
+        task.ml_dbscan_batch_size = int(self.ml_dbscan_batch_size_var.get())
 
     def _store_ml_settings_for_current_task(self, *_args):
         task = getattr(self, "current_task", None)
@@ -4819,13 +4827,21 @@ class App(TkinterApp):
                 eps=task.ml_eps,
                 min_samples=task.ml_min_samples,
                 dataset_key=task.ml_dataset_key,
-                dbscan_tile_size=getattr(task, "ml_dbscan_tile_size", 256),
-                dbscan_tile_overlap=getattr(task, "ml_dbscan_tile_overlap", 32),
-                dbscan_max_points_per_tile=getattr(task, "ml_dbscan_max_points_per_tile", 30000),
+                dbscan_device="gpu" if getattr(getattr(getattr(self, "image_processor", None), "backend", None), "use_gpu", False) else "cpu",
+                dbscan_batch_size=getattr(task, "ml_dbscan_batch_size", 512),
                 progress_callback=ml_progress,
                 cancel_callback=self.progress_manager.run_control.check,
             )
             task.ml_result = result
+            if task.ml_algorithm == "dbscan":
+                self.progress_manager.log_info(
+                    f"DBSCAN: backend={result.get('dbscan_backend')}; "
+                    f"кластеров={result['metrics']['cluster_count']}; "
+                    f"шумовых точек={result['metrics']['noise_count']}; "
+                    f"время={result['timings']['clustering']:.3f} c")
+                if result.get('dbscan_fallback_reason'):
+                    self.progress_manager.log_info(
+                        f"DBSCAN: резервный переход GPU → CPU: {result['dbscan_fallback_reason']}")
             save_feature_checkpoint(task, cancel_check=self.progress_manager.run_control.check)
             self.progress_manager.save_run_log(
                 task.task_folder_path,
@@ -4931,21 +4947,10 @@ class App(TkinterApp):
             self._set_ml_preview_image(None)
             return
         metrics = result["metrics"]
-        if result.get("tiled"):
-            stats = result.get("dbscan_statistics") or {}
-            anomaly_mean = stats.get("anomaly_mean", result["metrics"].get("anomaly_mean"))
-            counts = (
-                f"A>0: {stats.get('anomaly_nonzero', 0):,}; "
-                f"устойчивые A≥{stats.get('anomaly_threshold', 0.75):.2f}: {stats.get('anomaly_stable', 0):,}; "
-                f"A=1: {stats.get('anomaly_full', 0):,}; "
-                f"средняя A: {anomaly_mean:.3f}" if anomaly_mean is not None else
-                f"A>0: {stats.get('anomaly_nonzero', 0):,}"
-            )
-        else:
-            counts = ", ".join(
-                (f"шум: {count}" if label == -1 else f"кластер {label + 1}: {count}")
-                for label, count in result["counts"].items()
-            )
+        counts = ", ".join(
+            (f"Шум: {count}" if label == -1 else f"Кластер {label}: {count}")
+            for label, count in result["counts"].items()
+        )
         timings = result.get("timings", {})
         timing_text = "; ".join(
             f"{name}: {timings[name]:.2f} c"
@@ -4953,32 +4958,26 @@ class App(TkinterApp):
             if name in timings
         )
         silhouette_sample = metrics.get("silhouette_sample_size", 0)
-        sample_text = (
-            f" (выборка {silhouette_sample:,})" if silhouette_sample else ""
-        )
+        sample_text = (f" (выборка {silhouette_sample:,})" if silhouette_sample else "")
+        backend_line = (f"Вычисления: {result.get('dbscan_backend', '—')}\n"
+                        if result.get('algorithm') == 'dbscan' else "")
+        if result.get('dbscan_fallback_reason'):
+            backend_line += f"GPU → CPU: {result['dbscan_fallback_reason']}\n"
         self.ml_result_label.configure(
             text=(
-                    f"Алгоритм: {result['algorithm_name']}; точек: {result.get('point_count', len(result.get('records', []))):,}\n"
-                    f"Набор: {result.get('dataset', {}).get('channel', '—')} · a={result.get('dataset', {}).get('scale', '—')} · "
-                    f"{result.get('dataset', {}).get('point_type_name', '—')} · {result.get('dataset', {}).get('direction', '—')}\n"
-                    + ((f"Локальный сеточный DBSCAN: тайлов {result.get('dbscan_statistics', {}).get('tiles', '—')}\n")
-                       if result.get("tiled") else
-                       (f"Кластеров: {metrics['cluster_count']}; шумовых точек: {metrics['noise_count']}\n"))
-                    + f"Результат: {counts}\n"
-                    + (("DBSCAN: локальные ID тайлов не являются глобальными кластерами; "
-                        "основной показатель — устойчивость аномалии A∈[0,1].\n") if result.get("tiled") else
-                       (f"Silhouette: {self._format_metric(metrics['silhouette'])}{sample_text}; "
-                        f"Davies–Bouldin: {self._format_metric(metrics['davies_bouldin'])}; "
-                        f"Calinski–Harabasz: {self._format_metric(metrics['calinski_harabasz'])}\n"))
-                    + (f"Время: {timing_text}\n" if timing_text else "")
-                    + ((
-                           "DBSCAN: анализируйте отдельные ML-слои по масштабу, каналу, типу точек и направлению во вкладке «Результаты»."
-                           ) if result.get("tiled") else
-                       "Silhouette: ближе к 1 — лучше; Davies–Bouldin: меньше — лучше; Calinski–Harabasz: больше — лучше.")
+                f"Алгоритм: {result['algorithm_name']}; точек: {result.get('point_count', len(result.get('records', []))):,}\n"
+                f"Набор: {result.get('dataset', {}).get('channel', '—')} · a={result.get('dataset', {}).get('scale', '—')} · "
+                f"{result.get('dataset', {}).get('point_type_name', '—')} · {result.get('dataset', {}).get('direction', '—')}\n"
+                f"Кластеров: {metrics['cluster_count']}; шумовых точек: {metrics['noise_count']}\n"
+                + backend_line + f"Результат: {counts}\n"
+                + f"Silhouette: {self._format_metric(metrics['silhouette'])}{sample_text}; "
+                  f"Davies–Bouldin: {self._format_metric(metrics['davies_bouldin'])}; "
+                  f"Calinski–Harabasz: {self._format_metric(metrics['calinski_harabasz'])}\n"
+                + (f"Время: {timing_text}\n" if timing_text else "")
             ),
             text_color=AppTheme.TEXT_ON_DARK,
         )
-        preview_values = ["Аномальность в признаках" if result.get("tiled") else "Кластеры в признаках"]
+        preview_values = ["Кластеры в признаках"]
         self.ml_preview_selector.configure(values=preview_values, state="normal")
         if self.ml_preview_selector.get() not in preview_values:
             self.ml_preview_selector.set(preview_values[0])
@@ -8418,15 +8417,11 @@ class App(TkinterApp):
             row += 1
 
             add_label(source, row, 'Признаки', 'ml.features')
-            feature_mapping = {
-                'Координаты': 'coordinates',
-                'Расстояния и углы KNN': 'knn',
-                'Координаты + KNN': 'coordinates_knn',
-            }
+            feature_mapping = {'KNN Info (исходные координаты, расстояния и углы)': 'knn_raw'}
             feature_menu = MLSingleDropdown(
                 source,
                 options=[(code, label) for label, code in feature_mapping.items()],
-                value=cfg.get('feature_set', 'knn'),
+                value='knn_raw',
                 on_change=lambda _value: self._save_ml_queue_cards())
             feature_menu.grid(row=row, column=1, sticky='ew', pady=2)
             variables['feature_set'] = feature_menu
@@ -8459,18 +8454,14 @@ class App(TkinterApp):
                           '5', 'ml.dbscan.min_samples')
                 advanced = ctk.CTkFrame(card, fg_color='transparent')
                 advanced.pack(anchor='w', padx=12, pady=(2, 4))
-                ctk.CTkLabel(advanced, text='Дополнительно · обработка DBSCAN по тайлам',
+                ctk.CTkLabel(advanced, text='Дополнительно · память и производительность',
                              font=AppTheme.body_font(), anchor='w').pack(fill='x', pady=(0, 4))
                 advanced_grid = ctk.CTkFrame(advanced, fg_color='transparent')
                 advanced_grid.pack(anchor='w')
                 advanced_grid.grid_columnconfigure(1, weight=0, minsize=450)
                 for advanced_row, key, caption, default, help_key in (
-                        (0, 'dbscan_tile_size', 'Размер тайла (пиксели)',
-                         256, 'ml.dbscan.tile_size'),
-                        (1, 'dbscan_tile_overlap', 'Перекрытие тайлов (пиксели)',
-                         32, 'ml.dbscan.tile_overlap'),
-                        (2, 'dbscan_max_points_per_tile', 'Максимум точек на тайл',
-                         30000, 'ml.dbscan.max_points'),
+                    (0, 'dbscan_batch_size', 'Размер вычислительного пакета',
+                     512, 'ml.dbscan.batch_size'),
                 ):
                     add_label(advanced_grid, advanced_row, caption, help_key)
                     variable = tk.StringVar(value=str(cfg.get(key, default)))
@@ -8708,11 +8699,21 @@ class App(TkinterApp):
                     eps=float(config.get("eps", 0.8)),
                     min_samples=int(config.get("min_samples", 5)),
                     dataset_key=dataset_key,
-                    dbscan_tile_size=int(config.get("dbscan_tile_size", 256)),
-                    dbscan_tile_overlap=int(config.get("dbscan_tile_overlap", 32)),
-                    dbscan_max_points_per_tile=int(config.get("dbscan_max_points_per_tile", 30000)),
+                    dbscan_device="gpu" if getattr(getattr(getattr(self, "image_processor", None), "backend", None), "use_gpu", False) else "cpu",
+                    dbscan_batch_size=int(config.get("dbscan_batch_size", 512)),
                     cancel_callback=self.progress_manager.run_control.check,
                 )
+                task.ml_result = result
+                if algorithm == 'dbscan':
+                    self.progress_manager.log_info(
+                        f"ML {index}/{len(operations)} · DBSCAN: "
+                        f"backend={result.get('dbscan_backend')}; "
+                        f"кластеров={result['metrics']['cluster_count']}; "
+                        f"шум={result['metrics']['noise_count']}; "
+                        f"время={result['timings']['clustering']:.3f} c")
+                    if result.get('dbscan_fallback_reason'):
+                        self.progress_manager.log_info(
+                            f"DBSCAN: резервный переход GPU → CPU: {result['dbscan_fallback_reason']}")
                 measured_seconds.append(time.time() - started)
                 completion = journal.completion_details(result)
                 journal.save(identity, 'saving', **completion)
@@ -8776,13 +8777,6 @@ class App(TkinterApp):
         if not result:
             return ""
         metrics = result.get("metrics", {})
-        if result.get("tiled"):
-            stats = result.get("dbscan_statistics") or {}
-            return (
-                f"DBSCAN: A>0 — {stats.get('anomaly_nonzero', 0)}; "
-                f"устойчивые — {stats.get('anomaly_stable', 0)}; "
-                f"тайлов — {stats.get('tiles', 0)}"
-            )
         return (
             f"Кластеров: {metrics.get('cluster_count', 0)}; "
             f"шумовых точек: {metrics.get('noise_count', 0)}"

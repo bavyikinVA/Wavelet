@@ -61,3 +61,21 @@ def install_callback_cleanup(widget):
 
     # 'all' also sees Toplevel descendants; a root binding alone does not.
     root.bind_all('<Destroy>', destroyed, add='+')
+
+
+def active_widget_root(widget):
+    """Return the live Tk root, or None once application shutdown starts.
+
+    A Tk callback may still be queued while WM_DELETE_WINDOW tears down the
+    interpreter. Checking only winfo_exists is insufficient during that gap.
+    This helper deliberately doesn't create a new default Tk interpreter.
+    """
+    try:
+        root = widget.winfo_toplevel()
+        if (not widget.winfo_exists() or not root.winfo_exists()
+                or getattr(root, '_waiting_to_close', False)
+                or getattr(root, '_is_destroyed', False)):
+            return None
+        return root
+    except (tk.TclError, RuntimeError):
+        return None

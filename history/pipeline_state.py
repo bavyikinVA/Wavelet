@@ -82,6 +82,8 @@ def load_stage_state(task) -> dict:
         return {"schema_version": STATE_SCHEMA_VERSION, "stages": {}}
     if not isinstance(payload, dict):
         return {"schema_version": STATE_SCHEMA_VERSION, "stages": {}}
+    if payload.get("schema_version") != STATE_SCHEMA_VERSION:
+        return {"schema_version": STATE_SCHEMA_VERSION, "stages": {}}
     if not isinstance(payload.get("stages", {}), dict):
         return {"schema_version": STATE_SCHEMA_VERSION, "stages": {}}
     payload.setdefault("stages", {})
@@ -103,6 +105,18 @@ def mark_stage_ready(task, stage: str) -> None:
     state = load_stage_state(task)
     signatures = stage_signatures(task)
     state.setdefault("stages", {})[stage] = {"signature": signatures[stage], "status": "ready"}
+    save_stage_state(task, state)
+
+
+def invalidate_stages(task, stages) -> None:
+    """Commit invalidation before overwriting any artifact of an old generation."""
+    invalid = set(stages)
+    for stage in STAGE_ORDER:
+        if any(parent in invalid for parent in STAGE_DEPENDENCIES[stage]):
+            invalid.add(stage)
+    state = load_stage_state(task)
+    for stage in invalid:
+        state['stages'].pop(stage, None)
     save_stage_state(task, state)
 
 
@@ -142,15 +156,9 @@ def stage_statuses(task) -> Dict[str, str]:
                 statuses[stage] = "stale"
             else:
                 statuses[stage] = "ready" if entry.get("status") == "ready" and _legacy_ready(task, stage) else "missing"
-        elif stage not in {"knn", "statistics"} and _legacy_ready(task, stage):
-            # Legacy artifacts are safe only when the task's remembered CWT
-            # signature still matches the current scientific inputs.
-            last_cwt = getattr(task, "last_completed_cwt_signature", None)
-            if last_cwt and last_cwt != signatures["wavelet"]:
-                statuses[stage] = "stale"
-            else:
-                statuses[stage] = "ready"
         else:
+            # Existence is not provenance. Missing/corrupt/legacy metadata
+            # cannot establish which scientific parameters produced a file.
             statuses[stage] = "missing"
 
     # Dependency invalidation: a downstream stage cannot remain ready when an

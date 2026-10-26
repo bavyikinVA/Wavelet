@@ -322,8 +322,8 @@ def process_extremes_with_knn(extreme_dict, scale_folder_path, k, original_image
 
         # The canonical NPZ is now the owner of the complete KNN arrays.
         # Keep only a tiny descriptor in the task so completed experiments do
-        # not pin all point clouds and N*k matrices in process RAM.  If export
-        # failed, retain the in-memory payload as a safety fallback.
+        # not pin all point clouds and N*k matrices in process RAM. When NPZ
+        # export is disabled, retain the payload for the feature checkpoint.
         if npz_path:
             results[extreme_type] = make_disk_knn_payload(npz_path, len(points))
             _profile_stat(profiling_stats, "resident_bytes", 0)
@@ -474,7 +474,9 @@ def save_knn_npz(filename, points, neighbors_dict, scale, channel, extreme_type,
             else:
                 image_shape = np.asarray(original_image.shape[:2], dtype=np.int32)
 
-            np.savez(
+            from history.atomic_io import atomic_savez
+
+            atomic_savez(
                 filename,
                 format_version=np.array([1], dtype=np.int16),
                 points=points_arr,
@@ -503,7 +505,7 @@ def save_knn_npz(filename, points, neighbors_dict, scale, channel, extreme_type,
     except Exception as e:
         if log_callback:
             log_callback(f"Ошибка сохранения KNN NPZ: {e}")
-        return None
+        raise
 
 
 def draw_knn_graph(points, neighbors_dict, scale, channel, extreme_type, filename, k, original_image,

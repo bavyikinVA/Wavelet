@@ -1,6 +1,7 @@
 """Numerical result discovery and lossless coefficient storage for the viewer."""
 from pathlib import Path
 import re
+import json
 import hashlib
 from functools import lru_cache
 from decimal import Decimal
@@ -15,7 +16,9 @@ def save_coefficient_preview(folder, name, coefficients):
     # discard narrow extrema and phase detail before the viewer even loaded it.
     array = np.asarray(coefficients)
     path = directory / (name + '.npy')
-    np.save(path, array, allow_pickle=False)
+    from history.atomic_io import atomic_binary_writer
+    with atomic_binary_writer(path) as stream:
+        np.save(stream, array, allow_pickle=False)
     return path
 
 
@@ -201,6 +204,23 @@ def discover_results(folder):
         item['result_scope'] = 'ml' if ml_index >= 0 else 'pipeline'
         item['ml_run'] = '/'.join(parts[ml_index + 1:-1]) if ml_index >= 0 else None
         candidates.append(item)
+    journals = {}
+    for item in candidates:
+        task_folder = item['task_folder']
+        if task_folder not in journals:
+            lookup = {}
+            try:
+                entries = json.loads((Path(task_folder) / '.ml_operations.json').read_text(encoding='utf-8'))
+                for entry in entries.values():
+                    params = entry.get('inputs', {}).get('parameters', entry.get('configuration', {}))
+                    for key in ('table_path', 'summary_path', 'feature_plot_path'):
+                        path = entry.get('result', {}).get(key)
+                        if path:
+                            lookup[str(Path(path).resolve())] = params
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+            journals[task_folder] = lookup
+        item['ml_parameters'] = journals[task_folder].get(str(Path(item['path']).resolve()), {})
     return sorted(_collapse_export_duplicates(candidates), key=lambda item: (
         item['task_id'], item['category'] != 'Источник', item['category'],
         Path(item['path']).suffix.lower() not in {'.png', '.npy'}, item['label']))

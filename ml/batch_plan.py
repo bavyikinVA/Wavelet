@@ -52,10 +52,9 @@ def default_configuration(algorithm='kmeans'):
     return {
         'algorithm': algorithm, 'channels': '*', 'scales': '*', 'directions': '*',
         'point_types': '*', 'k_values': '5', 'eps_values': '0.8',
-        'min_samples_values': '5', 'feature_set': 'knn', 'standardize': True,
+        'min_samples_values': '5', 'feature_set': 'knn_raw', 'standardize': True,
         'random_state': 42, 'point_filter': 'all',
-        'dbscan_tile_size': 256, 'dbscan_tile_overlap': 32,
-        'dbscan_max_points_per_tile': 30000,
+        'dbscan_batch_size': 512,
     }
 
 
@@ -65,6 +64,9 @@ def expand_ml_plan(plan, datasets, max_operations=5000):
         cfg = deepcopy(raw)
         cfg.pop('rerun_selected', None)
         cfg.pop('_execution_mode', None)
+        for deprecated in ('dbscan_tile_size', 'dbscan_tile_overlap', 'dbscan_max_points_per_tile'):
+            cfg.pop(deprecated, None)
+        cfg['feature_set'] = 'knn_raw'
         algorithm = str(cfg.get('algorithm', 'kmeans')).lower()
         if algorithm not in {'kmeans', 'dbscan'}:
             raise ValueError(f'ML-карточка {index+1}: неизвестный алгоритм {algorithm}')
@@ -89,7 +91,7 @@ def expand_ml_plan(plan, datasets, max_operations=5000):
             eps_values = _numbers(cfg.get('eps_values', cfg.get('eps', 0.8)), float,
                                   'eps', minimum=0, strict=True)
             min_values = _numbers(cfg.get('min_samples_values', cfg.get('min_samples', 5)),
-                                  int, 'min_samples', minimum=2)
+                                  int, 'min_samples', minimum=1)
             variants = [(None, eps, mins) for eps, mins in product(eps_values, min_values)]
         for opt in available:
             for k, eps, mins in variants:

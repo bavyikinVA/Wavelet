@@ -1,3 +1,10 @@
+"""Clustering of point features produced by the in-memory KNN stage.
+
+The module has no GUI dependencies.  Long-running operations expose optional
+progress and cancellation callbacks so a GUI can stay responsive and show the
+real stage currently being executed.
+"""
+
 from __future__ import annotations
 
 import csv
@@ -23,6 +30,7 @@ from compute.knn.result_format import (
 
 from .errors import ClusteringError
 from .validation import validate_ml_parameters
+from .dbscan_global import global_dbscan
 
 
 POINT_TYPE_LABELS = {
@@ -127,118 +135,125 @@ def select_knn_dataset(knn_results: dict, dataset_key):
         raise ClusteringError("Выбранный KNN-набор больше недоступен")
     return selected
 
+# Only the approved KNN Info schema is used for clustering.  Metadata IDs
+# identify relationships; they are not geometric distances and must not be
+# supplied as continuous numeric features.
+KNN_FEATURE_SCHEMA_VERSION = "knn_info_raw_v1"
+
+
 def extract_knn_features(
     knn_results: dict,
     point_filter: str = "all",
-    feature_set: str = "knn",
+    feature_set: str = "knn_raw",
     *,
     progress_callback: ProgressCallback | None = None,
     cancel_callback: CancelCallback | None = None,
 ) -> FeatureTable:
-    """Build one feature vector per point from one or more normalized KNN groups."""
+    """Create one observation per point from raw KNN Info columns.
+
+    KNN Info stores ``point_id, x, y, neighbor_id, distance, angle_deg`` in
+    LONG form (k edges per point).  Clustering needs ONE fixed-width row for
+    each point, therefore its feature vector is
+    ``[x, y, distance_1, angle_deg_1, ..., distance_k, angle_deg_k]``.
+    ``point_id`` and each ``neighbor_id`` remain in the exported records for
+    exact traceability, never as arbitrary numeric ML features.
+
+    The KNN link order and individual angles/distances are left unchanged:
+    no means, standard deviations, trigonometric substitutions or other
+    derived descriptors.  Legacy values of ``feature_set`` are deliberately
+    normalized to the one approved raw representation.
+    """
+    if feature_set not in {"knn_raw", "knn", "coordinates_knn", "coordinates"}:
+        raise ClusteringError("Неизвестный набор признаков KNN")
+
     records = []
+    vectors = []
     selected_types = set(_selected_point_types(point_filter))
-    channel_order = {
-        "red": 0.0, "green": 1.0, "blue": 2.0,
-        "r": 0.0, "g": 1.0, "b": 2.0,
-        "gray": 0.0, "gs1": 0.0, "gs2": 1.0, "gs3": 2.0,
-    }
     groups = [g for g in _iter_knn_groups(knn_results) if g[3] in selected_types]
     total_groups = max(1, len(groups))
+    expected_k = None
+    feature_names = []
 
     for group_index, (direction, channel, scale, point_type, payload) in enumerate(groups, 1):
         _check_cancel(cancel_callback)
         try:
             materialized = materialize_knn_payload(payload)
         except (OSError, KeyError, ValueError) as error:
-            raise ClusteringError(
-                f"Не удалось загрузить KNN-набор для ML: {error}"
-            ) from error
-        points = np.asarray(materialized.get("points", []), dtype=float)
-        neighbors = materialized.get("neighbors", {})
+            raise ClusteringError(f"Не удалось загрузить KNN-набор для ML: {error}") from error
+        points = np.asarray(materialized.get("points", []), dtype=np.float64)
         if points.ndim != 2 or points.shape[1] < 2:
             continue
-
         indices, distances, angles = neighbor_arrays(
-            neighbors, point_count=len(points)
+            materialized.get("neighbors", {}), point_count=len(points)
         )
-        valid_dist = (indices >= 0) & np.isfinite(distances)
-        dist_count = valid_dist.sum(axis=1)
-        dist_sum = np.where(valid_dist, distances, 0.0).sum(axis=1)
-        distance_mean = np.divide(
-            dist_sum, dist_count, out=np.zeros(len(points), dtype=float),
-            where=dist_count > 0,
-        )
-        centered = np.where(
-            valid_dist, distances - distance_mean[:, None], 0.0
-        )
-        distance_std = np.sqrt(np.divide(
-            np.sum(centered * centered, axis=1),
-            dist_count,
-            out=np.zeros(len(points), dtype=float),
-            where=dist_count > 0,
-        ))
-
         if angles is None:
-            mean_sin = np.zeros(len(points), dtype=float)
-            mean_cos = np.zeros(len(points), dtype=float)
-        else:
-            valid_angles = (indices >= 0) & np.isfinite(angles)
-            angle_count = valid_angles.sum(axis=1)
-            radians = np.deg2rad(angles)
-            sin_sum = np.where(valid_angles, np.sin(radians), 0.0).sum(axis=1)
-            cos_sum = np.where(valid_angles, np.cos(radians), 0.0).sum(axis=1)
-            mean_sin = np.divide(
-                sin_sum, angle_count, out=np.zeros(len(points), dtype=float),
-                where=angle_count > 0,
-            )
-            mean_cos = np.divide(
-                cos_sum, angle_count, out=np.zeros(len(points), dtype=float),
-                where=angle_count > 0,
-            )
+            raise ClusteringError("В KNN отсутствуют исходные углы; необходим пересчёт KNN")
+        if indices.shape != distances.shape or angles.shape != indices.shape or indices.shape[0] != len(points):
+            raise ClusteringError("Размеры массивов KNN не совпадают")
+        k = indices.shape[1]
+        if expected_k is None:
+            expected_k = k
+            feature_names = ["x", "y"]
+            for rank in range(1, k + 1):
+                feature_names.extend((f"neighbor_{rank}_distance", f"neighbor_{rank}_angle_deg"))
+        elif k != expected_k:
+            raise ClusteringError("Невозможно объединить наборы KNN с разными значениями k")
 
+        # Invalid neighbor slots may occur when fewer than k points exist.
+        # They are not fabricated into a distance/angle pair.
+        invalid = (indices < 0) | (indices >= len(points))
+        if np.any(invalid):
+            raise ClusteringError("KNN-набор содержит отсутствующих соседей; проверьте k")
+        if not (np.all(np.isfinite(points[:, :2])) and np.all(np.isfinite(distances))
+                and np.all(np.isfinite(angles))):
+            raise ClusteringError("KNN-набор содержит NaN/Inf; анализ остановлен")
+
+        batch = np.empty((len(points), 2 + 2 * k), dtype=np.float64)
+        batch[:, :2] = points[:, :2]
+        batch[:, 2::2] = distances
+        batch[:, 3::2] = angles
+        vectors.append(batch)
         for point_id, point in enumerate(points):
             if point_id % 1000 == 0:
                 _check_cancel(cancel_callback)
-            sin_value = float(mean_sin[point_id])
-            cos_value = float(mean_cos[point_id])
-            records.append({
+            record = {
                 "direction": direction,
                 "channel": str(channel),
-                "channel_index": channel_order.get(str(channel), 0.0),
                 "scale": _safe_number(scale),
                 "point_type": point_type,
                 "point_type_name": POINT_TYPE_LABELS.get(point_type, point_type),
                 "point_id": int(point_id),
-                "x": _safe_number(point[0]),
-                "y": _safe_number(point[1]),
-                "distance_mean": float(distance_mean[point_id]),
-                "distance_std": float(distance_std[point_id]),
-                "angle_sin_mean": sin_value,
-                "angle_cos_mean": cos_value,
-                "angle_concentration": float(np.hypot(sin_value, cos_value)),
-            })
+                "x": float(point[0]),
+                "y": float(point[1]),
+            }
+            for j in range(k):
+                rank = j + 1
+                record[f"neighbor_{rank}_id"] = int(indices[point_id, j])
+                record[f"neighbor_{rank}_distance"] = float(distances[point_id, j])
+                record[f"neighbor_{rank}_angle_deg"] = float(angles[point_id, j])
+            records.append(record)
         _notify(progress_callback, "features", group_index / total_groups,
-                f"Подготовка признаков: {len(records):,} точек")
+                f"Подготовка исходных KNN-данных: {len(records):,} точек")
 
     if len(records) < 3:
         raise ClusteringError("Недостаточно KNN-точек в выбранном наборе")
-
-    if feature_set == "coordinates":
-        feature_names = ["x", "y"]
-    elif feature_set == "knn":
-        feature_names = ["distance_mean", "distance_std", "angle_sin_mean",
-                         "angle_cos_mean", "angle_concentration"]
-    elif feature_set == "coordinates_knn":
-        feature_names = ["x", "y", "distance_mean", "distance_std",
-                         "angle_sin_mean", "angle_cos_mean", "angle_concentration"]
-    else:
-        raise ClusteringError("Неизвестный набор признаков")
-
-    values = np.asarray([[r[name] for name in feature_names] for r in records], dtype=float)
-    if not np.all(np.isfinite(values)):
-        raise ClusteringError("В признаках обнаружены некорректные значения")
+    values = np.concatenate(vectors, axis=0)
     return FeatureTable(values=values, feature_names=feature_names, records=records)
+
+
+def _raw_knn_columns(records):
+    """Columns of the KNN Info source, in original neighbor-rank order."""
+    columns = [("point_id", "Номер точки"), ("x", "X"), ("y", "Y")]
+    if records:
+        rank = 1
+        while f"neighbor_{rank}_id" in records[0]:
+            columns.extend((
+                (f"neighbor_{rank}_id", f"Сосед {rank}: номер"),
+                (f"neighbor_{rank}_distance", f"Сосед {rank}: расстояние"),
+                (f"neighbor_{rank}_angle_deg", f"Сосед {rank}: угол (градусы)"),
+            ))
+            rank += 1
+    return columns
 
 def _quality_metrics(
     values: np.ndarray,
@@ -261,30 +276,30 @@ def _quality_metrics(
     }
     if cluster_count < 2 or len(evaluated_values) <= cluster_count:
         return metrics
-
+    # Avoid quadratic cluster-vs-cluster memory for pathologically many labels.
+    # Silhouette itself compares samples pairwise and is bounded separately.
     sample_size = min(int(silhouette_max_samples), len(evaluated_values))
-    metrics["silhouette"] = float(
-        silhouette_score(
-            evaluated_values,
-            evaluated_labels,
-            sample_size=sample_size if sample_size < len(evaluated_values) else None,
-            random_state=42,
-        )
-    )
-    metrics["silhouette_sample_size"] = sample_size
-    metrics["davies_bouldin"] = float(
-        davies_bouldin_score(evaluated_values, evaluated_labels)
-    )
+    if 2 <= cluster_count < sample_size and sample_size >= 2:
+        try:
+            metrics["silhouette"] = float(silhouette_score(
+                evaluated_values, evaluated_labels,
+                sample_size=sample_size if sample_size < len(evaluated_values) else None,
+                random_state=42))
+            metrics["silhouette_sample_size"] = sample_size
+        except ValueError:
+            # Random subsamples may omit members of rare clusters; report N/A.
+            pass
+    if cluster_count <= 1000:
+        metrics["davies_bouldin"] = float(
+            davies_bouldin_score(evaluated_values, evaluated_labels))
     metrics["calinski_harabasz"] = float(
-        calinski_harabasz_score(evaluated_values, evaluated_labels)
-    )
+        calinski_harabasz_score(evaluated_values, evaluated_labels))
     return metrics
 
 
 def _cluster_colors(labels: np.ndarray):
-    unique = sorted(set(labels.tolist()))
-    cmap = plt.get_cmap("tab20", max(len([x for x in unique if x >= 0]), 1))
-    return ["#777777" if label == -1 else cmap(int(label) % cmap.N) for label in labels]
+    from ml.color_scheme import categorical_ml_rgba
+    return categorical_ml_rgba(labels)
 
 
 def _plot_feature_space(values, labels, algorithm_name, output_path):
@@ -324,132 +339,24 @@ def _plot_on_image(records, labels, image, algorithm_name, output_path):
     plt.close(fig)
 
 
-def _plot_dbscan_noise(records, labels, image, output_path):
-    fig, ax = plt.subplots(figsize=(10, 8), dpi=130)
-    if image is not None:
-        ax.imshow(image)
-    else:
-        ax.set_facecolor("#303030")
-        ax.invert_yaxis()
-    x = np.asarray([record["x"] for record in records])
-    y = np.asarray([record["y"] for record in records])
-    noise = labels == -1
-    if np.any(~noise):
-        ax.scatter(x[~noise], y[~noise], c="#8a8a8a", s=8, alpha=0.25, linewidths=0)
-    if np.any(noise):
-        ax.scatter(x[noise], y[noise], c="#d62728", s=24, alpha=0.9, linewidths=0.15,
-                   edgecolors="#111111", label="Шум / потенциально необычные точки")
-        ax.legend(loc="upper right")
-    ax.set_title("DBSCAN: шумовые точки на изображении")
-    ax.set_xlabel("X, пиксели")
-    ax.set_ylabel("Y, пиксели")
-    fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _write_csv(records, labels, output_path, anomaly_score=None):
+def _write_csv(records, labels, output_path):
     columns = [
         ("cluster", "Кластер"), ("channel", "Канал"),
         ("scale", "Масштаб"), ("point_type_name", "Тип точки"),
-        ("point_id", "Номер точки"), ("x", "X"), ("y", "Y"),
-        ("distance_mean", "Среднее расстояние KNN"),
-        ("distance_std", "Разброс расстояний KNN"),
-        ("angle_sin_mean", "Средний синус направления"),
-        ("angle_cos_mean", "Средний косинус направления"),
-        ("angle_concentration", "Согласованность направлений"),
+        ("direction", "Направление"),
+        *_raw_knn_columns(records),
     ]
-    if anomaly_score is not None:
-        columns.append(("anomaly_score", "Аномальность DBSCAN"))
-    fieldnames = [title for _key, title in columns]
     with open(output_path, "w", encoding="utf-8-sig", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer = csv.DictWriter(stream, fieldnames=[title for _, title in columns])
         writer.writeheader()
-        for row_index, (record, label) in enumerate(zip(records, labels)):
+        for record, label in zip(records, labels):
             source = dict(record)
             source["cluster"] = int(label)
-            if anomaly_score is not None:
-                source["anomaly_score"] = float(anomaly_score[row_index])
             writer.writerow({title: source.get(key) for key, title in columns})
 
-
-
-def _write_dbscan_csv(records, anomaly_score, output_path, anomaly_threshold=0.75):
-    """Write a spatial DBSCAN layer without pretending tile-local ids are global clusters."""
-    columns = [
-        ("channel", "Канал"), ("scale", "Масштаб"),
-        ("point_type_name", "Тип точки"), ("direction", "Направление"),
-        ("point_id", "Номер точки"), ("x", "X"), ("y", "Y"),
-        ("distance_mean", "Среднее расстояние KNN"),
-        ("distance_std", "Разброс расстояний KNN"),
-        ("angle_sin_mean", "Средний синус направления"),
-        ("angle_cos_mean", "Средний косинус направления"),
-        ("angle_concentration", "Согласованность направлений"),
-        ("anomaly_score", "Аномальность DBSCAN"),
-        ("dbscan_state", "Состояние DBSCAN"),
-    ]
-    with open(output_path, "w", encoding="utf-8-sig", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=[title for _, title in columns])
-        writer.writeheader()
-        for record, score in zip(records, anomaly_score):
-            source = dict(record)
-            source["anomaly_score"] = float(score)
-            if score >= anomaly_threshold:
-                source["dbscan_state"] = "устойчивая аномалия"
-            elif score > 0:
-                source["dbscan_state"] = "неустойчивая область"
-            else:
-                source["dbscan_state"] = "плотная структура"
-            writer.writerow({title: source.get(key) for key, title in columns})
-
-
-def _dbscan_statistics(anomaly_score, *, point_count, tile_count, eps, min_samples,
-                       anomaly_threshold=0.75):
-    scores = np.asarray(anomaly_score, dtype=float)
-    return {
-        "points": int(point_count),
-        "tiles": int(tile_count),
-        "eps": float(eps),
-        "min_samples": int(min_samples),
-        "anomaly_mean": float(scores.mean()) if len(scores) else 0.0,
-        "anomaly_nonzero": int(np.count_nonzero(scores > 0)),
-        "anomaly_stable": int(np.count_nonzero(scores >= anomaly_threshold)),
-        "anomaly_full": int(np.count_nonzero(scores >= 1.0 - 1e-12)),
-        "anomaly_threshold": float(anomaly_threshold),
-    }
-
-
-def _write_dbscan_statistics(stats, output_path):
-    columns = [
-        ("points", "Всего точек"), ("tiles", "Количество тайлов"),
-        ("eps", "eps"), ("min_samples", "min_samples"),
-        ("anomaly_mean", "Средняя аномальность"),
-        ("anomaly_nonzero", "Точек с аномальностью > 0"),
-        ("anomaly_stable", "Устойчивых аномалий"),
-        ("anomaly_full", "Точек с аномальностью = 1"),
-        ("anomaly_threshold", "Порог устойчивой аномалии"),
-    ]
-    with open(output_path, "w", encoding="utf-8-sig", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=[title for _, title in columns])
-        writer.writeheader()
-        writer.writerow({title: stats[key] for key, title in columns})
-
-
-def _plot_anomaly_feature_space(values, anomaly_score, output_path):
-    reduced = PCA(n_components=2, random_state=42).fit_transform(values)
-    fig, ax = plt.subplots(figsize=(10, 7), dpi=130)
-    scatter = ax.scatter(reduced[:, 0], reduced[:, 1], c=anomaly_score,
-                         cmap="inferno", vmin=0.0, vmax=1.0, s=9, alpha=.72, linewidths=0)
-    fig.colorbar(scatter, ax=ax, label="Аномальность DBSCAN")
-    ax.set_title("DBSCAN: локальная аномальность в пространстве признаков")
-    ax.set_xlabel("PCA 1")
-    ax.set_ylabel("PCA 2")
-    ax.grid(alpha=.18)
-    fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight")
-    plt.close(fig)
 
 def _cluster_summary(records, labels):
+    """Spatial diagnostics, not replacement ML features."""
     summary = []
     for label in sorted(set(labels.tolist())):
         indices = np.flatnonzero(labels == label)
@@ -457,9 +364,6 @@ def _cluster_summary(records, labels):
         summary.append({
             "cluster": int(label),
             "count": int(len(selected)),
-            "distance_mean": float(np.mean([r["distance_mean"] for r in selected])),
-            "distance_std_mean": float(np.mean([r["distance_std"] for r in selected])),
-            "angle_concentration_mean": float(np.mean([r["angle_concentration"] for r in selected])),
             "x_mean": float(np.mean([r["x"] for r in selected])),
             "y_mean": float(np.mean([r["y"] for r in selected])),
         })
@@ -469,9 +373,6 @@ def _cluster_summary(records, labels):
 def _write_cluster_summary(summary, output_path):
     columns = [
         ("cluster", "Кластер"), ("count", "Количество точек"),
-        ("distance_mean", "Среднее KNN-расстояние"),
-        ("distance_std_mean", "Средний разброс KNN-расстояний"),
-        ("angle_concentration_mean", "Средняя согласованность направлений"),
         ("x_mean", "Средний X"), ("y_mean", "Средний Y"),
     ]
     with open(output_path, "w", encoding="utf-8-sig", newline="") as stream:
@@ -503,7 +404,7 @@ def _plot_distribution(records, labels, key, title, xlabel, output_path):
         bottom = np.zeros(len(categories), dtype=float)
         for index, label in enumerate(cluster_labels):
             values = matrix[:, index]
-            ax.bar(x, values, bottom=bottom, label=f"Кластер {label + 1}")
+            ax.bar(x, values, bottom=bottom, label=f"Кластер {label}")
             bottom += values
         ax.set_xticks(x)
         ax.set_xticklabels([f"{value:g}" if isinstance(value, (int, float, np.number)) else str(value)
@@ -518,92 +419,6 @@ def _plot_distribution(records, labels, key, title, xlabel, output_path):
     plt.close(fig)
 
 
-
-def _tiled_dbscan(values, records, eps, min_samples, *, tile_size=256, overlap=32,
-                  max_points_per_tile=30000, progress_callback=None, cancel_callback=None):
-    """Memory-bounded local DBSCAN over adaptive spatial tiles.
-
-    The spatial domain is first split into regular cells and a dense cell is
-    recursively divided until the expanded (overlapped) working set fits the
-    configured point budget.  Thus every source point is analysed; there is no
-    random sampling.  Overlap votes produce a stable anomaly score in [0, 1].
-    """
-    x = np.asarray([r["x"] for r in records], dtype=float)
-    y = np.asarray([r["y"] for r in records], dtype=float)
-    if len(values) == 0:
-        return np.empty(0, dtype=int), np.empty(0, dtype=float), 0
-    tile_size = max(32, int(tile_size))
-    overlap = max(0, min(int(overlap), tile_size // 2))
-    max_points_per_tile = max(1000, int(max_points_per_tile))
-    xmin, xmax = int(np.floor(x.min())), int(np.ceil(x.max())) + 1
-    ymin, ymax = int(np.floor(y.min())), int(np.ceil(y.max())) + 1
-
-    pending = []
-    for y0 in range(ymin, ymax, tile_size):
-        for x0 in range(xmin, xmax, tile_size):
-            pending.append((x0, min(x0 + tile_size, xmax), y0, min(y0 + tile_size, ymax)))
-    cells = []
-    while pending:
-        _check_cancel(cancel_callback)
-        x0, x1, y0, y1 = pending.pop()
-        expanded = ((x >= x0-overlap) & (x < x1+overlap) &
-                    (y >= y0-overlap) & (y < y1+overlap))
-        count = int(np.count_nonzero(expanded))
-        width, height = x1-x0, y1-y0
-        if count > max_points_per_tile and max(width, height) > 32:
-            if width >= height and width > 32:
-                mid = (x0+x1)//2
-                pending.extend([(x0, mid, y0, y1), (mid, x1, y0, y1)])
-            elif height > 32:
-                mid = (y0+y1)//2
-                pending.extend([(x0, x1, y0, mid), (x0, x1, mid, y1)])
-            else:
-                cells.append((x0, x1, y0, y1))
-        else:
-            cells.append((x0, x1, y0, y1))
-
-    labels = np.full(len(values), -1, dtype=int)
-    noise_votes = np.zeros(len(values), dtype=np.float32)
-    votes = np.zeros(len(values), dtype=np.int16)
-    cluster_offset = 0
-    total = max(1, len(cells))
-    for tile_no, (x0, x1, y0, y1) in enumerate(cells, 1):
-        _check_cancel(cancel_callback)
-        expanded = ((x >= x0-overlap) & (x < x1+overlap) &
-                    (y >= y0-overlap) & (y < y1+overlap))
-        idx = np.flatnonzero(expanded)
-        if len(idx) == 0:
-            _notify(progress_callback, "clustering", tile_no/total,
-                    f"DBSCAN: тайл {tile_no}/{total} — нет точек")
-            continue
-        if len(idx) > max_points_per_tile * 1.5:
-            raise ClusteringError(
-                f"Слишком плотный DBSCAN-тайл: {len(idx):,} точек. "
-                "Уменьшите размер тайла или перекрытие."
-            )
-        try:
-            local = DBSCAN(eps=float(eps), min_samples=int(min_samples)).fit_predict(values[idx])
-        except MemoryError as error:
-            raise ClusteringError(
-                f"DBSCAN исчерпал память даже на локальном тайле ({len(idx):,} точек). "
-                "Уменьшите размер тайла/перекрытие."
-            ) from error
-        votes[idx] += 1
-        noise_votes[idx] += (local == -1)
-        core = ((x[idx] >= x0) & (x[idx] < x1) & (y[idx] >= y0) & (y[idx] < y1))
-        core_idx = idx[core]
-        core_labels = local[core]
-        positive = core_labels >= 0
-        if np.any(positive):
-            mapped = core_labels.copy()
-            mapped[positive] += cluster_offset
-            labels[core_idx] = mapped
-            cluster_offset = int(mapped[positive].max()) + 1
-        labels[core_idx[~positive]] = -1
-        _notify(progress_callback, "clustering", tile_no/total,
-                f"DBSCAN: тайл {tile_no}/{total} · {len(idx):,} точек")
-    anomaly = np.divide(noise_votes, np.maximum(votes, 1), dtype=np.float32)
-    return labels, anomaly, total
 
 def _dataset_slug(records):
     if not records:
@@ -622,7 +437,7 @@ def run_clustering(
     output_root: str,
     image=None,
     point_filter: str = "all",
-    feature_set: str = "knn",
+    feature_set: str = "knn_raw",
     standardize: bool = True,
     n_clusters: int = 5,
     random_state: int = 42,
@@ -635,24 +450,22 @@ def run_clustering(
     silhouette_max_samples: int = 5000,
     minibatch_threshold: int = 50000,
     minibatch_size: int = 4096,
-    dbscan_tile_size: int = 256,
-    dbscan_tile_overlap: int = 32,
-    dbscan_max_points_per_tile: int = 30000,
+    dbscan_device: str = "cpu",
+    dbscan_batch_size: int = 512,
+    dbscan_small_threshold: int = 2500,
 ) -> dict:
     """Cluster one selected KNN dataset with bounded-memory large-data paths."""
     parameters = validate_ml_parameters(dict(
         algorithm=algorithm, n_clusters=n_clusters, random_state=random_state,
-        eps=eps, min_samples=min_samples, dbscan_tile_size=dbscan_tile_size,
-        dbscan_tile_overlap=dbscan_tile_overlap,
-        dbscan_max_points_per_tile=dbscan_max_points_per_tile))
+        eps=eps, min_samples=min_samples, dbscan_batch_size=dbscan_batch_size))
     algorithm = parameters['algorithm']
-    n_clusters = parameters['n_clusters']
-    random_state = parameters['random_state']
-    eps = parameters['eps']
-    min_samples = parameters['min_samples']
-    dbscan_tile_size = parameters['dbscan_tile_size']
-    dbscan_tile_overlap = parameters['dbscan_tile_overlap']
-    dbscan_max_points_per_tile = parameters['dbscan_max_points_per_tile']
+    if algorithm == 'kmeans':
+        n_clusters = parameters['n_clusters']
+        random_state = parameters['random_state']
+    else:
+        eps = parameters['eps']
+        min_samples = parameters['min_samples']
+        dbscan_batch_size = parameters['dbscan_batch_size']
     timings = {}
     def timed(name, fn):
         started = time.perf_counter()
@@ -677,10 +490,12 @@ def run_clustering(
     _notify(progress_callback, "scaling", 1.0, "Признаки подготовлены")
     _check_cancel(cancel_callback)
 
-    anomaly_score = None
-    tiled = False
+    dbscan_backend = None
+    dbscan_fallback_reason = None
     model_kind = algorithm
     if algorithm == "kmeans":
+        if n_clusters < 2 or n_clusters >= point_count:
+            raise ClusteringError("Для K-means число кластеров должно быть от 2 до числа точек минус 1")
         if point_count >= int(minibatch_threshold):
             model = MiniBatchKMeans(n_clusters=int(n_clusters), random_state=int(random_state),
                                     batch_size=int(minibatch_size), n_init="auto")
@@ -693,37 +508,24 @@ def run_clustering(
         labels = timed("clustering", lambda: model.fit_predict(model_values))
         _notify(progress_callback, "clustering", 1.0, f"{algorithm_name}: кластеризация завершена")
     elif algorithm == "dbscan":
-        algorithm_name = "DBSCAN (локальный сеточный)"
-        tiled = True
+        if eps <= 0:
+            raise ClusteringError("Радиус DBSCAN должен быть больше нуля")
+        if min_samples < 1:
+            raise ClusteringError("Минимум точек DBSCAN должен быть не меньше 1")
+        algorithm_name = "DBSCAN (глобальный)"
         _notify(progress_callback, "clustering", 0.0,
-                f"DBSCAN: сеточная обработка {point_count:,} точек…")
-        def execute():
-            return _tiled_dbscan(model_values, table.records, eps, min_samples,
-                                 tile_size=dbscan_tile_size, overlap=dbscan_tile_overlap,
-                                 max_points_per_tile=dbscan_max_points_per_tile,
-                                 progress_callback=progress_callback, cancel_callback=cancel_callback)
-        labels, anomaly_score, tile_count = timed("clustering", execute)
-        _notify(progress_callback, "clustering", 1.0,
-                f"DBSCAN: обработано тайлов: {tile_count}")
+                f"DBSCAN: единый набор из {point_count:,} точек ({dbscan_device.upper()})…")
+        labels, dbscan_backend, dbscan_fallback_reason = timed("clustering", lambda: global_dbscan(
+            model_values, eps, min_samples, device=dbscan_device,
+            batch_size=dbscan_batch_size, small_threshold=dbscan_small_threshold,
+            progress_callback=progress_callback, cancel_callback=cancel_callback))
     else:
         raise ClusteringError("Неизвестный алгоритм кластеризации")
 
     _check_cancel(cancel_callback)
     _notify(progress_callback, "metrics", 0.0, "Расчёт метрик качества…")
-    if tiled:
-        # Local tile ids are deliberately not global clusters; cluster-shape
-        # metrics across tiles would be misleading.
-        metrics = {
-            "cluster_count": int(len(set(labels[labels >= 0].tolist()))),
-            "noise_count": int(np.sum(labels == -1)),
-            "silhouette": None, "silhouette_sample_size": 0,
-            "davies_bouldin": None, "calinski_harabasz": None,
-            "anomaly_mean": float(np.mean(anomaly_score)) if anomaly_score is not None else None,
-        }
-        timings["quality_metrics"] = 0.0
-    else:
-        metrics = timed("quality_metrics", lambda: _quality_metrics(
-            model_values, labels, silhouette_max_samples=silhouette_max_samples))
+    metrics = timed("quality_metrics", lambda: _quality_metrics(
+        model_values, labels, silhouette_max_samples=silhouette_max_samples))
     _notify(progress_callback, "metrics", 1.0, "Метрики рассчитаны")
 
     timestamp = dated_folder_name(datetime.now())
@@ -738,53 +540,26 @@ def run_clustering(
     else:
         output_dir = os.path.join(output_root, "ml", slug, timestamp)
     os.makedirs(output_dir, exist_ok=True)
-    if tiled:
-        base = f"ml_dbscan_{slug}"
-        summary_path = os.path.join(
-            output_dir, f"ml_dbscan_summary_{slug}.csv"
-        )
-        feature_plot_path = os.path.join(
-            output_dir, f"ml_dbscan_features_{slug}.png"
-        )
-    else:
-        base = f"ml_kmeans_{slug}"
-        summary_path = os.path.join(
-            output_dir, f"ml_kmeans_summary_{slug}.csv"
-        )
-        feature_plot_path = os.path.join(
-            output_dir, f"ml_kmeans_features_{slug}.png"
-        )
+    prefix = "ml_dbscan" if algorithm == "dbscan" else "ml_kmeans"
+    base = f"{prefix}_{slug}"
+    summary_path = os.path.join(output_dir, f"{prefix}_summary_{slug}.csv")
+    feature_plot_path = os.path.join(output_dir, f"{prefix}_features_{slug}.png")
     table_path = os.path.join(output_dir, base + ".csv")
 
     _notify(progress_callback, "saving", 0.0, "Сохранение ML-слоя…")
     save_started = time.perf_counter()
-    if tiled:
-        _write_dbscan_csv(table.records, anomaly_score, table_path)
-        dbscan_stats = _dbscan_statistics(
-            anomaly_score, point_count=point_count, tile_count=tile_count,
-            eps=eps, min_samples=min_samples)
-        _write_dbscan_statistics(dbscan_stats, summary_path)
-        summary = []
-    else:
-        _write_csv(table.records, labels, table_path)
-        summary = _cluster_summary(table.records, labels)
-        _write_cluster_summary(summary, summary_path)
-        dbscan_stats = None
+    _write_csv(table.records, labels, table_path)
+    summary = _cluster_summary(table.records, labels)
+    _write_cluster_summary(summary, summary_path)
     # Keep a compact feature-space diagnostic. Spatial overlays are rendered
     # natively by the Results viewer from the CSV layer.
     _notify(progress_callback, "saving", 0.55, "Построение пространства признаков…")
     if point_count <= 100000:
-        if tiled:
-            _plot_anomaly_feature_space(model_values, anomaly_score, feature_plot_path)
-        else:
-            _plot_feature_space(model_values, labels, algorithm_name, feature_plot_path)
+        _plot_feature_space(model_values, labels, algorithm_name, feature_plot_path)
     else:
         rng = np.random.default_rng(random_state)
         idx = np.sort(rng.choice(point_count, size=100000, replace=False))
-        if tiled:
-            _plot_anomaly_feature_space(model_values[idx], anomaly_score[idx], feature_plot_path)
-        else:
-            _plot_feature_space(model_values[idx], labels[idx], algorithm_name, feature_plot_path)
+        _plot_feature_space(model_values[idx], labels[idx], algorithm_name, feature_plot_path)
     timings["saving_and_visualization"] = time.perf_counter() - save_started
     _notify(progress_callback, "saving", 1.0, "ML-слой сохранён; откройте его в «Результатах»")
 
@@ -794,16 +569,14 @@ def run_clustering(
     return {
         "algorithm": model_kind, "algorithm_name": algorithm_name,
         "labels": labels, "records": table.records, "feature_names": table.feature_names,
+        "feature_schema_version": KNN_FEATURE_SCHEMA_VERSION,
         "point_count": point_count, "metrics": metrics, "counts": counts,
         "cluster_summary": summary, "timings": timings, "output_dir": output_dir,
         "table_path": table_path, "summary_path": summary_path,
         "feature_plot_path": feature_plot_path,
         "image_plot_path": None, "scale_plot_path": None, "channel_plot_path": None,
-        "noise_plot_path": None, "anomaly_score": anomaly_score,
-        "dbscan_statistics": dbscan_stats,
+        "noise_plot_path": None, "dbscan_backend": dbscan_backend,
+        "dbscan_fallback_reason": dbscan_fallback_reason,
         "dataset": {k: dataset.get(k) for k in ("direction", "channel", "scale", "point_type", "point_type_name")},
-        "tiled": tiled,
-        "dbscan_tile_size": int(dbscan_tile_size) if tiled else None,
-        "dbscan_tile_overlap": int(dbscan_tile_overlap) if tiled else None,
-        "dbscan_max_points_per_tile": int(dbscan_max_points_per_tile) if tiled else None,
+        "dbscan_batch_size": int(dbscan_batch_size) if algorithm == "dbscan" else None,
     }

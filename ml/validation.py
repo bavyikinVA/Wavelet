@@ -39,12 +39,8 @@ def validate_ml_parameters(config, point_count=None):
         result['random_state'] = seed
     else:
         result['eps'] = _number(config.get('eps', .8), 'eps', 0, positive=True)
-        result['min_samples'] = _number(config.get('min_samples', 5), 'min_samples', 2, integer=True)
-        size = _number(config.get('dbscan_tile_size', 256), 'dbscan_tile_size', 32, integer=True)
-        overlap = _number(config.get('dbscan_tile_overlap', 32), 'dbscan_tile_overlap', 0, integer=True)
-        if overlap > size // 2:
-            raise ClusteringError('dbscan_tile_overlap: должно быть не больше половины размера тайла')
-        result.update(dbscan_tile_size=size, dbscan_tile_overlap=overlap,
-            dbscan_max_points_per_tile=_number(config.get('dbscan_max_points_per_tile', 30000),
-                'dbscan_max_points_per_tile', 1000, integer=True))
+        result['min_samples'] = _number(config.get('min_samples', 5), 'min_samples', 1, integer=True)
+        result['dbscan_batch_size'] = _number(config.get('dbscan_batch_size', 512),
+            'dbscan_batch_size', 1, integer=True)
+
     return result

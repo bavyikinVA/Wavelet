@@ -44,9 +44,9 @@ class OperationJournal:
     def identity(self, config, selected):
         cfg = validate_ml_parameters(config)
         fields = ['algorithm', 'dataset_key', 'point_filter', 'feature_set', 'standardize', 'random_state']
-        defaults = dict(point_filter='all', feature_set='knn', standardize=True, random_state=42)
+        defaults = dict(point_filter='all', feature_set='knn_raw', standardize=True, random_state=42)
         fields += (['n_clusters'] if cfg['algorithm'] == 'kmeans' else
-                   ['eps', 'min_samples', 'dbscan_tile_size', 'dbscan_tile_overlap', 'dbscan_max_points_per_tile'])
+                   ['eps', 'min_samples'])
         parameters = {key: cfg.get(key, defaults.get(key)) for key in fields}
         source_key = tuple(config['dataset_key'])
         if source_key not in self.sources:
@@ -113,7 +113,7 @@ class OperationJournal:
         artifacts = {field: file_digest(result[field], self.check)
                      for field in ('table_path', 'summary_path', 'feature_plot_path')}
         fields = ('algorithm', 'algorithm_name', 'point_count', 'metrics', 'output_dir',
-                  'table_path', 'summary_path', 'feature_plot_path', 'dbscan_statistics', 'dataset', 'tiled')
+                  'table_path', 'summary_path', 'feature_plot_path', 'dbscan_backend', 'dbscan_fallback_reason', 'dataset')
         compact = {field: result[field] for field in fields if field in result}
         return dict(result=compact, artifacts=artifacts)
 

@@ -6,6 +6,7 @@ from history.array_cache import byte_cache
 from pathlib import Path
 import numpy as np
 from PIL import Image
+from ml.color_scheme import class_name
 
 
 
@@ -167,13 +168,17 @@ def _read(filename, modified, size, category, shape):
         if rows and ('X' in rows[0] or 'x' in rows[0]):
             x, y = ('X', 'Y') if 'X' in rows[0] else ('x', 'y')
             points = np.array([[float(r[x]), float(r[y])] for r in rows])
-            continuous = 'Аномальность DBSCAN' in rows[0]
-            colors = np.array([float(r.get('Аномальность DBSCAN', r.get('Кластер', 0))) for r in rows])
+            continuous = False
+            colors = np.array([int(r.get('Кластер', 0)) for r in rows], dtype=np.int32) if 'Кластер' in rows[0] else np.zeros(len(rows), dtype=np.int32)
+            class_names = {int(value): class_name(value) for value in np.unique(colors)}
             edges = []
             if category == 'KNN' and 'point_id' in rows[0]:
                 coordinates = {r['point_id']: p for r, p in zip(rows, points)}
                 edges = [[coordinates[r['point_id']], coordinates[r['neighbor_id']]] for r in rows if r['neighbor_id'] in coordinates]
-            return dict(kind='points', points=points, colors=colors, edges=edges, continuous=continuous,
+            labels = np.asarray(colors, dtype=np.int64) if 'Кластер' in rows[0] else None
+            return dict(kind='points', points=points, colors=colors, class_names=class_names,
+                        class_labels=labels, class_kind='clusters' if labels is not None else None,
+                        edges=edges, continuous=continuous,
                         shape=shape or (int(points[:, 1].max())+1, int(points[:, 0].max())+1), spatial=shape is not None)
         if rows and list(rows[0])[0] == 'row' and category == 'Синхронизация':
             return _map(np.array([[float(v) for k, v in r.items() if k != 'row'] for r in rows]), spatial=False)

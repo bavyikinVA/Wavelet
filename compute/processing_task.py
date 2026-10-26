@@ -238,9 +238,7 @@ class ProcessingTask:
         self.ml_random_state = 42
         self.ml_eps = 0.8
         self.ml_min_samples = 5
-        self.ml_dbscan_tile_size = 256
-        self.ml_dbscan_tile_overlap = 32
-        self.ml_dbscan_max_points_per_tile = 30000
+        self.ml_dbscan_batch_size = 512
         self.ml_result = None
         # Independent ML configurations scheduled after KNN.
         self.ml_plan = []
@@ -492,7 +490,7 @@ class ProcessingTask:
             "row_sync_stride", "row_sync_tolerance", "row_sync_metrics",
             "reuse_existing_results", "k_neighbors", "ml_algorithm", "ml_point_filter", "ml_feature_set",
             "ml_standardize", "ml_n_clusters", "ml_random_state", "ml_eps",
-            "ml_min_samples", "ml_dataset_key", "ml_plan", "ml_dbscan_tile_size", "ml_dbscan_tile_overlap", "ml_dbscan_max_points_per_tile", "save_source_channels", "save_centering_means",
+            "ml_min_samples", "ml_dataset_key", "ml_plan", "ml_dbscan_batch_size", "save_source_channels", "save_centering_means",
         )
         snapshot = {name: getattr(self, name) for name in fields}
         snapshot["scales"] = np.asarray(self.scales).tolist()

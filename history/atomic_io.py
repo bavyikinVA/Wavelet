@@ -26,3 +26,21 @@ def atomic_binary_writer(path, *, cancel_check=None):
 def atomic_write_text(path, text):
     with atomic_binary_writer(path) as stream:
         stream.write(text.encode('utf-8'))
+
+
+def atomic_savez(path, **arrays):
+    import numpy as np
+    with atomic_binary_writer(path) as stream:
+        np.savez(stream, **arrays)
+
+
+def atomic_savez_compressed(path, **arrays):
+    import numpy as np
+    with atomic_binary_writer(path) as stream:
+        np.savez_compressed(stream, **arrays)
+
+
+def atomic_savetxt(path, values, **options):
+    import numpy as np
+    with atomic_binary_writer(path) as stream:
+        np.savetxt(stream, values, **options)

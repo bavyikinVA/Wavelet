@@ -72,70 +72,87 @@ class _ScrollableDropdown:
         else:
             search = None
 
-        frame = ctk.CTkScrollableFrame(container, fg_color='transparent',
-                                       corner_radius=0,
-                                       scrollbar_button_color='#555C66',
-                                       scrollbar_button_hover_color='#778392')
-        frame.pack(fill='both', expand=True, padx=(5, 3), pady=(5 if search is None else 2, 6))
-        self._popup_list = frame
+        frame = tk.Frame(container, bg=_BG)
+        frame.pack(fill='both', expand=True, padx=6, pady=6)
+        canvas = tk.Canvas(frame, bg=_BG, highlightthickness=0, takefocus=True)
+        scrollbar = ctk.CTkScrollbar(frame, command=canvas.yview)
+        scrollbar.pack(side='right', fill='y')
+        canvas.pack(side='left', fill='both', expand=True)
+        self._popup_list = canvas
+        row_height = 54 if wide else 35
+        matching = []
+        active = 0
 
         def choose(value):
             self._close_popup()
             if self.winfo_exists():
                 self._dropdown_callback(value)
-            # The popup and its binding commands no longer exist. Stop this
-            # click before Tk dispatches it to the former Toplevel bindtag.
             return 'break'
 
-        def populate(*_):
+        def paint(*_):
             if self._popup is not popup:
                 return
-            for child in frame.winfo_children():
-                child.destroy()
+            canvas.delete('all')
+            width = max(100, canvas.winfo_width())
+            first = max(0, int(canvas.canvasy(0) // row_height))
+            last = min(len(matching), first + max(1, canvas.winfo_height() // row_height) + 2)
+            if not matching:
+                canvas.create_text(12, 22, text='Ничего не найдено', fill=_MUTED, anchor='w')
+            for index in range(first, last):
+                value = matching[index]
+                y = index * row_height
+                canvas.create_rectangle(2, y+1, width-2, y+row_height-2,
+                    fill=_ACTIVE if index == active else _ROW, outline='')
+                title, subtitle = _split_result(str(value)) if wide else (str(value), '')
+                canvas.create_text(12, y+16, text=title, fill=_TEXT, anchor='w', font=('Segoe UI', 10))
+                if wide:
+                    canvas.create_text(12, y+36, text=subtitle, fill=_MUTED, anchor='w', font=('Segoe UI', 9))
+
+        def scrolled(first, last):
+            scrollbar.set(first, last)
+            paint()
+        canvas.configure(yscrollcommand=scrolled)
+        canvas.bind('<Configure>', paint)
+
+        def populate(*_):
+            nonlocal matching, active
             term = search_var.get().casefold().strip()
             matching = [value for value in values if term in str(value).casefold()]
-            if not matching:
-                ctk.CTkLabel(frame, text='Ничего не найдено', text_color=_MUTED,
-                             height=44).pack(fill='x')
-                return
-            current = self.get()
-            for value in matching:
-                selected = value == current
-                row = ctk.CTkFrame(frame, fg_color=_ACTIVE if selected else 'transparent',
-                                   corner_radius=7, height=50 if wide else 33)
-                row.pack(fill='x', padx=3, pady=2)
-                row.pack_propagate(False)
-                inner = ctk.CTkFrame(row, fg_color='transparent')
-                inner.pack(fill='both', expand=True, padx=10, pady=5 if wide else 1)
-                if wide:
-                    title, subtitle = _split_result(str(value))
-                    label = ctk.CTkLabel(inner, text=title, text_color=_TEXT,
-                                         anchor='w', height=19)
-                    label.pack(fill='x')
-                    detail = ctk.CTkLabel(inner, text=subtitle or ' ', text_color=_MUTED,
-                                          font=ctk.CTkFont(size=11), anchor='w', height=17)
-                    detail.pack(fill='x')
-                    targets = (row, inner, label, detail)
-                else:
-                    label = ctk.CTkLabel(inner, text=str(value), text_color=_TEXT,
-                                         anchor='w', height=28)
-                    label.pack(fill='x')
-                    targets = (row, inner, label)
-                if selected:
-                    ctk.CTkLabel(inner, text='✓', text_color='#83C5FF',
-                                 width=19).place(relx=1.0, rely=0.5, anchor='e')
-                for widget in targets:
-                    widget.bind('<Button-1>', lambda event, v=value: choose(v), add='+')
-                    widget.bind('<Enter>', lambda event, r=row, s=selected: r.configure(
-                        fg_color=_ACTIVE if s else _HOVER), add='+')
-                    widget.bind('<Leave>', lambda event, r=row, s=selected: r.configure(
-                        fg_color=_ACTIVE if s else 'transparent'), add='+')
-            # Newly populated rows must also catch the wheel when a search
-            # rebuilds the list.  Otherwise only dragging the scrollbar works.
-            from utils.mousewheel import bind_popup_mousewheel
-            bind_popup_mousewheel(popup, frame)
+            active = matching.index(self.get()) if self.get() in matching else 0
+            canvas.configure(scrollregion=(0, 0, 1, max(1, len(matching))*row_height))
+            canvas.yview_moveto(active / max(1, len(matching)))
+            paint()
 
+        def click(event):
+            index = int(canvas.canvasy(event.y) // row_height)
+            if 0 <= index < len(matching):
+                return choose(matching[index])
+            return 'break'
+
+        def wheel(event):
+            canvas.yview_scroll(-int(event.delta / 120) or (-1 if event.delta > 0 else 1), 'units')
+            return 'break'
+
+        def navigate(event):
+            nonlocal active
+            if event.keysym == 'Return':
+                return choose(matching[active]) if matching else 'break'
+            active = max(0, min(len(matching)-1,
+                0 if event.keysym == 'Home' else len(matching)-1 if event.keysym == 'End'
+                else active + (-1 if event.keysym == 'Up' else 1)))
+            top = canvas.canvasy(0)
+            if active*row_height < top or (active+1)*row_height > top+canvas.winfo_height():
+                canvas.yview_moveto(active / max(1, len(matching)))
+            paint()
+            return 'break'
+
+        canvas.configure(yscrollincrement=row_height)
+        canvas.bind('<Button-1>', click)
+        popup.bind('<MouseWheel>', wheel)
+        for key in ('Up', 'Down', 'Home', 'End', 'Return'):
+            popup.bind('<'+key+'>', navigate)
         search_var.trace_add('write', populate)
+        self._popup_search = search_var
         populate()
         popup.bind('<Escape>', lambda _: self._close_popup())
         def close_if_outside(event):
@@ -149,7 +166,7 @@ class _ScrollableDropdown:
         if search is not None:
             search.focus_set()
         else:
-            frame.focus_set()
+            canvas.focus_set()
 
     def _close_popup(self):
         popup = getattr(self, '_popup', None)

@@ -10,6 +10,8 @@ from history.result_data import load_result
 from utils.theme import AppTheme
 from utils.scrollable_dropdown import ScrollableComboBox
 from utils.viewport import PointIndex, clip_segments
+from utils.ml_classes import class_styles, visible_points
+from utils.layer_catalog import result_id
 
 
 def _layer_group(item):
@@ -41,7 +43,12 @@ class LayerControls(ctk.CTkFrame):
         self.items = {}
         self.job = None
         self.legend = None
+        self.base = None
+        self._style_cache = {}
         self.grid_columnconfigure(0, weight=1)
+        self._dialog = None
+        self._picker_root = None
+        self._dialog_state = {}
         selector_row = ctk.CTkFrame(self, fg_color='transparent')
         selector_row.grid(row=0, column=0, columnspan=2, sticky='ew')
         ctk.CTkLabel(selector_row, text='Тип слоя', anchor='w').pack(fill='x', pady=(0, 2))
@@ -57,10 +64,10 @@ class LayerControls(ctk.CTkFrame):
         self.direction_selector.set('Все направления')
         self.direction_selector.pack(fill='x', pady=(0, 6))
         # Two-step layer creation: keep the picker hidden until requested.
-        self.add_button = ctk.CTkButton(
+        self.legacy_add_button = ctk.CTkButton(
             selector_row, text='+ Добавить слой', height=30,
-            fg_color=AppTheme.NAV_HOVER, command=self.toggle_layer_picker)
-        self.add_button.pack(fill='x', pady=(5, 5))
+            fg_color=AppTheme.NAV_HOVER, command=self.open_layer_picker)
+        self.legacy_add_button.pack(fill='x', pady=(5, 5))
         self.picker_frame = ctk.CTkFrame(selector_row, fg_color='transparent')
         ctk.CTkLabel(self.picker_frame, text='Выберите данные слоя', anchor='w').pack(
             fill='x', pady=(4, 2))
@@ -71,50 +78,14 @@ class LayerControls(ctk.CTkFrame):
         self.selector.pack(fill='x')
         self._picker_open = False
         self._source_items = []
-        filter_row = ctk.CTkFrame(ml_master or self, fg_color='transparent')
-        if ml_master:
-            filter_row.pack(fill='x', padx=6, pady=5)
-        else:
-            filter_row.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(3, 0))
-        if ml_master:
-            ctk.CTkLabel(filter_row, text='Фильтры ML', anchor='w').pack(anchor='w')
-        else:
-            ctk.CTkLabel(filter_row, text='ML:', width=26, anchor='w').pack(side='left')
-        self.ml_filters = {}
-        self._ml_filter_values = {}
-        self.ml_items = {}
-        for key, width in [('algorithm', 105), ('channel', 95), ('point_type', 145), ('direction', 105)]:
-            menu = ScrollableComboBox(filter_row, values=['Все'], state='readonly', width=width,
-                                      command=lambda _value, k=key: self._apply_filters())
-            menu.set('Все')
-            if ml_master:
-                ctk.CTkLabel(filter_row, text={'algorithm': 'Алгоритм', 'channel': 'Канал', 'point_type': 'Тип точек', 'direction': 'Направление'}[key], anchor='w').pack(anchor='w', pady=(6, 0))
-                menu.configure(width=250)
-                menu.pack(fill='x', pady=(3, 5))
-            else:
-                menu.pack(side='left', padx=(0, 5))
-            self.ml_filters[key] = menu
-        reset_button = ctk.CTkButton(filter_row, text='Сброс', width=58,
-                                     fg_color='transparent', hover_color=AppTheme.NAV_HOVER,
-                                     command=self.reset_ml_filters)
-        if ml_master:
-            reset_button.pack(anchor='e', pady=(4, 0))
-        else:
-            reset_button.pack(side='left')
-        if ml_master:
-            ctk.CTkLabel(filter_row, text='Результат кластеризации', anchor='w').pack(
-                anchor='w', pady=(9, 2))
-            self.ml_selector = ScrollableComboBox(
-                filter_row, values=['Нет ML-результатов'], state='disabled',
-                width=260, dropdown_wide=True, dropdown_search=True)
-            self.ml_selector.pack(fill='x', pady=(0, 7))
-            ctk.CTkButton(filter_row, text='Показать ML на изображении',
-                          command=self.show_ml_result).pack(fill='x', pady=(2, 6))
-            ctk.CTkLabel(filter_row,
-                         text='Выберите запуск и отобразите кластеры поверх исходного изображения.',
-                         wraplength=265, justify='left', anchor='w',
-                         text_color='#AAB1BB').pack(fill='x', pady=(0, 6))
-        self.status = ctk.CTkLabel(self, text='Слои: точки, огибающие, KNN и ML-результаты', anchor='w', height=20)
+        # Legacy comboboxes remain unmounted only for old state-restoration and
+        # compatibility tests. The actual user-facing picker is a separate window.
+        selector_row.grid_remove()
+        self.add_button = ctk.CTkButton(
+            self, text='+ Добавить слой', height=32,
+            fg_color=AppTheme.PRIMARY, command=self.open_layer_picker)
+        self.add_button.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 7))
+        self.status = ctk.CTkLabel(self, text='Добавленные слои: 0', anchor='w', height=20)
         self.status.grid(row=2, column=0, columnspan=2, sticky='ew')
 
     @staticmethod
@@ -145,7 +116,7 @@ class LayerControls(ctk.CTkFrame):
         if self.group_selector.get() not in groups:
             self.group_selector.set('Все типы')
         self._update_directions()
-        self._populate_ml_filters()
+        self._apply_filters()
 
     def _update_directions(self):
         group = self.group_selector.get()
@@ -162,57 +133,30 @@ class LayerControls(ctk.CTkFrame):
         self._update_directions()
         self._apply_filters()
 
-    def _populate_ml_filters(self):
-        ml_items = [item for item in self._source_items if item['category'] == 'ML-кластеры']
-        for key, menu in self.ml_filters.items():
-            raw_values = sorted({
-                str(item.get(key)) for item in ml_items
-                if item.get(key) not in (None, '')
-            })
-            translations = {
-                'row': 'Построчный CWT', 'rows': 'Построчный CWT',
-                'col': 'Столбцовый CWT', 'columns': 'Столбцовый CWT',
-                'max_by_row': 'Максимумы по строкам',
-                'min_by_row': 'Минимумы по строкам',
-                'max_by_column': 'Максимумы по столбцам',
-                'min_by_column': 'Минимумы по столбцам',
-            }
-            display_to_raw = {
-                translations.get(value, value): value for value in raw_values
-            }
-            self._ml_filter_values[key] = display_to_raw
-            values = sorted(display_to_raw)
-            current = menu.get()
-            menu.configure(values=['Все'] + values, state='readonly' if values else 'disabled')
-            menu.set(current if current in values else 'Все')
-        self._apply_filters()
-
     def _apply_filters(self):
-        active = {
-            key: self._ml_filter_values.get(key, {}).get(menu.get(), menu.get())
-            for key, menu in self.ml_filters.items()
-            if menu.get() != 'Все'
-        }
         filtered = []
+        base = self.pane.selected_item or {}
         for item in self._source_items:
+            if not self.pane.payload or not self.pane.payload.get('spatial'):
+                continue
+            if item.get('task_folder') != base.get('task_folder'):
+                continue
+            if item.get('path') == base.get('path'):
+                continue
+            if any(l['item']['path'] == item['path'] for l in self.layers):
+                continue
             if (self.group_selector.get() != 'Все типы' and
                     _layer_group(item) != self.group_selector.get()):
                 continue
             if (self.direction_selector.get() != 'Все направления' and
                     _layer_direction(item) != self.direction_selector.get()):
                 continue
-            if item['category'] != 'ML-кластеры':
-                if not active:
-                    filtered.append(item)
-                continue
-            if all(str(item.get(key)) == value for key, value in active.items()):
-                filtered.append(item)
+            filtered.append(item)
         filtered.sort(key=lambda item: (
             item['category'] != 'ML-кластеры',
             item.get('algorithm') or '', item.get('channel') or '', item.get('point_type') or '',
             item.get('direction') or '', float(item.get('scale') or 0), item['label']))
         self.items = {}
-        self.ml_items = {}
         for item in filtered:
             # The full semantic provenance is needed: two CWT axes can have
             # independent envelope/point results with identical scales/kinds.
@@ -235,43 +179,11 @@ class LayerControls(ctk.CTkFrame):
                 label = f'{base} · {Path(item["path"]).stem} #{counter}'
                 counter += 1
             self.items[label] = item
-            if item['category'] == 'ML-кластеры' and Path(item['path']).suffix.lower() == '.csv':
-                self.ml_items[label] = item
         values = list(self.items)
         previous = self.selector.get()
         self.selector.configure(state='readonly', values=values or ['Нет слоёв'])
         self.selector.set(previous if previous in self.items else values[0] if values else 'Нет слоёв')
         self.selector.configure(state='readonly' if values else 'disabled')
-        if hasattr(self, 'ml_selector'):
-            ml_values = list(self.ml_items)
-            current = self.ml_selector.get()
-            self.ml_selector.configure(values=ml_values or ['Нет ML-результатов'],
-                                       state='readonly' if ml_values else 'disabled')
-            self.ml_selector.set(current if current in self.ml_items else
-                                 ml_values[0] if ml_values else 'Нет ML-результатов')
-        if active:
-            self.status.configure(text=f'ML-фильтр: показано {len(self.ml_items)} ML-файлов')
-
-    def show_ml_result(self):
-        """Show the chosen cluster CSV on its own task's source image."""
-        if not hasattr(self, 'ml_selector'):
-            return
-        item = self.ml_items.get(self.ml_selector.get())
-        if not item:
-            self.status.configure(text='Нет подходящего пространственного ML-результата')
-            return
-        source = next((candidate for candidate in self.pane._experiment_items
-                       if candidate['category'] == 'Источник' and
-                       candidate.get('task_id') == item.get('task_id')), None)
-        if source is None:
-            self.status.configure(text='Не найдено исходное изображение этой задачи')
-            return
-        # Select the correct task source, rather than trying to superpose the
-        # cluster map on a different task's CWT or image dimensions.
-        if (self.pane.selected_item or {}).get('path') != source['path']:
-            self.pane.task_selector.set(item['task_id'])
-            self.pane.set_items(self.pane._experiment_items, prefer_source=True)
-        self.add_item(item)
 
     def add_item(self, item):
         if any(layer['item'].get('path') == item['path'] for layer in self.layers):
@@ -282,15 +194,10 @@ class LayerControls(ctk.CTkFrame):
         if self.job is None:
             self.job = self.after(20, self.poll)
 
-    def reset_ml_filters(self):
-        for menu in self.ml_filters.values():
-            menu.set('Все')
-        self._apply_filters()
-
     @staticmethod
     def _compact_layer_name(item):
         """Keep cards readable at the minimum sidebar width."""
-        category = item.get('category', 'Слой')
+        category = (item.get('algorithm') or 'ML') if item.get('category') == 'ML-кластеры' else item.get('category', 'Слой')
         channel = item.get('channel') or ''
         scale = item.get('scale')
         kind = item.get('point_kind') or ''
@@ -309,7 +216,7 @@ class LayerControls(ctk.CTkFrame):
         name = ' · '.join(piece for piece in pieces if piece)
         return name or (item.get('display_label') or item.get('label') or 'Слой')[:65]
 
-    def _append_layer(self, item, data=None, *, label=None):
+    def _append_layer(self, item, data=None, *, label=None, base=False):
         layer = dict(item=item, data=data, visible=tk.BooleanVar(value=True), alpha=.8,
                      marker_scale=1.0, color=self.COLORS[len(self.layers) % len(self.COLORS)], artists=[])
         if data is None:
@@ -318,10 +225,11 @@ class LayerControls(ctk.CTkFrame):
             layer['future'] = None
         row = layer['row'] = ctk.CTkFrame(
             self, fg_color=AppTheme.NAV_HOVER, corner_radius=4)
-        row.grid(row=len(self.layers)+3, column=0, columnspan=2,
+        row.grid(row=3 if base else len(self.layers)+4, column=0, columnspan=2,
                  sticky='ew', pady=(4, 2), padx=1)
         row.grid_columnconfigure(1, weight=1)
-        row_text = self._compact_layer_name(item)
+        layer['base'] = base
+        row_text = ('Основной результат · ' if base else '') + self._compact_layer_name(item)
         layer['full_label'] = label or self._display_label(item)
         # No long label is allowed to expand the panel's requested width.
         visible_box = ctk.CTkCheckBox(
@@ -333,20 +241,18 @@ class LayerControls(ctk.CTkFrame):
             font=AppTheme.body_font(), wraplength=148)
         name_label.grid(row=0, column=1, sticky='ew', padx=(0, 3), pady=(6, 3))
         layer['name_label'] = name_label
-        ctk.CTkButton(
-            row, text='×', width=25, height=25,
-            fg_color=AppTheme.NAV_BACKGROUND,
-            command=lambda: self.remove(layer)).grid(
-            row=0, column=2, padx=(2, 7), pady=(5, 2))
-        swatch = ctk.CTkButton(
-            row, text='', width=26, height=22, corner_radius=4,
-            fg_color=layer['color'], hover_color=layer['color'],
-            command=lambda: self.choose_color(layer))
-        swatch.grid(row=1, column=0, sticky='w', padx=(7, 2), pady=(3, 4))
-        layer['swatch'] = swatch
-        ctk.CTkLabel(row, text='Цвет точек', anchor='w',
-                     font=AppTheme.caption_font()).grid(
-            row=1, column=1, columnspan=2, sticky='w', padx=(0, 3), pady=(3, 4))
+        if not base:
+            ctk.CTkButton(row, text='×', width=25, height=25,
+                fg_color=AppTheme.NAV_BACKGROUND, command=lambda: self.remove(layer)).grid(
+                row=0, column=2, padx=(2, 7), pady=(5, 2))
+        if item['category'] != 'ML-кластеры':
+            swatch = ctk.CTkButton(row, text='', width=26, height=22, corner_radius=4,
+                fg_color=layer['color'], hover_color=layer['color'], command=lambda: self.choose_color(layer))
+            swatch.grid(row=1, column=0, sticky='w', padx=7, pady=4)
+            layer['swatch'] = swatch
+            ctk.CTkLabel(row, text='Цвет точек', font=AppTheme.caption_font()).grid(row=1, column=1, sticky='w')
+        layer['class_frame'] = ctk.CTkFrame(row, fg_color='transparent')
+        layer['class_frame'].grid(row=7, column=0, columnspan=3, sticky='ew', padx=7, pady=4)
         ctk.CTkLabel(
             row, text='Прозрачность', anchor='w',
             font=AppTheme.caption_font()).grid(
@@ -368,21 +274,162 @@ class LayerControls(ctk.CTkFrame):
         size_slider.grid(row=5, column=0, columnspan=3, sticky='ew',
                          padx=9, pady=(0, 8))
         layer['size_slider'] = size_slider
-        self.layers.append(layer)
+        if not base:
+            self.layers.append(layer)
         return layer
 
+    def set_base(self, item, data):
+        is_ml = bool(item and data and item['category'] == 'ML-кластеры' and data['kind'] == 'points')
+        if self.base and (not is_ml or self.base['item']['path'] != item['path'] or self.base['data'] is not data):
+            self.base['row'].destroy()
+            self.base = None
+        if is_ml:
+            for layer in list(self.layers):
+                if layer['item']['path'] == item['path']:
+                    self.remove(layer)
+            if self.base is None:
+                self.base = self._append_layer(item, data, base=True)
+                self.base['alpha'] = 1.
+                self.base['slider'].set(1.)
+            self.base['artists'] = [self.pane.scatter, self.pane.edges]
+            if data.get('continuous') and data.get('class_labels') is None:
+                self.pane.scatter.set_cmap('inferno')
+                self.pane.scatter.set_clim(0, 1)
+            self.base.pop('_viewport', None)
+        self._apply_filters()
+
+    def _class_controls(self, layer):
+        if 'styles' in layer or not layer.get('data'):
+            return
+        layer['styles'] = class_styles(layer['data'])
+        cached = self._style_cache.get(layer['item']['path'], {})
+        for key, style in layer['styles'].items():
+            if key in cached:
+                style.update(color=cached[key]['color'], visible=cached[key]['visible'])
+        self._style_cache[layer['item']['path']] = layer['styles']
+        host = layer['class_frame']
+        if layer['styles']:
+            def toggle():
+                if host.winfo_manager():
+                    host.grid_remove()
+                    layer['classes_toggle'].configure(text=f'▸ Классы · {len(layer["styles"])}')
+                else:
+                    host.grid()
+                    layer['classes_toggle'].configure(text=f'▾ Классы · {len(layer["styles"])}')
+            button = ctk.CTkButton(layer['row'], text=f'▾ Классы · {len(layer["styles"])}',
+                anchor='w', fg_color='transparent', command=toggle)
+            button.grid(row=6, column=0, columnspan=3, sticky='ew', padx=5)
+            layer['classes_toggle'] = button
+        host.grid_columnconfigure(0, weight=1)
+        for index, (key, style) in enumerate(layer['styles'].items()):
+            variable = tk.BooleanVar(value=style['visible'])
+            def changed(k=key, v=variable):
+                layer['styles'][k]['visible'] = v.get()
+                layer.pop('_viewport', None)
+                self.redraw()
+            box = ctk.CTkCheckBox(host, text=f"{style['name']} · {style['count']}",
+                variable=variable, width=120, font=AppTheme.caption_font(), command=changed)
+            box.grid(row=index, column=0, sticky='w', pady=4)
+            button = ctk.CTkButton(host, text='', width=24, height=24,
+                fg_color=style['color'], hover_color=style['color'])
+            button.configure(command=lambda k=key, b=button: self.choose_class_color(layer, k, b))
+            button.grid(row=index, column=1, sticky='e', padx=(4, 0))
+        if layer['item']['category'] == 'ML-кластеры' and not layer['styles']:
+            ctk.CTkLabel(host, text='Состояния не сохранены; показана исходная оценка',
+                wraplength=245, justify='left', text_color=AppTheme.TEXT_SECONDARY).grid(sticky='ew')
+
+    def choose_class_color(self, layer, key, button):
+        _, color = colorchooser.askcolor(color=layer['styles'][key]['color'],
+            title=layer['styles'][key]['name'], parent=self.winfo_toplevel())
+        if color:
+            layer['styles'][key]['color'] = color
+            button.configure(fg_color=color, hover_color=color)
+            layer.pop('_viewport', None)
+            self.redraw()
+
+    def open_layer_picker(self):
+        """Open one explorer; never create Tk children while root is closing."""
+        from utils.tk_lifecycle import active_widget_root
+        root = active_widget_root(self.pane)
+        if root is None:
+            return
+
+        dialog = self._dialog
+        if dialog is not None:
+            try:
+                if dialog.winfo_exists():
+                    dialog.lift()
+                    dialog.focus_set()
+                    return
+            except tk.TclError:
+                pass
+            self._dialog = None
+
+        if not (self.pane.payload and self.pane.payload.get('spatial')):
+            self.status.configure(text='Сначала выберите пространственный результат')
+            return
+
+        from utils.layer_picker import LayerPicker
+        try:
+            dialog = LayerPicker(
+                root, items=self.pane._experiment_items,
+                base_item=self.pane.selected_item, base_data=self.pane.payload,
+                folder=self.pane.folder,
+                added_ids={result_id(layer['item']) for layer in self.layers},
+                on_add=self.add_items, on_close=self._picker_closed,
+                state=self._dialog_state, executor=self.pane._executor)
+        except tk.TclError:
+            # CTk may receive a previously queued click after WM_DELETE_WINDOW.
+            # Do not mask genuine errors while the application is alive.
+            if active_widget_root(self.pane) is None:
+                return
+            raise
+
+        if active_widget_root(self.pane) is None:
+            dialog.close()
+            return
+        self._dialog = dialog
+        self._picker_root = root
+        self._picker_open = True
+        if hasattr(root, 'register_child_window'):
+            root.register_child_window(dialog)
+
+    def _picker_closed(self, state):
+        root = self._picker_root
+        dialog = self._dialog
+        if root is not None and dialog is not None and hasattr(root, 'unregister_child_window'):
+            root.unregister_child_window(dialog)
+        self._dialog_state = state
+        self._dialog = None
+        self._picker_root = None
+        self._picker_open = False
+
     def toggle_layer_picker(self):
-        if self._picker_open:
+        if self._dialog is not None:
             self.hide_layer_picker()
         else:
-            self._picker_open = True
-            self.picker_frame.pack(fill='x', pady=(4, 0))
-            self.add_button.configure(text='Отмена выбора')
+            self.open_layer_picker()
 
     def hide_layer_picker(self):
-        self._picker_open = False
-        self.picker_frame.pack_forget()
-        self.add_button.configure(text='+ Добавить слой')
+        dialog = self._dialog
+        if dialog is not None:
+            try:
+                dialog.close()
+            except tk.TclError:
+                # Parent Tk interpreter may already be unavailable.
+                self._picker_closed(self._dialog_state)
+
+    def add_items(self, validated):
+        """Commit an already verified batch atomically, without I/O on Tk."""
+        for item, data in validated:
+            if item.get('path') == (self.pane.selected_item or {}).get('path'):
+                return
+            if any(result_id(layer['item']) == result_id(item) for layer in self.layers):
+                return
+        for item, data in validated:
+            self._append_layer(item, data=data)
+        self._apply_filters()
+        self.redraw()
 
     def _on_layer_chosen(self, _value=None):
         # The selector is an input, not an additional permanent toolbar.
@@ -455,11 +502,12 @@ class LayerControls(ctk.CTkFrame):
         handles, messages = [], []
         pane = self.pane
         base_shape = tuple(pane.payload['shape']) if pane.payload and pane._extent is not None else None
-        for index, layer in enumerate(self.layers):
+        for index, layer in enumerate(([self.base] if self.base else []) + self.layers):
             data = layer['data']
             compatible = (data is not None and base_shape == tuple(data['shape'])
                           and data.get('source_id') == (pane.payload or {}).get('source_id'))
             visible = bool(layer['visible'].get() and compatible)
+            self._class_controls(layer)
             if compatible and not layer['artists']:
                 points = np.asarray(data['points'])
                 clustered = layer['item']['category'] == 'ML-кластеры' and 'colors' in data
@@ -477,21 +525,15 @@ class LayerControls(ctk.CTkFrame):
                 artist.set_alpha(layer['alpha'])
             if visible:
                 item = layer['item']
-                name = (item.get('display_label') or item['label']).casefold()
-                details = [word for word in ('верхняя', 'нижняя', 'максимумы', 'минимумы') if word in name]
-                category = 'Точки огибающей' if item['category'] == 'Огибающие' else item['category']
-                label = f'{index+1}. {category} {" ".join(details)} · a={item.get("scale") or "—"} · {item.get("channel") or ""}'
-                if layer['item']['category'] == 'ML-кластеры' and 'colors' in data:
-                    dots = layer['artists'][0]
-                    if data.get('continuous'):
-                        handles.append(Line2D([], [], marker='o', linestyle='', color=dots.cmap(0.15),
-                                              label=f'{label} · обычные'))
-                        handles.append(Line2D([], [], marker='o', linestyle='', color=dots.cmap(0.9),
-                                              label=f'{label} · высокая аномальность'))
-                    else:
-                        for cluster in np.unique(data['colors'])[:10]:
-                            handles.append(Line2D([], [], marker='o', linestyle='', color=dots.cmap(dots.norm(cluster)),
-                                                  label=f'{label} · кластер {cluster:g}'))
+                label = self._compact_layer_name(item)
+                if layer.get('styles'):
+                    for style in layer['styles'].values():
+                        if style['visible'] and style['count']:
+                            handles.append(Line2D([], [], marker='o', linestyle='', color=style['color'],
+                                label=f"{item.get('algorithm') or 'ML'} · {style['name']}" +
+                                      (f" · {item.get('channel') or ''} s={item.get('scale') or '—'}" if self.layers else '')))
+                elif item['category'] == 'ML-кластеры':
+                    handles.append(Line2D([], [], marker='o', linestyle='', color='#edbd58', label=label + ' · исходная оценка'))
                 else:
                     handles.append(Line2D([], [], marker='o', linestyle='', color=layer['color'], label=label))
             if layer.get('error'):
@@ -500,13 +542,8 @@ class LayerControls(ctk.CTkFrame):
                 messages.append('слой скрыт: нужны тот же источник и размеры пространственной карты')
             elif layer.get('future') is not None:
                 messages.append('Загрузка слоя…')
-        if handles:
-            self.legend = pane.figure.legend(
-                handles=handles, fontsize=6, loc='lower center',
-                bbox_to_anchor=(0.49, 0.01), ncol=min(2, len(handles)),
-                facecolor=AppTheme.NAV_BACKGROUND, labelcolor=AppTheme.TEXT_ON_DARK,
-                frameon=False, borderaxespad=0.2)
-        self.status.configure(text='; '.join(dict.fromkeys(messages)) or f'Слоёв: {len(self.layers)} · ползунок: прозрачность')
+
+        self.status.configure(text='; '.join(dict.fromkeys(messages)) or f'Добавленные слои: {len(self.layers)}')
         self.update_marker_sizes()
         pane.canvas.draw_idle()
 
@@ -514,7 +551,7 @@ class LayerControls(ctk.CTkFrame):
         """Update visible geometry only, retaining full source data for export."""
         x0, x1 = sorted(self.pane.ax.get_xlim())
         y0, y1 = sorted(self.pane.ax.get_ylim())
-        for layer in self.layers:
+        for layer in ([self.base] if getattr(self, 'base', None) else []) + self.layers:
             if not layer['artists'] or not layer['artists'][0].get_visible():
                 continue
             points = np.asarray(layer['data']['points'])
@@ -536,8 +573,12 @@ class LayerControls(ctk.CTkFrame):
             margin_y = (y1-y0)*8/max(1, self.pane.ax.bbox.height)
             expanded = (x0-margin_x, x1+margin_x, y0-margin_y, y1+margin_y)
             indices = index.query(expanded)
+            indices, rgba = visible_points(layer['data'], layer.get('styles', {}), indices)
             layer['artists'][0].set_offsets(points[indices, :2])
-            if layer['item']['category'] == 'ML-кластеры' and 'colors' in layer['data']:
+            if rgba is not None:
+                layer['artists'][0].set_array(None)
+                layer['artists'][0].set_facecolors(rgba)
+            elif layer['item']['category'] == 'ML-кластеры' and 'colors' in layer['data']:
                 layer['artists'][0].set_array(np.asarray(layer['data']['colors'])[indices])
             segments = layer['_segments']
             if len(segments):
@@ -561,14 +602,17 @@ class LayerControls(ctk.CTkFrame):
         layer['row'].destroy()
         self.layers.remove(layer)
         for i, remaining in enumerate(self.layers):
-            remaining['row'].grid_configure(row=i+3)
+            remaining['row'].grid_configure(row=i+4)
+        self._apply_filters()
         self.redraw()
 
     def clear(self):
+        self.hide_layer_picker()
         for layer in list(self.layers):
             self.remove(layer)
 
     def destroy(self):
+        self.hide_layer_picker()
         if self.job is not None:
             self.after_cancel(self.job)
             self.job = None
