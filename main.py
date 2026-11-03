@@ -107,7 +107,7 @@ from compute.channel_analysis import (
     prepared_channel_meta,
     write_channel_manifest,
 )
-from image_cropper_app import run_cropper
+from loaders.image.cropper import run_cropper
 from pipette import run_pipette
 from utils.gui import TkinterApp, ScrollableFrame, CollapsibleFrame
 from utils.help_icon import HelpIcon
@@ -7993,6 +7993,13 @@ class App(TkinterApp):
             font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
         ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
 
+        self.resume_batch_button = ctk.CTkButton(self.compute_section,
+            text='Продолжить сохранённую очередь…',command=self._resume_pipeline_batch)
+        self.resume_batch_button.grid(row=2,column=0,sticky='w',padx=12,pady=8)
+        self.batch_report_button = ctk.CTkButton(self.compute_section,
+            text='Отчёт очереди…',command=self._open_batch_report)
+        self.batch_report_button.grid(row=3,column=0,sticky='w',padx=12,pady=(0,8))
+
     def _refresh_memory_estimate(self):
         try:
             self.memory_label.configure(text=estimate_label([self.current_task] if self.current_task else []))
@@ -8593,6 +8600,10 @@ class App(TkinterApp):
     def _finish_ml_queue_only_success(self, task, summary):
         done = summary["completed"]
         errors = summary["failed"]
+        if summary.get('history_pending'):
+            self.progress_manager.fail_run(
+                f"ML-план: готово {done}, ошибок {errors}; история ожидает записи: {summary['history_pending']}")
+            return
         if done == 0 and errors:
             self.progress_manager.fail_run(
                 f"ML-план: все {errors} операций завершились ошибкой")
@@ -8649,6 +8660,12 @@ class App(TkinterApp):
         rows = [new_row(task, config) for config in operations]
         if report_rows is not None:
             report_rows.extend(rows)
+        if not operations:
+            return {"completed": 0, "failed": 0}
+        from history.ml_outbox import MLHistoryOutbox
+        outbox = MLHistoryOutbox(task.task_folder_path, self.run_history, task,
+                                self._persist_experiment_task, self.progress_manager.log_error)
+        outbox.flush()
         completed = 0
         failed = 0
         measured_seconds = []
@@ -8668,8 +8685,15 @@ class App(TkinterApp):
                 row['operation_id'] = identity
                 if reused is not None:
                     lookup = getattr(self.run_history, 'find_ml_operation', None)
-                    if lookup is not None and lookup(task, identity, reused['output_dir']) is None:
-                        self.run_history.add_run(task=task, status='completed', run_type='ml',
+                    known = outbox.contains(identity, reused['output_dir'])
+                    if not known and lookup is not None and outbox.available:
+                        try:
+                            known = lookup(task, identity, reused['output_dir']) is not None
+                        except Exception as error:
+                            outbox.available = False
+                            self.progress_manager.log_error(f'История ML недоступна: {error}')
+                    if not known and (lookup is not None or journal.entries[identity]['status'] == 'saving'):
+                        outbox.enqueue(status='completed', run_type='ml',
                             duration_seconds=journal.entries[identity].get('duration_seconds', 0),
                             settings={**task.settings_snapshot(), 'ml_configuration': config,
                                       'ml_operation_id': identity},
@@ -8717,8 +8741,8 @@ class App(TkinterApp):
                 measured_seconds.append(time.time() - started)
                 completion = journal.completion_details(result)
                 journal.save(identity, 'saving', **completion)
-                self.run_history.add_run(
-                    task=task, status="completed", run_type="ml",
+                outbox.enqueue(
+                    status="completed", run_type="ml",
                     duration_seconds=time.time() - started,
                     settings={**task.settings_snapshot(), "ml_configuration": config, "ml_operation_id": identity},
                     ml_algorithm=algorithm, output_path=result["output_dir"],
@@ -8750,11 +8774,11 @@ class App(TkinterApp):
                 self.progress_manager.log_error(
                     f"ML {index}/{len(operations)} ({dataset_key}): {error}; "
                     "следующие конфигурации продолжаются")
-                self.run_history.add_run(
-                    task=task, status="failed", run_type="ml",
+                outbox.enqueue(
+                    status="failed", run_type="ml",
                     duration_seconds=time.time() - started,
                     settings={**task.settings_snapshot(), "ml_configuration": config, "ml_operation_id": identity},
-                    ml_algorithm=algorithm, error_message=str(error),
+                    ml_algorithm=algorithm, error_message=str(error), output_path=task.task_folder_path,
                 )
             finally:
                 result = None
@@ -8769,8 +8793,10 @@ class App(TkinterApp):
                 self.progress_manager.log_info(
                     f"ML: обработано {index}/{len(operations)}; последняя операция {elapsed:.2f} с; "
                     f"RSS={rss:.1f} MiB{eta_text}")
-        self._persist_experiment_task(task)
-        return {"completed": completed, "failed": failed}
+        summary = {"completed": completed, "failed": failed}
+        if outbox.pending:
+            summary['history_pending'] = outbox.pending
+        return summary
 
     def _history_ml_summary(self, task):
         result = task.ml_result
@@ -8782,193 +8808,179 @@ class App(TkinterApp):
             f"шумовых точек: {metrics.get('noise_count', 0)}"
         )
 
+    def _record_pipeline_attempt(self, task, row):
+        from history.ml_outbox import MLHistoryOutbox, outbox_path
+        folder = row.get('output_path')
+        if folder and outbox_path(folder).is_file():
+            outbox = MLHistoryOutbox(folder, self.run_history, task,
+                                    self._persist_experiment_task, self.progress_manager.log_error)
+            if outbox.flush():
+                raise RuntimeError('История ML ожидает записи в SQLite')
+            if row.get('ml_summary'):
+                row['ml_summary'].pop('history_pending', None)
+        self._persist_experiment_task(task)
+        self.run_history.add_run(
+            task=task, status=row['outcome'],
+            duration_seconds=row['duration_seconds'],
+            settings={**row['settings'], 'pipeline_attempt_id': row['attempt_id']},
+            error_message=row.get('error',''),
+            ml_summary=str(row.get('ml_summary',{})),
+            output_path=row['output_path'], attempt_id=row['attempt_id'])
+
+    def _execute_pipeline_task(self, task, operations, report_rows, journal, row):
+        from compute.batch_runner import validate_task
+        if row.get('preparation_error'):
+            raise ValueError(row['preparation_error'])
+        validate_task(task)
+        current_signature = cwt_signature(task)
+        reuse = (task.reuse_existing_results
+                 and task.last_completed_cwt_signature == current_signature
+                 and task.task_folder_path and os.path.isdir(task.task_folder_path))
+        from history.attempts import prepare_output
+        prepare_output(task,self.image_processor,journal,row,reuse,self.progress_manager.run_control.check)
+        save_run_image(task)
+        journal.update(row, settings=task.settings_snapshot())
+        try:
+            self.image_processor.compute_for_task(task)
+        finally:
+            row['backend'] = dict(self.image_processor.backend.backend_info)
+        ml = {'completed': 0, 'failed': 0}
+        if task.ml_plan:
+            ml = self._run_integrated_ml(task, operations, report_rows=report_rows)
+        self.progress_manager.begin_stage(f'{task.task_name} · Сохранение результатов')
+        self.progress_manager.save_run_log(task.task_folder_path,
+            header=f'Задача: {task.task_name}\nПопытка: {row["attempt_id"]}')
+        save_feature_checkpoint(task, cancel_check=self.progress_manager.run_control.check)
+        return ml
+
     def compute(self, tasks=None):
-        """Run the captured selection; other tasks are never queued implicitly."""
+        """GPU-first pipeline; the queue never changes the selected backend."""
+        from compute.batch_runner import BatchJournal, run_batch, snapshot_inputs
+        from ml.batch_plan import preview_task_ml_operations
         tasks = tuple(tasks) if tasks is not None else ((self.current_task,) if self.current_task else ())
         if not tasks:
-            mb.showwarning("Внимание", "Нет задач для обработки")
             return
-
-        # Validate only the tasks explicitly included in this run.
-        for i, task in enumerate(tasks):
-            try:
-                validate_scales(task.scales)
-            except ValueError as error:
-                mb.showerror("Масштабы", f"Задача {i + 1}: {error}")
-                return
-            if not task.image_path:
-                mb.showerror("Ошибка", f"Задача {i + 1}: не загружено изображение")
-                return
-            if len(task.scales) == 0:
-                mb.showerror("Ошибка", f"Задача {i + 1}: не заданы масштабы")
-                return
-            if (task.channel_representation == "gram_schmidt"
-                    and not task.has_colors_selected()):
-                mb.showerror(
-                    "Каналы анализа",
-                    f"Задача {i + 1}: для Gram–Schmidt не задан цветовой базис"
-                )
-                return
-            if task.analysis_mode == "1d" and not (
-                    task.process_rows or task.process_columns):
-                mb.showerror(
-                    "Ошибка",
-                    f"Задача {i + 1}: не выбран источник 1D CWT"
-                )
-                return
-            if task.analysis_mode == "1d":
-                from compute.extremes.detection import normalize_peak_parameters
-                try:
-                    normalize_peak_parameters(
-                        getattr(task, "extrema_distance", 1),
-                        getattr(task, "extrema_prominence", 0.0),
-                    )
-                except ValueError as error:
-                    mb.showerror(
-                        "Параметры экстремумов",
-                        f"Задача {i + 1}: {error}"
-                    )
-                    return
-            if task.analysis_mode == "2d" and not task.orientations:
-                mb.showerror(
-                    "Ошибка",
-                    f"Задача {i + 1}: не заданы ориентации 2D Morlet"
-                )
-                return
-
+        journal = getattr(self, '_pending_resume_journal', None)
+        self._pending_resume_journal = None
         report_rows = []
-        ml_operations_by_task = {}
-        ml_started_tasks = set()
+        operations = {}
         try:
-            timer = time.time()
-            total_tasks = len(tasks)
-            current_task_num = 0
-            from ml.batch_plan import preview_task_ml_operations
-            for planned_task in tasks:
+            if journal is None:
+                journal = BatchJournal.create(self.image_processor.root_folder_path, tasks,
+                    self.image_processor.backend.requested_backend)
+                journal.document['experiment_id'] = self.image_processor.experiment_id
+                journal.flush()
+                snapshot_inputs(journal,tasks,self.progress_manager.run_control)
+            self._last_batch_path = str(journal.path)
+            self.progress_manager.log_info(f'Журнал очереди: {journal.path}')
+            stages = []
+            for task, row in zip(tasks, journal.document['tasks']):
                 try:
-                    ml_operations_by_task[id(planned_task)] = preview_task_ml_operations(planned_task)
-                except ValueError as error:
-                    raise ValueError(f"{planned_task.task_name}: {error}") from error
-            execution_stages = []
-            for planned_task in tasks:
-                planned_stages = planned_task.execution_stage_names()
-                execution_stages.extend(
-                    f"{planned_task.task_name} · {stage}"
-                    for stage in planned_stages[:-1]
-                )
-                operations = ml_operations_by_task[id(planned_task)]
-                execution_stages.extend(
-                    f"{planned_task.task_name} · ML {i}/{len(operations)} · "
-                    f"{op['algorithm']} · {tuple(op['dataset_key'])}"
-                    for i, op in enumerate(operations, 1)
-                )
-                execution_stages.append(
-                    f"{planned_task.task_name} · {planned_stages[-1]}")
-            self.progress_manager.begin_run(
-                f"Исследование · {', '.join(task.task_name for task in tasks)}", execution_stages
-            )
-
-            for task in tasks:
-                self.progress_manager.run_control.check()
-                current_task_num += 1
-                self.progress_manager.log_info(f"Обработка задачи {current_task_num}/{total_tasks}: {task.task_name}")
-
-                task_started = time.time()
-                snapshot = task.settings_snapshot()
-                try:
-                    # Продолжение той же задачи переиспользует её каталог,
-                    # пока научные входы CWT не изменились. Изменение источника,
-                    # масштабов, каналов или параметров Morlet создаёт новый каталог.
-                    current_signature = cwt_signature(task)
-                    resume_same_task = bool(
-                        getattr(task, "reuse_existing_results", True)
-                        and getattr(task, "last_completed_cwt_signature", None)
-                        == current_signature
-                        and getattr(task, "task_folder_path", "")
-                        and os.path.isdir(task.task_folder_path)
-                    )
-                    if resume_same_task:
-                        self.progress_manager.log_info(
-                            f"Продолжение {task.task_name}: используются готовые "
-                            "результаты предыдущих этапов"
-                        )
-                    else:
-                        task.task_folder_path = ""
-                        self.image_processor.create_task_folder(task)
-                        save_run_image(task)
-                    snapshot = task.settings_snapshot()
-                    self.image_processor.compute_for_task(task)
-                    if getattr(task, "ml_plan", []):
-                        ml_started_tasks.add(id(task))
-                        self._run_integrated_ml(task, ml_operations_by_task[id(task)], report_rows=report_rows)
-                    self.progress_manager.begin_stage(
-                        f"{task.task_name} · Сохранение результатов"
-                    )
-                    log_header = (
-                        f"Изображение: {os.path.basename(task.image_path)}\n"
-                        f"Вейвлет: Morlet ({task.analysis_mode.upper()})\n"
-                        f"Масштабы: {task.scales_summary()}\n"
-                        f"Сценарий: {task.pipeline_preset}\n"
-                        f"Этапы: {task.executed_stage_summary()}\n"
-                        f"Нюансы: {task.nuances_summary()}"
-                    )
-                    self.progress_manager.save_run_log(
-                        task.task_folder_path, header=log_header
-                    )
-                    checkpoint = save_feature_checkpoint(task, cancel_check=self.progress_manager.run_control.check)
-                    if checkpoint:
-                        self.progress_manager.log_info(
-                            f"Контрольная точка признаков сохранена: {checkpoint}"
-                        )
-                    self.progress_manager.run_control.check()
-                    self._persist_experiment_task(task)
-                    self.run_history.add_run(
-                        task=task,
-                        status="completed",
-                        duration_seconds=time.time() - task_started,
-                        settings=snapshot,
-                        ml_summary=self._history_ml_summary(task),
-                    )
-                    self.progress_manager.log_info(f'Результаты {task.task_name} сохранены')
-                except RunCancelled as error:
-                    self._persist_experiment_task(task)
-                    self.run_history.add_run(task=task, status='cancelled',
-                                             duration_seconds=time.time() - task_started,
-                                             settings=snapshot, error_message=str(error))
-                    try:
-                        self.progress_manager.save_run_log(task.task_folder_path,
-                                                           header='Запуск отменён; результаты частичные')
-                    except OSError as log_error:
-                        self.progress_manager.log_error(f"Не удалось сохранить журнал отмены: {log_error}")
-                    raise
-                except Exception as error:
-                    self._persist_experiment_task(task)
-                    self.run_history.add_run(
-                        task=task,
-                        status="failed",
-                        duration_seconds=time.time() - task_started,
-                        settings=snapshot,
-                        error_message=str(error),
-                    )
-                    raise
-
-            elapsed_time = time.time() - timer
-            self.after_safe(0, self._refresh_history_tab)
-            self.after_safe(0, self._update_pipeline_controls_state)
-            self.after_safe(0, lambda: self.show_success_message(elapsed_time, total_tasks, ml_report=bool(report_rows)))
-
+                    operations[id(task)] = preview_task_ml_operations(task)
+                    if row['status'] in {'pending','interrupted'}:
+                        stages.extend(f'{task.task_name} · {name}' for name in task.execution_stage_names()[:-1])
+                        stages.extend(f'{task.task_name} · ML {i}/{len(operations[id(task)])} · '
+                                      f"{op['algorithm']} · {tuple(op['dataset_key'])}"
+                                      for i,op in enumerate(operations[id(task)],1))
+                        stages.append(f'{task.task_name} · Сохранение результатов')
+                except (ValueError, TypeError) as error:
+                    operations[id(task)] = []
+                    row['preparation_error'] = str(error)
+            journal.flush()
+            self.progress_manager.begin_run(f'Очередь · {len(tasks)} задач',stages or ['История'])
+            summary = run_batch(journal,tasks,
+                lambda task,row: self._execute_pipeline_task(task,operations[id(task)],report_rows,journal,row),
+                self._record_pipeline_attempt,self.progress_manager.run_control,self.progress_manager.log_error)
+            self._last_batch_summary = summary
+            self.after_safe(0,self._refresh_history_tab)
+            self.after_safe(0,self._update_pipeline_controls_state)
+            if summary['status'] == 'completed':
+                elapsed = sum(row.get('duration_seconds',0) for row in journal.document['tasks'])
+                self.after_safe(0,lambda: self.show_success_message(elapsed,len(tasks),ml_report=bool(report_rows)))
+            else:
+                self.progress_manager.fail_run(
+                    f"Очередь: готово {summary['completed']}; частично {summary['partial_failed']}; "
+                    f"ошибок {summary['failed']}; осталось {summary['pending'] + summary['interrupted']}; "
+                    f"история ожидает записи {summary['history_pending']}")
+            return summary
         except RunCancelled:
+            if journal is not None:
+                journal.document['status'] = 'cancelled'
+                journal.flush()
             raise
-        except Exception as e:
-            self.progress_manager.log_error(f"Критическая ошибка: {str(e)}")
-            self.progress_manager.fail_run(f"Ошибка вычислений: {str(e)}")
-            self.after_safe(0, self._refresh_history_tab)
+        except Exception as error:
+            if journal is not None:
+                journal.document.update(status='interrupted',batch_error=f'{type(error).__name__}: {error}')
+                try:
+                    journal.flush()
+                except Exception as journal_error:
+                    self.progress_manager.log_error(f'Не удалось записать остановку очереди: {journal_error}')
+            raise
         finally:
-            from ml.run_report import new_row
-            for task in tasks:
-                if id(task) not in ml_started_tasks:
-                    report_rows.extend(new_row(task, op) for op in ml_operations_by_task.get(id(task), []))
-            self._complete_ml_report(report_rows, self.image_processor.root_folder_path)
+            if journal is not None:
+                try:
+                    from history.batch_report import export_report
+                    self._last_batch_report = str(export_report(journal))
+                    self.progress_manager.log_info(f'Отчёт очереди: {self._last_batch_report}')
+                except Exception as error:
+                    self.progress_manager.log_error(f'Не удалось сохранить отчёт очереди: {error}')
+            self._complete_ml_report(report_rows,self.image_processor.root_folder_path)
+
+    def _open_batch_report(self):
+        from tkinter import filedialog
+        from compute.batch_runner import BatchJournal
+        from history.batch_report import export_report
+        path = getattr(self,'_last_batch_report',None)
+        if not path or not os.path.isfile(path):
+            filename = filedialog.askopenfilename(parent=self,title='Отчёт сохранённой очереди',
+                initialdir=self.image_processor.root_folder_path or '.',filetypes=[('Журнал очереди','*.json')])
+            if not filename:
+                return
+            try:
+                path = str(export_report(BatchJournal.load(filename)))
+                self._last_batch_report = path
+            except Exception as error:
+                mb.showerror('Отчёт очереди',str(error))
+                return
+        self._open_result_path(path)
+
+    def _resume_pipeline_batch(self):
+        from tkinter import filedialog
+        from compute.batch_runner import BatchJournal, restore_tasks
+        if self._workspace_is_busy():
+            return
+        filename = filedialog.askopenfilename(parent=self,title='Продолжить сохранённую очередь',
+            initialdir=self.image_processor.root_folder_path or '.',
+            filetypes=[('Журнал очереди batch.json','*.json')])
+        if not filename:
+            return
+        try:
+            journal = BatchJournal.load(filename)
+            journal.prepare_resume()
+            tasks = restore_tasks(journal)
+            if not tasks:
+                raise ValueError('Очередь пуста')
+            self.image_processor.root_folder_path = str(journal.path.resolve().parents[2])
+            self.image_processor.experiment_id = journal.document.get('experiment_id') or uuid4().hex
+            # Restoring a batch requests its original backend; unavailable GPU
+            # is handled by the existing CPU fallback and execution protocol.
+            self.image_processor.set_gpu_enabled(journal.document.get('requested_backend','gpu') != 'cpu')
+            self.image_processor.tasks = tasks
+            self.image_processor.current_task_index = 0
+            self.current_task = tasks[0]
+            self._update_tasks_display()
+            self._update_ui_for_current_task()
+            self._pending_resume_journal = journal
+            self.progress_manager.run_control.reset()
+            self._disable_ui_during_compute(True)
+            self.cancel_compute_button.configure(state='normal',text='Отменить расчёт')
+            self._compute_thread = threading.Thread(target=self._compute_wrapper,args=(tuple(tasks),),daemon=True)
+            self._compute_thread.start()
+        except Exception as error:
+            self._pending_resume_journal = None
+            if getattr(self, '_compute_ui_locked', False):
+                self._disable_ui_during_compute(False)
+            mb.showerror('Восстановление очереди',str(error))
 
     def _toggle_tasks_panel(self):
         self._apply_panel_layout(not self._tasks_visible, self._progress_visible)

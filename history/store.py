@@ -79,6 +79,10 @@ class RunHistoryStore:
                 CREATE INDEX IF NOT EXISTS idx_tasks_experiment ON tasks(experiment_id, task_number);
                 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, id);
             ''')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(runs)')}
+            if 'attempt_id' not in columns:
+                db.execute('ALTER TABLE runs ADD COLUMN attempt_id TEXT')
+            db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_attempt ON runs(attempt_id)')
 
     def ensure_experiment(self, experiment_id, root_path, name=None):
         if not experiment_id or not root_path:
@@ -107,7 +111,7 @@ class RunHistoryStore:
 
     def add_run(self, *, task, status, duration_seconds, settings,
                 ml_summary='', error_message='', ml_algorithm=None, run_type=None,
-                output_path=None):
+                output_path=None, attempt_id=None):
         task_id = getattr(task, 'persistent_id', None)
         if not task_id:
             raise ValueError('Сначала зарегистрируйте задачу в SQLite')
@@ -116,13 +120,21 @@ class RunHistoryStore:
         if kind not in ('pipeline', 'ml'):
             raise ValueError('Неизвестный тип запуска')
         with self._connect() as db:
+            if attempt_id:
+                db.execute('BEGIN IMMEDIATE')
+                previous = db.execute('SELECT id,task_id FROM runs WHERE attempt_id=?',
+                                      (attempt_id,)).fetchone()
+                if previous:
+                    if previous['task_id'] != task_id:
+                        raise ValueError('Идентификатор попытки принадлежит другой задаче')
+                    return previous['id']
             cursor = db.execute('''INSERT INTO runs(task_id,run_type,created_at,status,duration_seconds,
-                output_path,ml_algorithm,ml_summary,error_message,settings_json)
-                VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                output_path,ml_algorithm,ml_summary,error_message,settings_json,attempt_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
                 (task_id, kind, _now(), status, float(duration_seconds),
                  output_path if output_path is not None else (task.task_folder_path or ''),
                  algorithm, ml_summary, error_message,
-                 json.dumps(settings, ensure_ascii=False)))
+                 json.dumps(settings, ensure_ascii=False), attempt_id))
             db.execute('''UPDATE tasks SET folder_path=?,settings_json=?,updated_at=? WHERE id=?''',
                        (task.task_folder_path or '', json.dumps(settings, ensure_ascii=False), _now(), task_id))
             db.execute('''UPDATE experiments SET updated_at=? WHERE id=(SELECT experiment_id FROM tasks WHERE id=?)''',
