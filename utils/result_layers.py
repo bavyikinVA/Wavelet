@@ -251,8 +251,14 @@ class LayerControls(ctk.CTkFrame):
             swatch.grid(row=1, column=0, sticky='w', padx=7, pady=4)
             layer['swatch'] = swatch
             ctk.CTkLabel(row, text='Цвет точек', font=AppTheme.caption_font()).grid(row=1, column=1, sticky='w')
-        layer['class_frame'] = ctk.CTkFrame(row, fg_color='transparent')
-        layer['class_frame'].grid(row=7, column=0, columnspan=3, sticky='ew', padx=7, pady=4)
+        # An empty CTkFrame requests its default height (~200 px). Creating it
+        # for ordinary point layers leaves a large blank area below the sliders.
+        # ML-only class controls are created hidden and shown after population.
+        if item['category'] == 'ML-кластеры':
+            layer['class_frame'] = ctk.CTkFrame(row, fg_color='transparent')
+            layer['class_frame'].grid(row=7, column=0, columnspan=3,
+                                      sticky='ew', padx=7, pady=(0, 4))
+            layer['class_frame'].grid_remove()
         ctk.CTkLabel(
             row, text='Прозрачность', anchor='w',
             font=AppTheme.caption_font()).grid(
@@ -299,6 +305,8 @@ class LayerControls(ctk.CTkFrame):
         self._apply_filters()
 
     def _class_controls(self, layer):
+        if layer['item']['category'] != 'ML-кластеры':
+            return
         if 'styles' in layer or not layer.get('data'):
             return
         layer['styles'] = class_styles(layer['data'])
@@ -334,9 +342,11 @@ class LayerControls(ctk.CTkFrame):
                 fg_color=style['color'], hover_color=style['color'])
             button.configure(command=lambda k=key, b=button: self.choose_class_color(layer, k, b))
             button.grid(row=index, column=1, sticky='e', padx=(4, 0))
-        if layer['item']['category'] == 'ML-кластеры' and not layer['styles']:
+        if not layer['styles']:
             ctk.CTkLabel(host, text='Состояния не сохранены; показана исходная оценка',
                 wraplength=245, justify='left', text_color=AppTheme.TEXT_SECONDARY).grid(sticky='ew')
+        # Only populated ML panels contribute to the card's requested height.
+        host.grid()
 
     def choose_class_color(self, layer, key, button):
         _, color = colorchooser.askcolor(color=layer['styles'][key]['color'],

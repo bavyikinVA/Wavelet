@@ -1,7 +1,6 @@
 """Separate attempt outputs and immutable scientific provenance."""
 import hashlib
 import json
-import os
 import shutil
 from pathlib import Path
 
@@ -58,7 +57,8 @@ def prepare_output(task, processor, journal, row, reuse, check):
         excluded={'attempt.json','manifest.json','execution_manifest.json','run_log.txt'}
         files=[p for p in files if p.name not in excluded and not p.name.endswith('.tmp')]
         size=sum(p.stat().st_size for p in files)
-        if shutil.disk_usage(new).free < size + 16*1024*1024:
+        from compute.disk_budget import SAFETY_RESERVE
+        if shutil.disk_usage(new).free < size + SAFETY_RESERVE:
             import errno
             raise OSError(errno.ENOSPC,'Недостаточно места для независимой копии результатов')
         for path in files:

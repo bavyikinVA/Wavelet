@@ -118,7 +118,8 @@ class BatchJournal:
 
 def global_failure(error):
     return (isinstance(error, (JournalWriteError, MemoryError)) or
-            isinstance(error, OSError) and error.errno in {errno.ENOSPC, errno.EROFS})
+            isinstance(error, OSError) and error.errno in
+            {errno.ENOSPC, errno.EROFS, getattr(errno, 'EDQUOT', errno.ENOSPC)})
 
 
 def summarize(rows):
@@ -153,7 +154,7 @@ def commit_history(journal, row, task, record_history, log):
     return not row['history_pending']
 
 
-def run_batch(journal, tasks, execute, record_history, control, log):
+def run_batch(journal, tasks, execute, record_history, control, log, *, lazy_inputs=False):
     """execute returns an ML summary; scientific failures stay local to a task."""
     rows = journal.document['tasks']
     if len(tasks) != len(rows):
@@ -177,52 +178,63 @@ def run_batch(journal, tasks, execute, record_history, control, log):
             journal.document['status'] = 'cancelled'
             journal.flush()
             raise
-        started = time.monotonic()
-        journal.update(row,status='running',started_at=now())
-        cancelled = False
-        stop = False
         try:
-            ml = execute(task,row) or {}
-            control.check()
-            outcome = 'partial_failed' if ml.get('failed',0) else 'completed'
-            row['ml_summary'] = ml
-        except RunCancelled as error:
-            outcome, cancelled = 'cancelled', True
-            row['error'] = str(error)
-        except JournalWriteError:
-            raise  # Never perform more scientific work without a durable log.
-        except Exception as error:
-            outcome = 'failed'
-            row['error'] = f'{type(error).__name__}: {error}'
-            row['traceback'] = traceback.format_exc()
-            stop = global_failure(error)
-            log(f"Задача {task.task_name}: {row['error']}")
-        journal.update(row,status='saving',outcome=outcome,
-            output_path=task.task_folder_path or '',
-            duration_seconds=time.monotonic()-started,finished_at=now(),
-            history_pending=True)
-        try:
-            from history.attempts import seal_attempt
-            row['attempt_manifest'] = seal_attempt(journal,row,task)
-        except Exception as error:
-            row['provenance_error'] = f'{type(error).__name__}: {error}'
-            log(f"Протокол {task.task_name} не сохранён: {error}")
-            if outcome in {'completed','partial_failed'}:
+            started = time.monotonic()
+            journal.update(row,status='running',started_at=now())
+            cancelled = False
+            stop = False
+            try:
+                from compute.disk_budget import check_task_capacity
+                if not row.get('preparation_error'):
+                    check_task_capacity(task, journal.path.parent, row=row, log=log)
+                if lazy_inputs and not row.get('preparation_error'):
+                    from history.source_image import ensure_task_source
+                    ensure_task_source(task, row)
+                ml = execute(task,row) or {}
+                control.check()
+                outcome = 'partial_failed' if ml.get('failed',0) else 'completed'
+                row['ml_summary'] = ml
+            except RunCancelled as error:
+                outcome, cancelled = 'cancelled', True
+                row['error'] = str(error)
+            except JournalWriteError:
+                raise  # Never perform more scientific work without a durable log.
+            except Exception as error:
                 outcome = 'failed'
-                row['outcome'] = outcome
-                row['error'] = row.get('error') or row['provenance_error']
-            stop = True
-        if history_available:
-            history_available = commit_history(journal,row,task,record_history,log)
-        else:
-            row['history_error'] = 'Запись отложена после ошибки БД в этом пакете'
-        journal.update(row,status=outcome)
-        if cancelled:
-            journal.document['status'] = 'cancelled'
-            journal.flush()
-            raise RunCancelled(row.get('error','Отменено'))
-        if stop:
-            break
+                row['error'] = f'{type(error).__name__}: {error}'
+                row['traceback'] = traceback.format_exc()
+                stop = global_failure(error)
+                log(f"Задача {task.task_name}: {row['error']}")
+            journal.update(row,status='saving',outcome=outcome,
+                output_path=task.task_folder_path or '',
+                duration_seconds=time.monotonic()-started,finished_at=now(),
+                history_pending=True)
+            try:
+                from history.attempts import seal_attempt
+                row['attempt_manifest'] = seal_attempt(journal,row,task)
+            except Exception as error:
+                row['provenance_error'] = f'{type(error).__name__}: {error}'
+                log(f"Протокол {task.task_name} не сохранён: {error}")
+                if outcome in {'completed','partial_failed'}:
+                    outcome = 'failed'
+                    row['outcome'] = outcome
+                    row['error'] = row.get('error') or row['provenance_error']
+                stop = True
+            if history_available:
+                history_available = commit_history(journal,row,task,record_history,log)
+            else:
+                row['history_error'] = 'Запись отложена после ошибки БД в этом пакете'
+            journal.update(row,status=outcome)
+            if cancelled:
+                journal.document['status'] = 'cancelled'
+                journal.flush()
+                raise RunCancelled(row.get('error','Отменено'))
+            if stop:
+                break
+        finally:
+            if lazy_inputs:
+                from history.source_image import release_task_source
+                release_task_source(task)
     result = summarize(rows)
     journal.document.update(status=result['status'],summary=result,finished_at=now())
     journal.flush()
@@ -245,33 +257,47 @@ def validate_task(task):
         raise ValueError('Не заданы ориентации 2D Morlet')
 
 
-def snapshot_inputs(journal, tasks, control):
+def snapshot_inputs(journal, tasks, control, *, release_memory=False):
     """Keep the effective cropped input for pending tasks before computations."""
     from PIL import Image
-    import hashlib
     from history.atomic_io import atomic_binary_writer
     for task, row in zip(tasks, journal.document['tasks']):
         control.check()
         try:
+            # GUI task switching may already have released this source to an
+            # earlier durable .inputs snapshot. Hydrate one task at a time.
+            if task.original_image is None and getattr(task, '_input_snapshot_path', None):
+                from history.source_image import ensure_task_source
+                ensure_task_source(task)
             validate_task(task)
             path = journal.path.parent/'inputs'/(row['attempt_id']+'.png')
+            from compute.disk_budget import check_snapshot_capacity
+            check_snapshot_capacity(task, journal.path.parent)
             with atomic_binary_writer(path, cancel_check=control.check) as stream:
                 Image.fromarray(task.original_image).save(stream,format='PNG')
-            journal.update(row,input_path=str(path.resolve()),
-                           input_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            from history.attempts import digest
+            checksum = digest(path, control.check)
+            journal.update(row,input_path=str(path.resolve()),input_sha256=checksum)
+            task._input_snapshot_path = str(path.resolve())
+            task._input_snapshot_sha256 = checksum
+            if release_memory:
+                from history.source_image import release_task_source
+                release_task_source(task)
         except JournalWriteError:
             raise
         except Exception as error:
             if global_failure(error):
                 raise
             journal.update(row,preparation_error=f'{type(error).__name__}: {error}')
+        finally:
+            if release_memory and getattr(task, '_input_snapshot_path', None):
+                from history.source_image import release_task_source
+                release_task_source(task)
 
 
-def restore_tasks(journal):
+def restore_tasks(journal, *, lazy=False):
     """Recreate pending tasks from saved effective input, never the original crop source."""
-    import hashlib
-    import numpy as np
-    from PIL import Image
+    from history.attempts import digest
     from compute.processing_task import ProcessingTask
     from history.pipeline_resume import cwt_signature
     tasks = []
@@ -283,15 +309,17 @@ def restore_tasks(journal):
         task.task_folder_path = row.get('output_path','')
         if row.get('input_path') or row['status'] in {'pending','running','interrupted'}:
             path = Path(row.get('input_path',''))
-            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != row.get('input_sha256'):
+            if not path.is_file() or digest(path) != row.get('input_sha256'):
                 row['preparation_error'] = 'Снимок входного изображения отсутствует или повреждён'
             else:
-                with Image.open(path) as image:
-                    task.original_image = np.array(image.convert('RGB'))
                 task.image_path = str(path)
-                task.data = [task.original_image[:,:,c].copy() for c in range(3)]
-                task.data_copy = [channel.copy() for channel in task.data]
-                # F04 requires every stage signature + artifacts before reuse.
-                task.last_completed_cwt_signature = cwt_signature(task)
+                task._input_snapshot_path = str(path)
+                task._input_snapshot_sha256 = row['input_sha256']
+                task._restore_cwt_signature = True
+                if not lazy:
+                    from history.source_image import ensure_task_source
+                    ensure_task_source(task, row)
+                    # F04 requires every stage signature + artifacts before reuse.
+                    task.last_completed_cwt_signature = cwt_signature(task)
         tasks.append(task)
     return tasks

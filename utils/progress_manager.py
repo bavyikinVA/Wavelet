@@ -1,4 +1,8 @@
 import logging
+from logging.handlers import RotatingFileHandler
+from collections import deque
+import tempfile
+import shutil
 import os
 import queue
 import threading
@@ -23,19 +27,41 @@ class LoggingHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = self.format(record)
-            self.log_queue.put(msg)
+            # Display is a bounded preview; spool/disk handlers keep full text.
+            preview = msg[:12000] + ('\n…[превышен лимит отображения]' if len(msg) > 12000 else '')
+            self._put_latest(preview)
             if self.record_callback is not None:
                 self.record_callback(msg)
         except Exception as error:
-            self.log_queue.put(str(error))
+            self.handleError(record)
+
+    def _put_latest(self, message):
+        """A stalled/hidden textbox must never make the logging queue unbounded."""
+        try:
+            self.log_queue.put_nowait(message)
+        except queue.Full:
+            try:
+                self.log_queue.get_nowait()  # Drop oldest GUI-only message.
+            except queue.Empty:
+                pass
+            try:
+                self.log_queue.put_nowait(message)
+            except queue.Full:
+                pass  # Another producer may have filled it meanwhile.
+
 
 
 class ProgressManager:
     """Persistent execution panel with separate run and stage progress."""
 
+    MAX_LOG_QUEUE = 3000
+    MAX_VISIBLE_LINES = 1600
+    MAX_LOGS_PER_TICK = 100
+    MAX_GUI_MESSAGE_CHARS = 12000
+
     def __init__(self, parent: TkinterApp):
         self.parent = parent
-        self.log_queue = queue.Queue()
+        self.log_queue = queue.Queue(maxsize=self.MAX_LOG_QUEUE)
         self._is_active = True
         self._update_logs_callback_id = None
         self._timer_callback_id = None
@@ -44,8 +70,15 @@ class ProgressManager:
         self._stages = []
         self._stage_index = 0
         self._stage_progress = 0.0
-        self._run_log_lines = []
+        self._run_log_lines = deque(maxlen=self.MAX_VISIBLE_LINES)
+        self._displayed_log_lines = 0
+        self._run_log_spool = None
+        self._run_log_spool_file = None
+        self._run_log_spool_offset = 0
         self._log_lock = threading.Lock()
+        self._progress_lock = threading.Lock()
+        self._progress_update_queued = False
+        self._latest_progress = (0.0, '')
         self.logs_expanded = False
         self._result_callback = None
         self._folder_callback = None
@@ -182,7 +215,9 @@ class ProgressManager:
         gui_handler.setFormatter(formatter)
         gui_handler.setLevel(logging.INFO)
         self.logger.addHandler(gui_handler)
-        file_handler = logging.FileHandler("wavelet_analysis.log", encoding="utf-8")
+        file_handler = RotatingFileHandler(
+            "wavelet_analysis.log", maxBytes=16 * 1024 * 1024,
+            backupCount=3, encoding="utf-8")
         file_handler.setFormatter(formatter)
         file_handler.setLevel(logging.DEBUG)
         self.logger.addHandler(file_handler)
@@ -190,7 +225,9 @@ class ProgressManager:
 
     def _remember_log_line(self, line):
         with self._log_lock:
-            self._run_log_lines.append(line)
+            self._run_log_lines.append(line[:self.MAX_GUI_MESSAGE_CHARS])
+            if self._run_log_spool_file is not None:
+                self._run_log_spool_file.write((line + "\n").encode("utf-8"))
 
     def _ui(self, callback):
         if self._is_active:
@@ -202,8 +239,20 @@ class ProgressManager:
         self._stage_index = 0
         self._stage_progress = 0.0
         self._started_at = time.monotonic()
+        # The GUI is bounded, but the full run log is spooled to disk for export.
         with self._log_lock:
-            self._run_log_lines = []
+            if self._run_log_spool_file is not None:
+                self._run_log_spool_file.close()
+                self._run_log_spool_file = None
+            if self._run_log_spool:
+                try:
+                    os.unlink(self._run_log_spool)
+                except OSError:
+                    pass
+            fd, self._run_log_spool = tempfile.mkstemp(prefix='wavelets-run-', suffix='.log')
+            self._run_log_spool_file = os.fdopen(fd, 'wb')
+            self._run_log_spool_offset = 0
+            self._run_log_lines = deque(maxlen=self.MAX_VISIBLE_LINES)
         self._ui(lambda: self._apply_begin_run(title))
         self._schedule_timer()
 
@@ -247,9 +296,21 @@ class ProgressManager:
         self.run_control.check()
         value = max(0.0, min(1.0, float(value)))
         self._stage_progress = value
-        self._ui(lambda: self._apply_progress(value, message))
+        with self._progress_lock:
+            self._latest_progress = (value, message)
+            should_schedule = not self._progress_update_queued
+            if should_schedule:
+                self._progress_update_queued = True
+        if should_schedule:
+            self._ui(self._flush_latest_progress)
         if message:
             self.logger.info(message)
+
+    def _flush_latest_progress(self):
+        with self._progress_lock:
+            value, message = self._latest_progress
+            self._progress_update_queued = False
+        self._apply_progress(value, message)
 
     def _apply_progress(self, value, message):
         if self.run_control.event.is_set():
@@ -356,18 +417,26 @@ class ProgressManager:
     def _update_logs(self):
         if not self._is_active:
             return
-        try:
-            while True:
-                msg = self.log_queue.get_nowait()
-                self.log_text.configure(state="normal")
-                self.log_text.insert("end", msg + "\n")
-                self.log_text.see("end")
-                self.log_text.configure(state="disabled")
-        except queue.Empty:
-            pass
-        finally:
-            if self._is_active:
-                self._update_logs_callback_id = self.parent.after_safe(100, self._update_logs)
+        # Work for at most one bounded batch per UI tick. Inserting 100 records
+        # in one Tk call is significantly cheaper than 100 configure/insert pairs.
+        messages = []
+        for _ in range(self.MAX_LOGS_PER_TICK):
+            try:
+                messages.append(self.log_queue.get_nowait())
+            except queue.Empty:
+                break
+        if messages:
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", "\n".join(messages) + "\n")
+            self._displayed_log_lines += sum(msg.count('\n') + 1 for msg in messages)
+            if self._displayed_log_lines > self.MAX_VISIBLE_LINES:
+                extra = self._displayed_log_lines - self.MAX_VISIBLE_LINES
+                self.log_text.delete("1.0", f"{extra + 1}.0")
+                self._displayed_log_lines -= extra
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+        if self._is_active:
+            self._update_logs_callback_id = self.parent.after_safe(100, self._update_logs)
 
     def set_status(self, message: str, color=None):
         self._ui(lambda: self.progress_label.configure(
@@ -391,6 +460,7 @@ class ProgressManager:
         if self._is_active:
             self.log_text.configure(state="normal")
             self.log_text.delete("1.0", "end")
+            self._displayed_log_lines = 0
             self.log_text.configure(state="disabled")
 
     def _log_document(self, header=None):
@@ -413,21 +483,61 @@ class ProgressManager:
             initialfile=datetime.now().strftime("wavelet_log_%Y-%m-%d_%H-%M.txt")
         )
         if filename:
-            with open(filename, "w", encoding="utf-8") as file:
-                file.write(self._log_document())
+            self.save_run_log(os.path.dirname(filename) or '.', filename=filename)
             self.log_info(f"Журнал сохранён: {filename}")
 
-    def save_run_log(self, output_dir, header=None, *, append=False):
+    def save_run_log(self, output_dir, header=None, *, append=False, filename=None):
         if not output_dir:
             return ""
         os.makedirs(output_dir, exist_ok=True)
-        path = os.path.join(output_dir, "run_log.txt")
-        from history.atomic_io import atomic_write_text
-        document = self._log_document(header)
-        if append and os.path.isfile(path):
-            with open(path, encoding="utf-8") as file:
-                document = file.read().rstrip() + "\n\n" + document
-        atomic_write_text(path, document)
+        path = filename or os.path.join(output_dir, "run_log.txt")
+        from history.atomic_io import atomic_binary_writer
+        # Missing spool is supported for compatibility with legacy runs/tests.
+        spool = getattr(self, '_run_log_spool', None)
+        lock = getattr(self, '_log_lock', None)
+        if spool and lock:
+            with lock:
+                handle = getattr(self, '_run_log_spool_file', None)
+                if handle is not None:
+                    handle.flush()
+            heading = [
+                'WAVELET ANALYSIS — ЖУРНАЛ ИССЛЕДОВАНИЯ',
+                f"Экспорт: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+            ]
+            if getattr(self, '_run_title', ''):
+                heading.append(f'Запуск: {self._run_title}')
+            if header:
+                heading.extend(str(header).splitlines())
+            # A batch stores one log per task. Copy only new records rather
+            # than duplicating the full queue log into every task directory.
+            cursor = (getattr(self, '_run_log_spool_offset', 0)
+                      if not append and filename is None else 0)
+            end_offset = os.path.getsize(spool)
+            with atomic_binary_writer(path) as destination:
+                if append and os.path.isfile(path):
+                    with open(path, 'rb') as prior:
+                        shutil.copyfileobj(prior, destination, 1024 * 1024)
+                    destination.write(b'\n')
+                destination.write(('\n'.join(heading) + '\n\n').encode('utf-8'))
+                with open(spool, 'rb') as source:
+                    source.seek(min(cursor, end_offset))
+                    remaining = end_offset - source.tell()
+                    while remaining:
+                        block = source.read(min(1024 * 1024, remaining))
+                        if not block:
+                            break
+                        destination.write(block)
+                        remaining -= len(block)
+                destination.write(b'\n')
+            if not append and filename is None:
+                self._run_log_spool_offset = end_offset
+        else:
+            document = self._log_document(header)
+            if append and os.path.isfile(path):
+                with open(path, encoding='utf-8') as file:
+                    document = file.read().rstrip() + "\n\n" + document
+            from history.atomic_io import atomic_write_text
+            atomic_write_text(path, document)
         return path
 
     def reset(self):
@@ -448,6 +558,16 @@ class ProgressManager:
 
     def safe_destroy(self):
         self._is_active = False
+        with self._log_lock:
+            if self._run_log_spool_file is not None:
+                self._run_log_spool_file.close()
+                self._run_log_spool_file = None
+            if self._run_log_spool:
+                try:
+                    os.unlink(self._run_log_spool)
+                except OSError:
+                    pass
+                self._run_log_spool = None
         self._cancel_timer()
         if self._update_logs_callback_id:
             self.parent.after_cancel_safe(self._update_logs_callback_id)

@@ -11,7 +11,7 @@ from history.result_data import load_result
 from utils.layer_catalog import GROUPS, card_title, details, result_id, search_results, task_id
 from utils.layer_compatibility import check_loaded, preflight
 from utils.rendering import enable_dark_titlebar
-from utils.layer_picker_widgets import (ACTIVE, BG, BORDER, BLUE, CARD, FAINT,
+from utils.layer_picker_widgets import (ACTIVE, BG, BORDER, BLUE,
                                         MUTED, PANEL, SURFACE, TEXT, ExplorerTree,
                                         VirtualResultList, icon)
 

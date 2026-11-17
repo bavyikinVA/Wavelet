@@ -9,7 +9,7 @@ from math import ceil
 from matplotlib.colors import to_rgba
 import numpy as np
 
-from utils.ml_classes import class_styles, visible_points
+from utils.ml_classes import visible_points
 
 
 @dataclass(frozen=True)

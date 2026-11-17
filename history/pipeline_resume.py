@@ -10,7 +10,6 @@ import hashlib
 import json
 import zipfile
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 

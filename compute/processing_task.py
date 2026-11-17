@@ -245,6 +245,9 @@ class ProcessingTask:
 
     def invalidate_source_results(self):
         """Detach derived data and old output paths after replacing the source."""
+        self._input_snapshot_path = None
+        self._input_snapshot_sha256 = None
+        self._restore_cwt_signature = False
         self.result = {}
         self.knn_results = {}
         self.statistics_results = {}
@@ -496,6 +499,8 @@ class ProcessingTask:
         snapshot["scales"] = np.asarray(self.scales).tolist()
         snapshot["color1"] = None if self.color1 is None else np.asarray(self.color1).tolist()
         snapshot["color2"] = None if self.color2 is None else np.asarray(self.color2).tolist()
+        # The staged source checksum is durable across a workspace restart.
+        snapshot["input_snapshot_sha256"] = getattr(self, '_input_snapshot_sha256', None)
         return snapshot
 
     def execution_stage_names(self):
@@ -601,6 +606,9 @@ class ProcessingTask:
         self.analysis_channel_codes = []
         self.analysis_channel_labels = []
         # Source is restored by the application only if the file is still readable.
+        self._input_snapshot_path = None
+        self._input_snapshot_sha256 = snapshot.get("input_snapshot_sha256")
+        self._restore_cwt_signature = False
         self.image_path = snapshot.get("image_path", "")
         self.task_folder_path = ""
         self.result = {}

@@ -19,11 +19,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from sklearn.cluster import DBSCAN, KMeans, MiniBatchKMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
 from result_naming import dated_folder_name, ml_dataset_slug
+from history.atomic_io import atomic_text_writer, atomic_savefig
 from compute.knn.result_format import (
     neighbor_arrays, knn_payload_point_count, materialize_knn_payload,
 )
@@ -314,8 +315,10 @@ def _plot_feature_space(values, labels, algorithm_name, output_path):
     ax.set_ylabel("Главная компонента 2")
     ax.grid(alpha=0.18)
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight")
-    plt.close(fig)
+    try:
+        atomic_savefig(output_path, figure=fig, bbox_inches="tight")
+    finally:
+        plt.close(fig)
 
 
 def _plot_on_image(records, labels, image, algorithm_name, output_path):
@@ -335,8 +338,10 @@ def _plot_on_image(records, labels, image, algorithm_name, output_path):
     ax.set_xlabel("X, пиксели")
     ax.set_ylabel("Y, пиксели")
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight")
-    plt.close(fig)
+    try:
+        atomic_savefig(output_path, figure=fig, bbox_inches="tight")
+    finally:
+        plt.close(fig)
 
 
 def _write_csv(records, labels, output_path):
@@ -346,7 +351,7 @@ def _write_csv(records, labels, output_path):
         ("direction", "Направление"),
         *_raw_knn_columns(records),
     ]
-    with open(output_path, "w", encoding="utf-8-sig", newline="") as stream:
+    with atomic_text_writer(output_path, encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=[title for _, title in columns])
         writer.writeheader()
         for record, label in zip(records, labels):
@@ -375,7 +380,7 @@ def _write_cluster_summary(summary, output_path):
         ("cluster", "Кластер"), ("count", "Количество точек"),
         ("x_mean", "Средний X"), ("y_mean", "Средний Y"),
     ]
-    with open(output_path, "w", encoding="utf-8-sig", newline="") as stream:
+    with atomic_text_writer(output_path, encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=[title for _, title in columns])
         writer.writeheader()
         for row in summary:
@@ -415,8 +420,10 @@ def _plot_distribution(records, labels, key, title, xlabel, output_path):
     ax.set_ylabel("Количество точек")
     ax.grid(axis="y", alpha=0.18)
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight")
-    plt.close(fig)
+    try:
+        atomic_savefig(output_path, figure=fig, bbox_inches="tight")
+    finally:
+        plt.close(fig)
 
 
 

@@ -67,7 +67,7 @@ import customtkinter as ctk
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from Gram_Shmidt import change_channels
 from history.source_image import save_run_image
@@ -75,12 +75,10 @@ from history.result_catalog import save_coefficient_preview
 from history.pipeline_resume import (
     cwt_signature,
     load_complete_cwt,
-    load_point_cache,
-    save_point_cache,
 )
 from history.pipeline_state import (
     stage_statuses, minimal_execution_plan, mark_stage_ready,
-    format_stage_status, format_execution_plan,
+    format_execution_plan,
     requested_stage_names, STAGE_LABELS,
 )
 from result_naming import (
@@ -98,17 +96,16 @@ from result_naming import (
 )
 from compute.validation import validate_scales
 from compute.numerics import COMPUTE_DTYPE, COMPUTE_DTYPE_NAME
-from compute.backend_policy import GPU_FALLBACK_ERRORS, GPUUnavailableError, classify_gpu_exception
+from compute.backend_policy import GPU_FALLBACK_ERRORS, classify_gpu_exception
 from compute.processing_task import ProcessingTask
 from compute.channel_analysis import (
-    apply_detection_defaults,
     clear_prepared_channels,
     prepare_task_channels,
     prepared_channel_meta,
     write_channel_manifest,
 )
 from loaders.image.cropper import run_cropper
-from pipette import run_pipette
+from loaders.image.pipette import run_pipette
 from utils.gui import TkinterApp, ScrollableFrame, CollapsibleFrame
 from utils.help_icon import HelpIcon
 from utils.progress_manager import ProgressManager
@@ -116,9 +113,8 @@ from utils.theme import AppTheme
 from utils.icon_button import IconButton
 from utils.animation import animate_visibility
 from compute.run_control import RunCancelled
-from compute.memory_estimate import estimate_label
+from compute.memory_estimate import estimate_details
 from ml.errors import ClusteringError
-from ml.ui_state import ml_controls_editable
 from history import (
     RunHistoryStore, feature_checkpoint_available,
     restore_feature_checkpoint, save_feature_checkpoint,
@@ -229,6 +225,12 @@ class ImageProcessor:
                 f"(совпадение RGB: {similarity:.2%}); "
                 f"режим по умолчанию: {task.channel_summary()}"
             )
+            # Stage the cropped input immediately. A batch with 100+ tasks
+            # must not keep every full-resolution source decoded in RAM.
+            experiment_root = getattr(self, 'root_folder_path', None)
+            if experiment_root:
+                from history.source_image import stage_task_input
+                stage_task_input(task, experiment_root)
             self.progress.log_info("Изображение успешно обработано")
             return True
         else:
@@ -740,8 +742,10 @@ class ImageProcessor:
                             f"{channel_name}: масштаб {scale}, ориентация {angle:g}°"
                         )
                         fig.tight_layout()
-                        fig.savefig(
+                        from history.atomic_io import atomic_savefig
+                        atomic_savefig(
                             os.path.join(output_folder, file_stem + ".png"),
+                            figure=fig,
                             dpi=220,
                             bbox_inches="tight"
                         )
@@ -798,10 +802,12 @@ class ImageProcessor:
 
                     ax.set_title(f'Wavelets: Scale={task.scales[scale]}, Channel={colors[channel]}')
                     fig.colorbar(im, ax=ax)
-                    fig.savefig(
+                    from history.atomic_io import atomic_savefig
+                    atomic_savefig(
                         os.path.join(
                             wavelets_folder,
                             file_stem + ".png"),
+                        figure=fig,
                         dpi=300)
 
                     plt.close(fig)
@@ -1961,6 +1967,7 @@ class ImageProcessor:
             print(f"Файл сохранён: {file_path}")
         except Exception as e:
             print(f"Ошибка при сохранении файла {file_path}: {str(e)}")
+            raise
 
     @staticmethod
     def save_extremes_graphic(path, title, points_local, coefs_2d=None, original_img_shape=None):
@@ -2034,13 +2041,17 @@ class ImageProcessor:
                 from history.atomic_io import atomic_savez_compressed
                 atomic_savez_compressed(os.path.join(path, f"{title}.npz"),
                                     points=points, shape=native_shape)
-            plt.savefig(filename, bbox_inches='tight', dpi=150)
+            from history.atomic_io import atomic_savefig
+            atomic_savefig(filename, figure=fig, bbox_inches='tight', dpi=150)
             plt.close(fig)
 
             print(f"График экстремумов огибающей сохранён: {filename}")
 
         except Exception as e:
+            if 'fig' in locals():
+                plt.close(fig)
             print(f"Ошибка при сохранении графика {title}: {str(e)}")
+            raise
 
     @staticmethod
     def count_points_on_row(points, row_index):
@@ -2097,6 +2108,7 @@ class ImageProcessor:
         png_path = None
         csv_path = None
 
+        from history.atomic_io import atomic_text_writer
         try:
             if not save_png and not save_csv:
                 return None, None
@@ -2123,7 +2135,7 @@ class ImageProcessor:
             # Дополнительно сохраняем численные данные, чтобы можно было проверить график.
             if save_csv:
                 csv_path = os.path.join(path, f"{file_base_name}.csv")
-                with open(csv_path, 'w', encoding='utf-8') as file:
+                with atomic_text_writer(csv_path, encoding='utf-8') as file:
                     file.write(
                         f"scale,upper_envelope_maxima_count,{coordinate_name},"
                         "cwt_direction,feature_axis\n"
@@ -2166,7 +2178,8 @@ class ImageProcessor:
             ax.legend()
 
             png_path = os.path.join(path, f"{file_base_name}.png")
-            fig.savefig(png_path, bbox_inches='tight', dpi=150)
+            from history.atomic_io import atomic_savefig
+            atomic_savefig(png_path, figure=fig, bbox_inches='tight', dpi=150)
             plt.close(fig)
 
             # Проверяем, что файл реально появился на диске.
@@ -2184,7 +2197,7 @@ class ImageProcessor:
                 plt.close('all')
             except Exception:
                 pass
-            return None, csv_path
+            raise
 
     @staticmethod
     def compress_scale_counts_to_blocks(scales, counts, block_size):
@@ -2275,6 +2288,7 @@ class ImageProcessor:
         png_path = None
         csv_path = None
 
+        from history.atomic_io import atomic_text_writer
         try:
             if not save_png and not save_csv:
                 return None, None
@@ -2299,7 +2313,7 @@ class ImageProcessor:
 
             if save_csv:
                 csv_path = os.path.join(path, f"{file_base_name}.csv")
-                with open(csv_path, 'w', encoding='utf-8') as file:
+                with atomic_text_writer(csv_path, encoding='utf-8') as file:
                     file.write(
                         "block_label,block_start_scale,block_end_scale,"
                         f"scales_in_block,upper_envelope_maxima_sum,{coordinate_name},"
@@ -2348,7 +2362,8 @@ class ImageProcessor:
             ax.legend()
 
             png_path = os.path.join(path, f"{file_base_name}.png")
-            fig.savefig(png_path, bbox_inches='tight', dpi=150)
+            from history.atomic_io import atomic_savefig
+            atomic_savefig(png_path, figure=fig, bbox_inches='tight', dpi=150)
             plt.close(fig)
 
             if not os.path.exists(png_path):
@@ -2365,7 +2380,7 @@ class ImageProcessor:
                 plt.close('all')
             except Exception:
                 pass
-            return None, csv_path
+            raise
 
     @staticmethod
     def build_binary_row_from_points(points, row_index, width, tolerance=0):
@@ -2493,7 +2508,8 @@ class ImageProcessor:
             cbar.set_label(metric_name)
 
             png_path = os.path.join(path, f"{file_base_name}.png")
-            fig.savefig(png_path, bbox_inches="tight", dpi=150)
+            from history.atomic_io import atomic_savefig
+            atomic_savefig(png_path, figure=fig, bbox_inches="tight", dpi=150)
             plt.close(fig)
 
             if not os.path.exists(png_path):
@@ -2509,13 +2525,14 @@ class ImageProcessor:
                 plt.close('all')
             except Exception:
                 pass
-            return None
+            raise
 
     @staticmethod
     def save_row_sync_matrix_csv(path, file_base_name, sync_matrix, rows):
         """
         Сохраняет матрицу синхронизации строк в CSV.
         """
+        from history.atomic_io import atomic_text_writer
         try:
             os.makedirs(path, exist_ok=True)
             csv_path = os.path.join(path, f"{file_base_name}.csv")
@@ -2523,7 +2540,7 @@ class ImageProcessor:
             sync_matrix = np.asarray(sync_matrix, dtype=float)
             rows = list(rows)
 
-            with open(csv_path, "w", encoding="utf-8") as file:
+            with atomic_text_writer(csv_path, encoding="utf-8") as file:
                 file.write("row," + ",".join(str(r) for r in rows) + "\n")
                 for row_value, matrix_row in zip(rows, sync_matrix):
                     values = ",".join(f"{float(v):.6f}" for v in matrix_row)
@@ -2533,18 +2550,19 @@ class ImageProcessor:
 
         except Exception as e:
             print(f"Ошибка при сохранении CSV матрицы синхронизации строк {file_base_name}: {e}")
-            return None
+            raise
 
     @staticmethod
     def save_row_sync_pair_metrics_csv(path, file_base_name, pair_rows):
         """
         Сохраняет подробную таблицу метрик по всем парам строк.
         """
+        from history.atomic_io import atomic_text_writer
         try:
             os.makedirs(path, exist_ok=True)
             csv_path = os.path.join(path, f"{file_base_name}_pairs.csv")
 
-            with open(csv_path, "w", encoding="utf-8") as file:
+            with atomic_text_writer(csv_path, encoding="utf-8") as file:
                 file.write(
                     "row_a,row_b,n11,n10,n01,n00,jaccard,dice,phi\n"
                 )
@@ -2559,7 +2577,7 @@ class ImageProcessor:
 
         except Exception as e:
             print(f"Ошибка при сохранении подробной CSV таблицы пар строк {file_base_name}: {e}")
-            return None
+            raise
 
     def calculate_row_synchronization_for_scale_block(
             self,
@@ -2704,7 +2722,7 @@ class ImageProcessor:
 
         except Exception as e:
             self.progress.log_error(f"Ошибка при расчёте межстрочной синхронизации: {e}")
-            return []
+            raise
 
     def find_scale_folder(self, task, scale):
         """Находит папку масштаба для текущей задачи"""
@@ -2810,14 +2828,22 @@ class ImageProcessor:
             self.progress.begin_stage(f"{task.task_name} · {wavelet_stage}")
             self.progress.update_progress(0.0, "Начало вейвлет-преобразования...")
             if task.analysis_mode == "2d":
-                self.compute_wavelets_2d(task)
+                from compute.stage_profiling import StageProfile
+                cwt_profile = StageProfile("CWT 2D (расчёт и сохранение)")
+                with cwt_profile.measure():
+                    self.compute_wavelets_2d(task)
+                self.progress.log_info(f"Профиль CWT — {cwt_profile.summary()}")
             else:
                 point_execution = [s for s in execution_plan if s in {"extrema", "envelopes", "knn", "statistics"}]
                 need_cwt_in_memory = bool("wavelet" in execution_plan or point_execution)
                 if need_cwt_in_memory:
                     restored_cwt = None
                     if can_reuse_pipeline and "wavelet" not in execution_plan:
-                        restored_cwt = load_complete_cwt(task)
+                        from compute.stage_profiling import StageProfile
+                        restore_profile = StageProfile("CWT 1D (чтение кэша)")
+                        with restore_profile.measure():
+                            restored_cwt = load_complete_cwt(task)
+                        self.progress.log_info(f"Профиль CWT — {restore_profile.summary()}")
                     if restored_cwt is not None:
                         task.result = restored_cwt
                         self.progress.log_info(
@@ -2833,7 +2859,11 @@ class ImageProcessor:
                     else:
                         from history.pipeline_state import invalidate_stages
                         invalidate_stages(task, ["wavelet"])
-                        self.compute_wavelets(task, info_out)
+                        from compute.stage_profiling import StageProfile
+                        cwt_profile = StageProfile("CWT 1D (расчёт и сохранение)")
+                        with cwt_profile.measure():
+                            self.compute_wavelets(task, info_out)
+                        self.progress.log_info(f"Профиль CWT — {cwt_profile.summary()}")
                         mark_stage_ready(task, "wavelet")
                 else:
                     self.progress.log_info(
@@ -4528,7 +4558,7 @@ class App(TkinterApp):
         self._setup_intermediate_section()
 
         self.compute_section = ctk.CTkFrame(content, fg_color="transparent")
-        self.compute_section.pack(fill="x", padx=5, pady=20)
+        self.compute_section.pack(fill="x", padx=5, pady=(4, 12))
         self._setup_compute_section()
 
         self.analysis_next_button = None
@@ -4792,7 +4822,7 @@ class App(TkinterApp):
         self._ml_thread.start()
 
     def _ml_clustering_worker(self, task):
-        from ml.clustering import run_clustering, knn_dataset_options
+        from ml.clustering import run_clustering
         started = time.time()
         snapshot = task.settings_snapshot()
         try:
@@ -5370,7 +5400,7 @@ class App(TkinterApp):
             self.compute_section = ctk.CTkFrame(
                 scrollable_panel.scrollable_frame, fg_color="transparent"
             )
-            self.compute_section.pack(fill="x", padx=5, pady=20)
+            self.compute_section.pack(fill="x", padx=5, pady=(4, 12))
             self._setup_compute_section()
 
         return panel
@@ -6058,7 +6088,6 @@ class App(TkinterApp):
 
     def _restore_experiment(self, experiment_id):
         """Restore the original experiment, including tasks with no calculations."""
-        import cv2
         if self._workspace_is_busy():
             mb.showwarning("Исследование", "Дождитесь окончания расчёта")
             return
@@ -6085,29 +6114,20 @@ class App(TkinterApp):
                 task.task_name = row['name']
                 task.persistent_id = row['id']
                 task.task_folder_path = row['folder_path']
-                source = task.image_path
-                if source and os.path.isfile(source):
-                    image = cv2.imread(source)
-                    if image is not None:
-                        task.original_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                        b, g, r = cv2.split(image)
-                        task.data = [r, g, b]
-                        task.data_copy = [channel.copy() for channel in task.data]
-                if task.original_image is None:
-                    recovery_messages.append(f"Задача {task.task_name}: исходное изображение недоступно. "
-                                             "Сохранённые результаты остаются доступны для просмотра.")
-                if task.task_folder_path and os.path.isdir(task.task_folder_path):
-                    try:
-                        restore_feature_checkpoint(task, task.task_folder_path)
-                        recovery_messages.extend(
-                            f"Задача {task.task_name}: {message}" for message in task.recovery_warnings)
-                    except Exception as error:
-                        self.progress_manager.log_error(
-                            f"Не удалось восстановить KNN задачи {task.task_id}: {error}"
-                        )
-                        recovery_messages.append(f"Задача {task.task_name}: не удалось восстановить KNN ({error}).")
-                else:
-                    recovery_messages.append(f"Задача {task.task_name}: каталог результатов недоступен.")
+                # Reopening 100+ tasks must NOT decode all sources or feature
+                # checkpoints at once. Attach validated disk snapshots only.
+                from history.source_image import attach_workspace_input
+                try:
+                    attach_workspace_input(task, processor.root_folder_path)
+                except (OSError, ValueError) as error:
+                    recovery_messages.append(
+                        f"Задача {task.task_name}: источник недоступен ({error}). "
+                        "Результаты остаются доступны для просмотра.")
+                if not (task.task_folder_path and os.path.isdir(task.task_folder_path)):
+                    recovery_messages.append(
+                        f"Задача {task.task_name}: каталог результатов недоступен.")
+                # KNN feature checkpoint is loaded by _update_ui_for_current_task
+                # only after the user selects this task.
                 processor.tasks.append(task)
             for message in recovery_messages:
                 self.progress_manager.log_error(message)
@@ -6461,6 +6481,28 @@ class App(TkinterApp):
 
     def _update_ui_for_current_task(self):
         """Обновление UI в соответствии с текущей задачей"""
+        from history.source_image import ensure_task_source, release_task_source
+        if self.current_task is not None and getattr(self.current_task, '_input_snapshot_path', None):
+            if self.current_task.original_image is None:
+                try:
+                    ensure_task_source(self.current_task)
+                except (OSError, ValueError) as error:
+                    self.progress_manager.log_error(f'Не удалось восстановить источник задачи: {error}')
+            # Checkpoints contain the feature groups used by standalone ML.
+            # They are restored only for the selected task, not the whole batch.
+            if (not getattr(self, '_compute_ui_locked', False)
+                    and not self.current_task.knn_results
+                    and self.current_task.task_folder_path):
+                from history.checkpoints import feature_checkpoint_available, restore_feature_checkpoint
+                if feature_checkpoint_available(self.current_task.task_folder_path):
+                    restore_feature_checkpoint(self.current_task, self.current_task.task_folder_path)
+        # Release inactive tasks even when the newly selected task is blank.
+        if not getattr(self, '_compute_ui_locked', False):
+            for other in self.image_processor.tasks:
+                if (other is not self.current_task
+                        and getattr(other, '_input_snapshot_path', None)
+                        and other.original_image is not None):
+                    release_task_source(other)
         if hasattr(self, 'results_panel'):
             self.results_panel.load_folder(self.image_processor.root_folder_path)
         if self.current_task:
@@ -6772,6 +6814,13 @@ class App(TkinterApp):
             if loaded:
                 self._update_ui_for_current_task()
                 self._update_tasks_display()
+                # Persist the staged checksum immediately, including if the
+                # user closes the program before changing any settings.
+                try:
+                    self._persist_experiment_task(self.current_task)
+                except Exception as error:
+                    self.progress_manager.log_error(
+                        f'История задачи временно недоступна: {error}')
         except Exception as e:
             if self._is_destroyed:
                 return
@@ -7980,31 +8029,232 @@ class App(TkinterApp):
             self.centering_means_checkbox, fill="x"
         )
 
+    @staticmethod
+    def _resource_card_icon(kind, color):
+        """Draw a small antialiased resource icon; no emoji/font dependency."""
+        from math import cos, pi, sin
+
+        image = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        if kind == "ram":
+            draw.rounded_rectangle((25, 25, 71, 71), radius=7,
+                                   outline=color, width=6)
+            for pos in (34, 48, 62):
+                draw.line((pos, 14, pos, 25), fill=color, width=6)
+                draw.line((pos, 71, pos, 82), fill=color, width=6)
+                draw.line((14, pos, 25, pos), fill=color, width=6)
+                draw.line((71, pos, 82, pos), fill=color, width=6)
+            draw.rounded_rectangle((39, 39, 57, 57), radius=3,
+                                   outline=color, width=4)
+        elif kind == "gpu":
+            draw.rounded_rectangle((15, 24, 81, 70), radius=7,
+                                   outline=color, width=6)
+            draw.ellipse((34, 31, 66, 63), outline=color, width=5)
+            for step in range(4):
+                angle = step * pi / 2
+                draw.line((50 + 5 * cos(angle), 47 + 5 * sin(angle),
+                           50 + 14 * cos(angle), 47 + 14 * sin(angle)),
+                          fill=color, width=4)
+            draw.line((24, 76, 73, 76), fill=color, width=5)
+        else:
+            draw.ellipse((24, 18, 72, 42), outline=color, width=6)
+            draw.line((24, 30, 24, 69), fill=color, width=6)
+            draw.line((72, 30, 72, 69), fill=color, width=6)
+            draw.arc((24, 42, 72, 65), 0, 180, fill=color, width=6)
+            draw.arc((24, 57, 72, 81), 0, 180, fill=color, width=6)
+        image = image.resize((48, 48), Image.Resampling.LANCZOS)
+        return ctk.CTkImage(light_image=image, dark_image=image, size=(24, 24))
+
     def _setup_compute_section(self):
-        """Настройка секции вычислений"""
+        """Keep the main window unchanged; display resource estimates as tiles."""
         self.compute_section.grid_columnconfigure(0, weight=1)
-        self.memory_label = ctk.CTkLabel(self.compute_section, text='Оценка памяти появится после загрузки данных',
-                                         anchor='w', justify='left', wraplength=650)
-        self.memory_label.grid(row=1, column=0, sticky='ew', padx=12)
+
+        self.resource_card = ctk.CTkFrame(
+            self.compute_section,
+            fg_color="#292929", border_width=1,
+            border_color="#404040", corner_radius=13,
+        )
+        self.resource_card.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 0))
+        self.resource_card.grid_columnconfigure(0, weight=1)
+
+        header = ctk.CTkFrame(self.resource_card, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 10))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            header,
+            text="Оценка ресурсов для текущей задачи",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#f0f3f7", anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
+        info_wrap = ctk.CTkFrame(
+            header,
+            fg_color="#333333",
+            corner_radius=13,
+            border_width=1,
+            border_color="#494949",
+        )
+        info_wrap.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        ctk.CTkLabel(
+            info_wrap,
+            text="Предварительная оценка",
+            font=AppTheme.caption_font(),
+            text_color="#e0e0e0",
+            anchor="w",
+        ).pack(side="left", padx=(10, 6), pady=4)
+        self.resource_info_label = info_wrap
+        self.resource_info_help = HelpIcon(info_wrap, "resource.estimate")
+        self.resource_info_help.pack(side="left", padx=(0, 8), pady=4)
+        self.resource_header = header
+
+        tiles_frame = ctk.CTkFrame(self.resource_card, fg_color="transparent")
+        tiles_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 16))
+        self.resource_tiles_frame = tiles_frame
+        self.resource_tiles = {}
+        self.resource_value_labels = {}
+        self.resource_detail_labels = {}
+        self._resource_images = {}
+        palette = (
+            ("ram", "RAM", "#303030", "#505050", "#d7d7d7", "#414141"),
+            ("gpu", "GPU", "#303030", "#505050", "#d7d7d7", "#414141"),
+            ("disk", "Диск", "#303030", "#505050", "#d7d7d7", "#414141"),
+        )
+        for key, heading, bg_color, border_color, accent, icon_bg in palette:
+            tile = ctk.CTkFrame(
+                tiles_frame, fg_color=bg_color,
+                border_width=1, border_color=border_color,
+                corner_radius=12,
+            )
+            tile.grid_columnconfigure(0, weight=1)
+            tile.grid_rowconfigure(1, weight=0)
+
+            top = ctk.CTkFrame(tile, fg_color="transparent")
+            top.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 6))
+            top.grid_columnconfigure(1, weight=1)
+
+            icon_box = ctk.CTkFrame(
+                top, fg_color=icon_bg, corner_radius=11,
+                width=48, height=48,
+            )
+            icon_box.grid(row=0, column=0, sticky="w")
+            icon_box.grid_propagate(False)
+            self._resource_images[key] = self._resource_card_icon(key, accent)
+            ctk.CTkLabel(icon_box, text="", image=self._resource_images[key]).place(
+                relx=0.5, rely=0.5, anchor="center"
+            )
+
+            title_wrap = ctk.CTkFrame(top, fg_color="transparent")
+            title_wrap.grid(row=0, column=1, sticky="w", padx=(18, 0))
+            ctk.CTkLabel(
+                title_wrap, text=heading,
+                font=ctk.CTkFont(size=13, weight="bold"),
+                text_color="#eef3f8", anchor="w",
+            ).pack(anchor="w")
+
+            value = ctk.CTkLabel(
+                tile, text="—",
+                font=ctk.CTkFont(size=19, weight="bold"),
+                text_color="#f4f7fb", anchor="w",
+            )
+            value.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
+            detail = ctk.CTkLabel(
+                tile, text="",
+                font=ctk.CTkFont(size=11),
+                text_color="#b8c1cc", anchor="nw", justify="left",
+                wraplength=225,
+            )
+            detail.grid(row=2, column=0, sticky="ew",
+                        padx=16, pady=(0, 14))
+            self.resource_tiles[key] = tile
+            self.resource_value_labels[key] = value
+            self.resource_detail_labels[key] = detail
+
+        self._resource_layout_mode = None
+        self.resource_card.bind("<Configure>", self._layout_resource_tiles, add="+")
+        # Kept as a guard for callers of _update_action_availability().
+        self.memory_label = self.resource_card
+        self._layout_resource_tiles()
 
         ctk.CTkLabel(
             self.compute_section,
-            text="Запуск всей очереди находится внизу панели задач слева.",
+            text=("При открытии предыдущего исследования очередь продолжается автоматически: "
+                  "готовые задачи не пересчитываются, запускаются только новые или "
+                  "незавершённые задачи, а также задачи с изменёнными параметрами."),
             font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
-        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+            anchor='w', justify='left', wraplength=620,
+        ).grid(row=1, column=0, sticky='ew', padx=5, pady=(10, 10))
 
-        self.resume_batch_button = ctk.CTkButton(self.compute_section,
-            text='Продолжить сохранённую очередь…',command=self._resume_pipeline_batch)
-        self.resume_batch_button.grid(row=2,column=0,sticky='w',padx=12,pady=8)
-        self.batch_report_button = ctk.CTkButton(self.compute_section,
-            text='Отчёт очереди…',command=self._open_batch_report)
-        self.batch_report_button.grid(row=3,column=0,sticky='w',padx=12,pady=(0,8))
+    def _layout_resource_tiles(self, event=None):
+        """Show three equal tiles horizontally, stack them on narrow panes."""
+        width = event.width if event is not None else self.resource_card.winfo_width()
+        mode = "row" if width >= 755 else "stack"
+        if mode == self._resource_layout_mode:
+            return
+        self._resource_layout_mode = mode
+        self.resource_info_label.grid_forget()
+        if mode == "row":
+            self.resource_info_label.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        else:
+            self.resource_info_label.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        container = self.resource_tiles_frame
+        for column in range(3):
+            container.grid_columnconfigure(column, weight=1 if mode == "row" else
+                                           (1 if column == 0 else 0),
+                                           uniform="resource" if mode == "row" else "")
+        for index, key in enumerate(("ram", "gpu", "disk")):
+            tile = self.resource_tiles[key]
+            tile.grid_forget()
+            if mode == "row":
+                tile.grid(row=0, column=index, sticky="nsew",
+                          padx=(0, 10) if index < 2 else 0)
+                self.resource_detail_labels[key].configure(wraplength=220)
+            else:
+                tile.grid(row=index, column=0, sticky="ew",
+                          pady=(0, 9) if index < 2 else 0)
+                self.resource_detail_labels[key].configure(wraplength=450)
 
     def _refresh_memory_estimate(self):
         try:
-            self.memory_label.configure(text=estimate_label([self.current_task] if self.current_task else []))
+            if not self.current_task:
+                self.resource_value_labels['ram'].configure(text="—")
+                self.resource_detail_labels['ram'].configure(
+                    text="Загрузите изображение и настройте параметры.")
+                for key in ('gpu', 'disk'):
+                    self.resource_value_labels[key].configure(text="—")
+                    self.resource_detail_labels[key].configure(text="")
+                return
+
+            details = estimate_details(
+                [self.current_task], self.image_processor.root_folder_path)
+            self.resource_value_labels['ram'].configure(
+                text=f'≈ {details["ram_total_gib"]:.2f} ГиБ')
+            if details['current_rss'] is None:
+                ram_detail = "Рабочие массивы без памяти интерфейса и библиотек."
+            else:
+                ram_detail = (f'Сейчас {details["ram_current_gib"]:.2f} ГиБ · '
+                              f'этапы до ≈ {details["ram_additional_gib"]:.2f} ГиБ')
+            self.resource_detail_labels['ram'].configure(text=ram_detail)
+            self.resource_value_labels['gpu'].configure(
+                text=f'≈ {details["gpu_gib"]:.2f} ГиБ')
+            self.resource_detail_labels['gpu'].configure(
+                text="Рабочие массивы без пика VRAM и CUDA-пула.")
+
+            if details['disk_forecast_gib'] is not None:
+                self.resource_value_labels['disk'].configure(
+                    text=f'≈ {details["disk_forecast_gib"]:.2f} ГиБ')
+                self.resource_detail_labels['disk'].configure(
+                    text=(f'Временный запас ≈ {details["disk_temporary_gib"]:.2f} ГиБ · '
+                          f'свободно ≈ {details["disk_free_gib"]:.2f} ГиБ'))
+            else:
+                self.resource_value_labels['disk'].configure(text="—")
+                self.resource_detail_labels['disk'].configure(
+                    text="Недостаточно данных для прогноза диска.")
         except (ValueError, TypeError, OverflowError) as error:
-            self.memory_label.configure(text=f'Для оценки памяти проверьте параметры: {error}')
+            self.resource_value_labels['ram'].configure(text="—")
+            self.resource_detail_labels['ram'].configure(text=f'Проверьте параметры: {error}')
+            for key in ('gpu', 'disk'):
+                self.resource_value_labels[key].configure(text="—")
+                self.resource_detail_labels[key].configure(text="")
 
     def _request_cancel(self):
         compute_running = self._compute_thread is not None and self._compute_thread.is_alive()
@@ -8106,8 +8356,14 @@ class App(TkinterApp):
         self.progress_manager.run_control.reset()
         self.cancel_compute_button.configure(state='normal', text='Отменить расчёт')
 
-        # Блокируем UI на время вычислений
+        # Блокируем UI на время вычислений. Record slow GUI preparation:
+        # it happens before the worker starts and cannot be seen in stage logs.
+        lock_started = time.perf_counter()
         self._disable_ui_during_compute(True)
+        lock_elapsed = time.perf_counter() - lock_started
+        if lock_elapsed >= 0.5:
+            self.progress_manager.log_info(
+                f'Подготовка интерфейса к очереди: {lock_elapsed:.3f} с')
 
         self._compute_thread = threading.Thread(target=self._compute_wrapper, args=(tuple(self.image_processor.tasks),))
         self._compute_thread.daemon = True
@@ -8132,7 +8388,7 @@ class App(TkinterApp):
                 self.progress_manager.log_error(f'Очистка GPU: {error}')
             self.after_safe(0, lambda: self.cancel_compute_button.configure(state='disabled', text='Отменить расчёт'))
             try:
-                self.after_safe(0, lambda: self._disable_ui_during_compute(False))
+                self.after_safe(0, lambda: (self._disable_ui_during_compute(False), self._update_ui_for_current_task()))
             except Exception as e:
                 self.progress_manager.log_error(f"Ошибка при отключении UI: {str(e)}")
 
@@ -8855,6 +9111,7 @@ class App(TkinterApp):
 
     def compute(self, tasks=None):
         """GPU-first pipeline; the queue never changes the selected backend."""
+        from time import perf_counter
         from compute.batch_runner import BatchJournal, run_batch, snapshot_inputs
         from ml.batch_plan import preview_task_ml_operations
         tasks = tuple(tasks) if tasks is not None else ((self.current_task,) if self.current_task else ())
@@ -8864,15 +9121,75 @@ class App(TkinterApp):
         self._pending_resume_journal = None
         report_rows = []
         operations = {}
+        ready_skipped = 0
+        selection_elapsed = None
+        selection_times = []
         try:
             if journal is None:
+                # Resuming a research is implicit: the normal Start queue button
+                # inspects durable prior attempts and real artifacts. No extra
+                # file chooser, no re-run of unchanged completed tasks.
+                from compute.queue_selection import select_pending_tasks
+                # Integrity checks can unpack sizeable KNN checkpoints for every
+                # previously completed task. Make the long preparation visible
+                # and cancellable instead of appearing to freeze before stage 1.
+                selection_started = perf_counter()
+                status_update = getattr(self.progress_manager, 'set_status', lambda *_: None)
+                status_update('Проверка сохранённых задач и результатов…')
+                self.progress_manager.log_info(
+                    f'Проверка готовности очереди: {len(tasks)} задач; '
+                    'готовые результаты проверяются перед пропуском')
+
+                def selection_progress(index, total, item):
+                    now = perf_counter()
+                    if selection_times:
+                        selection_times[-1]['seconds'] = now - selection_times[-1]['started']
+                    selection_times.append(dict(name=item.task_name, started=now))
+                    status_update(f'Проверка результатов: {index}/{total} · {item.task_name}')
+                    if index == 1 or index % 5 == 0 or index == total:
+                        self.progress_manager.log_info(
+                            f'Проверка готовности: {index}/{total} · {item.task_name}')
+
+                tasks, already_ready = select_pending_tasks(
+                    tasks, self.image_processor.root_folder_path,
+                    self.progress_manager.run_control, progress=selection_progress)
+                selection_finished = perf_counter()
+                selection_elapsed = selection_finished - selection_started
+                if selection_times:
+                    selection_times[-1]['seconds'] = selection_finished - selection_times[-1]['started']
+                self.progress_manager.log_info(
+                    f'Проверка готовности завершена за {selection_elapsed:.3f} с: '
+                    f'запуск {len(tasks)}, пропуск {len(already_ready)}')
+                ready_skipped = len(already_ready)
+                if ready_skipped:
+                    self.progress_manager.log_info(
+                        f'Пропущено {ready_skipped} завершённых задач: файлы и настройки актуальны')
+                if not tasks:
+                    self.progress_manager.log_info('Все задачи актуальны: новых расчётов нет')
+                    self.after_safe(0, lambda: mb.showinfo(
+                        'Очередь', 'Все задачи уже рассчитаны. Новых или незавершённых задач нет.'))
+                    return dict(status='completed', completed=0, partial_failed=0,
+                                failed=0, pending=0, interrupted=0,
+                                cancelled=0, history_pending=0,
+                                skipped_ready=ready_skipped)
                 journal = BatchJournal.create(self.image_processor.root_folder_path, tasks,
                     self.image_processor.backend.requested_backend)
                 journal.document['experiment_id'] = self.image_processor.experiment_id
+                # A forecast is informational (point density varies); the
+                # per-task lower-bound check protects actual CWT writes.
+                from compute.disk_budget import queue_disk_forecast, MIB
+                try:
+                    disk_plan = queue_disk_forecast(tasks, self.image_processor.root_folder_path)
+                    journal.document['disk_forecast'] = disk_plan
+                    self.progress_manager.log_info(
+                        f'Диск очереди: прогноз ≈ {disk_plan["forecast_bytes"] / (1024*MIB):.2f} ГиБ, '
+                        f'свободно ≈ {disk_plan["free_bytes"] / (1024*MIB):.2f} ГиБ; '
+                        f'без размеров входов: {disk_plan["unknown"]}. Оценка зависит от числа точек.')
+                except OSError as error:
+                    self.progress_manager.log_error(f'Оценка диска недоступна: {error}')
                 journal.flush()
-                snapshot_inputs(journal,tasks,self.progress_manager.run_control)
+                snapshot_inputs(journal,tasks,self.progress_manager.run_control,release_memory=True)
             self._last_batch_path = str(journal.path)
-            self.progress_manager.log_info(f'Журнал очереди: {journal.path}')
             stages = []
             for task, row in zip(tasks, journal.document['tasks']):
                 try:
@@ -8888,15 +9205,27 @@ class App(TkinterApp):
                     row['preparation_error'] = str(error)
             journal.flush()
             self.progress_manager.begin_run(f'Очередь · {len(tasks)} задач',stages or ['История'])
+            self.progress_manager.log_info(f'Журнал очереди: {journal.path}')
+            if selection_elapsed is not None:
+                self.progress_manager.log_info(
+                    f'Предварительная проверка результатов: {selection_elapsed:.3f} с; '
+                    f'проверено {len(tasks) + ready_skipped} задач, пропущено {ready_skipped}')
+                for item in sorted(selection_times, key=lambda row: row.get('seconds', 0),
+                                   reverse=True)[:5]:
+                    self.progress_manager.log_info(
+                        f'Проверка {item["name"]}: {item.get("seconds", 0):.3f} с')
             summary = run_batch(journal,tasks,
                 lambda task,row: self._execute_pipeline_task(task,operations[id(task)],report_rows,journal,row),
-                self._record_pipeline_attempt,self.progress_manager.run_control,self.progress_manager.log_error)
+                self._record_pipeline_attempt,self.progress_manager.run_control,self.progress_manager.log_error,
+                lazy_inputs=True)
+            summary['skipped_ready'] = ready_skipped
             self._last_batch_summary = summary
             self.after_safe(0,self._refresh_history_tab)
             self.after_safe(0,self._update_pipeline_controls_state)
             if summary['status'] == 'completed':
                 elapsed = sum(row.get('duration_seconds',0) for row in journal.document['tasks'])
-                self.after_safe(0,lambda: self.show_success_message(elapsed,len(tasks),ml_report=bool(report_rows)))
+                self.after_safe(0, lambda: self._finish_pipeline_queue_ui(
+                    elapsed, len(tasks), ready_skipped))
             else:
                 self.progress_manager.fail_run(
                     f"Очередь: готово {summary['completed']}; частично {summary['partial_failed']}; "
@@ -8918,13 +9247,44 @@ class App(TkinterApp):
             raise
         finally:
             if journal is not None:
+                # The dialog only reads the in-memory batch journal, not the
+                # archival HTML/JSON. Show it while the worker produces the
+                # potentially expensive audit report instead of waiting for I/O.
+                self.after_safe(0, lambda j=journal, skipped=ready_skipped,
+                                ml_rows=list(report_rows):
+                                self._show_queue_report(j, skipped, ml_rows))
                 try:
                     from history.batch_report import export_report
                     self._last_batch_report = str(export_report(journal))
                     self.progress_manager.log_info(f'Отчёт очереди: {self._last_batch_report}')
                 except Exception as error:
                     self.progress_manager.log_error(f'Не удалось сохранить отчёт очереди: {error}')
-            self._complete_ml_report(report_rows,self.image_processor.root_folder_path)
+
+    def _finish_pipeline_queue_ui(self, elapsed, task_count, skipped):
+        self._update_ml_tab_state()
+        message = f'Завершено: {task_count} задач · {format_time(elapsed)}'
+        if skipped:
+            message += f' · готовых пропущено: {skipped}'
+        self.progress_manager.finish_run(
+            message,
+            result_callback=lambda: self._show_saved_results(
+                self.image_processor.root_folder_path),
+            folder_callback=lambda: self._open_result_path(
+                self.image_processor.root_folder_path),
+            history_callback=self._show_history_page)
+
+    def _show_queue_report(self, journal, skipped=0, ml_rows=None):
+        from utils.queue_run_report import QueueRunReport
+        previous = getattr(self, '_queue_report_window', None)
+        if previous is not None and previous.winfo_exists():
+            previous.destroy()
+        self._queue_report_window = QueueRunReport(
+            self, journal, skipped,
+            on_results=lambda: self._show_saved_results(
+                self.image_processor.root_folder_path),
+            on_continue=lambda: None,
+            on_ml_details=(lambda: self._show_ml_report(
+                ml_rows, self.image_processor.root_folder_path)) if ml_rows else None)
 
     def _open_batch_report(self):
         from tkinter import filedialog
@@ -8957,7 +9317,7 @@ class App(TkinterApp):
         try:
             journal = BatchJournal.load(filename)
             journal.prepare_resume()
-            tasks = restore_tasks(journal)
+            tasks = restore_tasks(journal, lazy=True)
             if not tasks:
                 raise ValueError('Очередь пуста')
             self.image_processor.root_folder_path = str(journal.path.resolve().parents[2])

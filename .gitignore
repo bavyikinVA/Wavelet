@@ -55,8 +55,7 @@ logs/
 .coverage
 coverage.xml
 htmlcov/
-# Source tests and reproducible benchmarks must be versioned in Git.
-tests/
+# tests/, docs/, cross_spectra/ and the app icon are tracked source assets.
 # =========================
 # Build / package artifacts
 # =========================
@@ -64,7 +63,6 @@ build/
 dist/
 *.egg-info/
 .eggs/
-*ico
 # =========================
 # OS files
 # =========================
@@ -111,11 +109,9 @@ visualizations/
 processed/
 processed_images/
 
-cross_spectra/
 
 test_images/
 gaussian_validation_inputs/
-docs/
 create_test_images.py
 gaussian_cwt_validation.py
 patch_viewer.py

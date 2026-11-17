@@ -3,7 +3,6 @@ Setup script for CUDA environment
 """
 
 import os
-import sys
 
 
 def setup_cuda_environment():

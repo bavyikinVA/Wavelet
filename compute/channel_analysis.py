@@ -6,7 +6,7 @@ channels are then used by all downstream stages.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -425,7 +425,10 @@ def write_channel_manifest(task, task_folder: str | Path) -> Path:
         except (OSError, json.JSONDecodeError):
             backup = path.with_name("manifest.invalid.json")
             try:
-                backup.write_bytes(path.read_bytes())
+                from history.atomic_io import atomic_binary_writer
+                with path.open('rb') as source, atomic_binary_writer(backup) as destination:
+                    import shutil
+                    shutil.copyfileobj(source, destination, length=1024 * 1024)
             except OSError:
                 pass
 

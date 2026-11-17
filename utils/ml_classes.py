@@ -1,7 +1,6 @@
 """Presentation of saved ML labels; never recompute scientific classifications."""
 import numpy as np
 from matplotlib.colors import to_rgba, to_hex
-from matplotlib import colormaps
 from ml.color_scheme import class_name, categorical_ml_rgba
 
 DBSCAN_STATES = ('плотная структура', 'неустойчивая область', 'устойчивая аномалия')

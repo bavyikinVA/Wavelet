@@ -10,8 +10,8 @@ from PIL import Image, ImageDraw
 
 from utils.layer_catalog import (GROUPS, GROUP_LABELS, algorithm_line,
                                  card_footer, category_color, category_tree,
-                                 parameter_line, point_scope, process_line,
-                                 result_id, task_id, title)
+                                 parameter_line, process_line,
+                                 result_id, title)
 
 BG = '#171717'
 PANEL = '#1c1c1c'

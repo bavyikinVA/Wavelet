@@ -1,4 +1,8 @@
 import tkinter as tk
+import threading
+import itertools
+import time
+from collections import deque
 import customtkinter as ctk
 from typing import Optional, Callable
 from utils.theme import AppTheme
@@ -15,7 +19,15 @@ class TkinterApp(ctk.CTk):
         from utils.tk_lifecycle import install_callback_cleanup
         install_callback_cleanup(self)
         self._is_destroyed = False
-        self._pending_callbacks = {}  # Словарь активных after callbacks
+        self._ui_thread_id = threading.get_ident()
+        self._dispatch_lock = threading.Lock()
+        self._dispatch_queue = deque()
+        self._dispatch_sequence = itertools.count(1)
+        # For main-thread callbacks: token -> Tk timer id. For worker requests:
+        # token -> None until scheduled by the main event loop.
+        self._pending_callbacks = {}
+        # The polling callback is registered strictly from the Tk owner thread.
+        self._dispatch_pump_id = self.after(16, self._drain_thread_callbacks)
         self._child_windows = []  # Список дочерних окон
         self.protocol("WM_DELETE_WINDOW", self.safe_destroy)
         self._buffered_paint = False
@@ -56,11 +68,18 @@ class TkinterApp(ctk.CTk):
                 print(f'Exception while destroying {child_window}: {e}')
         self._child_windows.clear()
 
-        # Отменяем все запланированные callbacks
-        for callback_id in list(self._pending_callbacks.keys()):
+        # Close the Python-only ingress first so workers cannot enqueue
+        # callbacks while the Tcl interpreter is being destroyed.
+        with self._dispatch_lock:
+            registered = [timer for timer in self._pending_callbacks.values() if timer]
+            self._pending_callbacks.clear()
+            self._dispatch_queue.clear()
+        registered.append(self._dispatch_pump_id)
+        for callback_id in registered:
+            if callback_id is None:
+                continue
             try:
                 self.after_cancel(callback_id)
-                del self._pending_callbacks[callback_id]
             except tk.TclError:
                 pass
 
@@ -70,45 +89,101 @@ class TkinterApp(ctk.CTk):
         except tk.TclError:
             pass
 
-    def after_safe(self, ms: int, func: Callable, *args) -> Optional[str]:
-        """Безопасный вызов after с отслеживанием callback'ов.
+    def _drain_thread_callbacks(self):
+        """Dispatch worker requests on the Tk owner thread, with a time budget."""
+        if self._is_destroyed:
+            return
+        started = time.monotonic()
+        for _ in range(80):
+            if time.monotonic() - started >= 0.010:
+                break
+            with self._dispatch_lock:
+                if not self._dispatch_queue:
+                    break
+                item = self._dispatch_queue.popleft()
+            if item[0] == 'cancel':
+                try:
+                    self.after_cancel(item[1])
+                except tk.TclError:
+                    pass
+                continue
+            token, ms, func, args = item
+            with self._dispatch_lock:
+                if token not in self._pending_callbacks:
+                    continue  # Cancelled before it reached the main loop.
+            if ms <= 0:
+                self._run_ui_callback(token, func, args)
+            else:
+                try:
+                    timer_id = self.after(ms, lambda t=token, f=func, a=args:
+                                          self._run_ui_callback(t, f, a))
+                except tk.TclError:
+                    with self._dispatch_lock:
+                        self._pending_callbacks.pop(token, None)
+                    continue
+                with self._dispatch_lock:
+                    if token in self._pending_callbacks:
+                        self._pending_callbacks[token] = timer_id
+                    else:
+                        self.after_cancel(timer_id)  # Already cancelled.
+        if not self._is_destroyed:
+            self._dispatch_pump_id = self.after(16, self._drain_thread_callbacks)
 
-        Идентификатор хранится в mutable-контейнере: callback с задержкой 0
-        теоретически может быть обработан очень быстро, поэтому замыкание не
-        должно обращаться к локальной переменной до её присваивания.
+    def _run_ui_callback(self, token, func, args):
+        with self._dispatch_lock:
+            active = token in self._pending_callbacks
+        try:
+            if active and not self._is_destroyed:
+                func(*args)
+        except Exception as error:
+            print(f"Callback error: {error}")
+        finally:
+            with self._dispatch_lock:
+                self._pending_callbacks.pop(token, None)
+
+    def after_safe(self, ms: int, func: Callable, *args) -> Optional[str]:
+        """Thread-safe callback delivery: workers never invoke any Tk method.
+
+        The mainloop polls only the Python queue, at most 80 requests/10ms per
+        tick. Worker cancellation also uses the queue, never Tk.after_cancel.
         """
         if self._is_destroyed:
             return None
-
+        if threading.get_ident() != self._ui_thread_id:
+            with self._dispatch_lock:
+                if self._is_destroyed:
+                    return None
+                token = f'worker-{next(self._dispatch_sequence)}'
+                self._pending_callbacks[token] = None
+                self._dispatch_queue.append((token, max(0, int(ms)), func, args))
+            return token
         holder = {"id": None}
-
         def safe_func():
-            try:
-                if not self._is_destroyed:
-                    func(*args)
-            except Exception as e:
-                print(f"Callback error: {e}")
-            finally:
-                callback_id = holder["id"]
-                if callback_id is not None:
-                    self._pending_callbacks.pop(callback_id, None)
-
+            self._run_ui_callback(holder['id'], func, args)
         try:
             callback_id = self.after(ms, safe_func)
-            holder["id"] = callback_id
-            self._pending_callbacks[callback_id] = True
+            holder['id'] = callback_id
+            with self._dispatch_lock:
+                self._pending_callbacks[callback_id] = callback_id
             return callback_id
         except tk.TclError:
             return None
 
     def after_cancel_safe(self, callback_id: str) -> None:
-        """Безопасная отмена callback'а"""
-        if callback_id in self._pending_callbacks:
-            try:
-                self.after_cancel(callback_id)
-                del self._pending_callbacks[callback_id]
-            except tk.TclError:
-                pass
+        if callback_id is None:
+            return
+        with self._dispatch_lock:
+            marker = object()
+            timer_id = self._pending_callbacks.pop(callback_id, marker)
+            if timer_id is marker or timer_id is None:
+                return  # Not registered or still queued in Python.
+            if threading.get_ident() != self._ui_thread_id:
+                self._dispatch_queue.append(('cancel', timer_id))
+                return
+        try:
+            self.after_cancel(timer_id)
+        except tk.TclError:
+            pass
 
 
 class ScrollableFrame(ctk.CTkFrame):

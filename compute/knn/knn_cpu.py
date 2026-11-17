@@ -614,7 +614,8 @@ def draw_knn_graph(points, neighbors_dict, scale, channel, extreme_type, filenam
             if progress_callback:
                 progress_callback(0.9, "Сохранение PNG...")
 
-            fig.savefig(filename, dpi=180, bbox_inches='tight')
+            from history.atomic_io import atomic_savefig
+            atomic_savefig(filename, figure=fig, dpi=180, bbox_inches='tight')
             _profile_stat(profiling_stats, "image_files", 1)
 
         # PNG and TXT are independent export formats.  PNG generation must
@@ -628,6 +629,7 @@ def draw_knn_graph(points, neighbors_dict, scale, channel, extreme_type, filenam
     except Exception as e:
         if log_callback:
             log_callback(f"Ошибка при отрисовке KNN: {e}")
+        raise
     finally:
         if fig is not None:
             plt.close(fig)
@@ -655,7 +657,8 @@ def save_knn_info(
                 progress_callback(0.2, "Запись заголовка...")
 
             rows_written = 0
-            with open(filename, 'w', encoding='utf-8') as f:
+            from history.atomic_io import atomic_text_writer
+            with atomic_text_writer(filename, encoding='utf-8') as f:
                 f.write("# META\n")
                 f.write(f"# scale={scale}\n")
                 f.write(f"# channel={channel}\n")
@@ -706,3 +709,4 @@ def save_knn_info(
     except Exception as e:
         if log_callback:
             log_callback(f"Ошибка сохранения KNN: {e}")
+        raise

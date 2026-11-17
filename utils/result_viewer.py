@@ -10,8 +10,6 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from history.result_catalog import discover_results
 from history.result_data import load_result
 from utils.theme import AppTheme
-from utils.icon_button import IconButton
-from utils.animation import animate_visibility
 from utils.result_layers import LayerControls
 from utils.scrollable_dropdown import ScrollableComboBox, ScrollableOptionMenu
 from utils.raster_levels import RasterLevels

@@ -11,7 +11,6 @@ The project historically used a strict 3-sample rule::
 from __future__ import annotations
 
 import math
-from typing import Iterable
 
 import numpy as np
 from scipy.signal import find_peaks
