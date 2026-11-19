@@ -133,7 +133,11 @@ def category_color(item):
 
 
 def card_title(item):
-    return title(item)
+    label = title(item)
+    region = item.get('roi_id')
+    if region is not None:
+        return f'{label} · Область {region}'
+    return label
 
 
 def card_meta(item):
@@ -162,8 +166,42 @@ def details(item):
     return '\n'.join(str(value) for value in fields if value)
 
 
+def _scale_key(item):
+    try:
+        value = float(item.get('scale'))
+        return value if math.isfinite(value) else float('inf')
+    except (TypeError, ValueError, OverflowError):
+        return float('inf')
+
+
+def roi_family_key(item):
+    """All scientific settings that must agree for ROI siblings to be grouped.
+
+    The ROI number itself is deliberately excluded.  Unlike the path, these
+    fields reflect the CWT, point-search and ML configuration of the result.
+    This is also the contract used by the picker for 'select all ROI'.
+    """
+    fields = ('task_id', 'result_scope', 'category', 'artifact', 'scale',
+              'channel', 'cwt_direction', 'direction', 'feature_axis',
+              'point_kind', 'orientation', 'wavelet_variant', 'algorithm',
+              'ml_run', 'quantity')
+    return tuple(_scale_key(item) if key == 'scale' else str(item.get(key) or '')
+                 for key in fields) + (repr(sorted((item.get('ml_parameters') or {}).items())),)
+
+
+def _roi_order(item):
+    try:
+        return (0, int(item['roi_id'])) if item.get('roi_id') is not None else (1, 0)
+    except (ValueError, TypeError):
+        return (1, 0)
+
+
 def search_results(items, scope=None, query='', order='scale'):
-    """AND search over human labels and exact saved metadata."""
+    """Filter by saved metadata; order equal configurations by ROI number.
+
+    This ensures that ROI 1, 2, ... are adjacent for every sort mode, even
+    when region directories and filenames happen to be interleaved.
+    """
     terms = query.casefold().replace('ё', 'е').split()
     matches = []
     for item in items:
@@ -176,17 +214,16 @@ def search_results(items, scope=None, query='', order='scale'):
             item.get('algorithm'), item.get('scale'), item.get('channel'),
             item.get('direction'), item.get('cwt_direction'), item.get('feature_axis'),
             item.get('point_kind'), item.get('ml_run'), item.get('display_label'),
+            f"Область {item['roi_id']} ROI {item['roi_id']}" if item.get('roi_id') is not None else None,
             Path(item['path']).stem, item.get('ml_parameters')
         ) if x is not None).casefold().replace('ё', 'е')
         if all(term in searchable for term in terms):
             matches.append(item)
 
-    def scale_key(item):
-        try:
-            value = float(item.get('scale'))
-            return value if math.isfinite(value) else float('inf')
-        except (TypeError, ValueError, OverflowError):
-            return float('inf')
+    # A single group sort is shared by all modes.  Paths are used only as the
+    # final deterministic tie-breaker, after the ROI number.
+    def sibling_key(item):
+        return roi_family_key(item) + (_roi_order(item), result_id(item))
 
     if order == 'recent':
         def modified(item):
@@ -194,16 +231,22 @@ def search_results(items, scope=None, query='', order='scale'):
                 return Path(item['path']).stat().st_mtime_ns
             except OSError:
                 return 0
-        matches.sort(key=lambda it: (modified(it), result_id(it)), reverse=True)
+        # A group is ordered by its latest result, not by each member's mtime.
+        group_time = {}
+        for item in matches:
+            family = roi_family_key(item)
+            group_time[family] = max(group_time.get(family, 0), modified(item))
+        matches.sort(key=lambda it: (-group_time[roi_family_key(it)], sibling_key(it)))
     elif order == 'scale_desc':
-        matches.sort(key=lambda it: (math.isinf(scale_key(it)), -scale_key(it),
-                                     str(it.get('channel') or ''), result_id(it)))
+        matches.sort(key=lambda it: (math.isinf(_scale_key(it)), -_scale_key(it),
+                                     sibling_key(it)))
     elif order == 'channel':
-        matches.sort(key=lambda it: (str(it.get('channel') or ''), scale_key(it), result_id(it)))
+        matches.sort(key=lambda it: (str(it.get('channel') or '').casefold(),
+                                     _scale_key(it), sibling_key(it)))
     elif order == 'name':
-        matches.sort(key=lambda it: (title(it).casefold(), result_id(it)))
+        matches.sort(key=lambda it: (title(it).casefold(), sibling_key(it)))
     else:
-        matches.sort(key=lambda it: (scale_key(it), str(it.get('channel') or ''), result_id(it)))
+        matches.sort(key=lambda it: (_scale_key(it), sibling_key(it)))
     return matches
 
 

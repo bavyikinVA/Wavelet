@@ -166,6 +166,7 @@ class LayerControls(ctk.CTkFrame):
             kind = {'max': 'Максимумы', 'min': 'Минимумы',
                     'upper': 'Верхняя', 'lower': 'Нижняя'}.get(item.get('point_kind'))
             parts = [item.get('task_name'), item.get('category'),
+                     f"ROI {item['roi_id']}" if item.get('roi_id') is not None else None,
                      f"s={item['scale']}" if item.get('scale') else None,
                      item.get('channel'), cwt if cwt != 'Без направления' else None,
                      axis, kind]
@@ -209,6 +210,8 @@ class LayerControls(ctk.CTkFrame):
         else:
             detail = ''
         pieces = [category, detail]
+        if item.get('roi_id') is not None:
+            pieces.append(f"ROI {item['roi_id']}")
         if scale not in (None, ''):
             pieces.append(f's={scale}')
         if channel:

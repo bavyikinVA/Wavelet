@@ -8,7 +8,8 @@ import tkinter as tk
 import customtkinter as ctk
 
 from history.result_data import load_result
-from utils.layer_catalog import GROUPS, card_title, details, result_id, search_results, task_id
+from utils.layer_catalog import (GROUPS, card_title, details, result_id,
+                                 roi_family_key, search_results, task_id)
 from utils.layer_compatibility import check_loaded, preflight
 from utils.rendering import enable_dark_titlebar
 from utils.layer_picker_widgets import (ACTIVE, BG, BORDER, BLUE,
@@ -137,6 +138,7 @@ class LayerPicker(ctk.CTkToplevel):
             font=ctk.CTkFont(size=11), command=lambda _v: self.refresh()
         )
         self.sort.grid(row=0, column=1, sticky='e')
+        self._visible_results = []
         self.result_list = VirtualResultList(main, self._toggle, self._show_details)
         self.result_list.grid(row=1, column=0, sticky='nsew', padx=(13, 9), pady=(0, 12))
 
@@ -147,15 +149,21 @@ class LayerPicker(ctk.CTkToplevel):
         self.status = ctk.CTkLabel(footer, text='Выбрано: 0', anchor='w',
                                    text_color=MUTED, font=ctk.CTkFont(size=11))
         self.status.grid(row=0, column=0, sticky='ew')
+        self.group_button = ctk.CTkButton(
+            footer, text='Все ROI набора', width=135, height=34, corner_radius=9,
+            fg_color=SURFACE, hover_color='#343434', text_color=TEXT,
+            command=self._select_roi_siblings,
+        )
+        self.group_button.grid(row=0, column=1, padx=(8, 0))
         self.cancel_button = ctk.CTkButton(footer, text='Отмена', width=105,
                                            height=34, corner_radius=9,
                                            fg_color=SURFACE, hover_color='#343434',
                                            text_color=TEXT, command=self.close)
-        self.cancel_button.grid(row=0, column=1, padx=(10, 8))
+        self.cancel_button.grid(row=0, column=2, padx=(10, 8))
         self.add_button = ctk.CTkButton(footer, text='Добавить', width=145,
                                         height=34, corner_radius=9, fg_color='#28699d',
                                         hover_color='#3385c4', command=self.add_selected)
-        self.add_button.grid(row=0, column=2)
+        self.add_button.grid(row=0, column=3)
         self._refresh_status()
         self.refresh()
         self.after(40, self._grab_if_open)
@@ -210,7 +218,9 @@ class LayerPicker(ctk.CTkToplevel):
             if active_scope else 'Все результаты'
         )
         self.count_label.configure(text=f'Результаты · {label}  ({len(results)})')
+        self._visible_results = results
         self.result_list.set_results(results, self.selected, self.added_ids)
+        self._refresh_status()
 
     def _schedule_search(self):
         if self._search_job is not None:
@@ -244,10 +254,42 @@ class LayerPicker(ctk.CTkToplevel):
         self.result_list.set_selected(self.selected)
         self._refresh_status()
 
+    def _available_roi_siblings(self):
+        """Unselected, visible results of the same scientific configuration."""
+        if not self.selection_order:
+            return []
+        anchor = self.by_id.get(self.selection_order[-1])
+        if anchor is None or anchor.get('roi_id') is None:
+            return []
+        family = roi_family_key(anchor)
+        return [item for item in self._visible_results
+                if item.get('roi_id') is not None and roi_family_key(item) == family
+                and result_id(item) not in self.selected
+                and result_id(item) not in self.added_ids]
+
+    def _select_roi_siblings(self):
+        if self._busy:
+            return
+        siblings = self._available_roi_siblings()
+        if len(self.selected) + len(siblings) > MAX_BATCH:
+            messagebox.showwarning('Слишком много слоёв',
+                                   f'За один раз можно добавить не более {MAX_BATCH} слоёв.',
+                                   parent=self)
+            return
+        for item in siblings:
+            identifier = result_id(item)
+            self.selected.add(identifier)
+            self.selection_order.append(identifier)
+        self.result_list.set_selected(self.selected)
+        self._refresh_status()
+
     def _refresh_status(self):
         self.status.configure(text=f'Выбрано: {len(self.selected)}' +
                               (f'  ·  Уже добавлено: {len(self.added_ids)}' if self.added_ids else ''))
         self.add_button.configure(state='normal' if self.selected and not self._busy else 'disabled')
+        if hasattr(self, 'group_button'):
+            self.group_button.configure(state='normal' if not self._busy and
+                                        self._available_roi_siblings() else 'disabled')
 
     def add_selected(self):
         if self._busy or not self.selected:

@@ -148,7 +148,7 @@ def _canonical_result_key(item):
     if item.get('artifact') == 'cwt2d' and stem.endswith('_complex'):
         stem = stem[:-8]
     return (item['task_id'], item['result_scope'], item.get('ml_run'),
-            item['category'], item.get('artifact'), item.get('direction'),
+            item.get('roi_id'), item['category'], item.get('artifact'), item.get('direction'),
             item.get('feature_axis'), item.get('point_kind'),
             item.get('scale'), item.get('orientation'), item.get('channel'),
             item.get('algorithm'), stem)
@@ -187,6 +187,8 @@ def discover_results(folder):
         if not path.is_file():
             continue
         relative = path.relative_to(root)
+        if 'roi' in relative.parts and path.name.casefold() == 'regions.npz':
+            continue
         if any(part.casefold().startswith('.pipeline_cache') for part in relative.parts):
             continue
         if not (path.name.casefold() in {'image.png', 'изображение.png'}
@@ -233,6 +235,8 @@ def result_parameters(path):
     """
     name = str(path).replace('\\', '/').casefold()
     basename = Path(name).name
+    roi_match = re.search(r'(?:^|/)region_(\d+)(?:/|$)', name)
+    roi_id = int(roi_match[1]) if roi_match else None
     number = r'([-+]?\d+(?:[.,]\d+)?(?:e[-+]?\d+)?)'
     def numeric(pattern):
         match = re.search(pattern + number, name)
@@ -309,6 +313,7 @@ def result_parameters(path):
     quantity = next((value for value in ('magnitude', 'phase', 'complex')
                      if f'_{value}' in basename), None)
     return dict(
+        roi_id=roi_id,
         scale=current_scale or numeric(r'(?:масштаб|scale)[_ ]*'),
         orientation=current_angle or numeric(r'(?:angle|угол)[_ ]*'),
         wavelet_variant=('isotropic' if artifact == 'cwt2d' and '_iso' in basename else None),
@@ -355,6 +360,8 @@ def result_display_label(path, parameters=None):
         'ml': 'ML-результат',
     }
     parts = [labels.get(artifact, category_name)]
+    if parameters.get('roi_id') is not None:
+        parts.append(f"Область {parameters['roi_id']}")
     cwt_direction = parameters.get('cwt_direction')
     if cwt_direction:
         parts.append(

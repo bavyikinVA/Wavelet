@@ -59,6 +59,29 @@ def group_runs_by_task(runs):
     return result
 
 
+def history_roi_summary(snapshot):
+    """Display the ROI count recorded by a task/run, not the current mask files.
+
+    Snapshots predate ROI support; those should not acquire a misleading label.
+    The scientific pipeline performs CWT on the full image and filters point
+    processing to separately selected ROI masks.
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    regions = snapshot.get('roi_regions')
+    if isinstance(regions, list):
+        count = len(regions)
+    else:
+        count = 0
+    if not (count and snapshot.get('roi_enabled', True)):
+        return None
+    suffix = ('область' if count % 10 == 1 and count % 100 != 11 else
+              'области' if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14)
+              else 'областей')
+    return (f'{count} {suffix} · CWT по всему изображению; '
+            'экстремумы, огибающие и KNN — отдельно по ROI')
+
+
 def history_snapshot_changes(task_meta, run_meta, *, task_image=None, run_image=None):
     """Only historical settings differing from the task's current snapshot.
 
@@ -80,6 +103,12 @@ def history_snapshot_changes(task_meta, run_meta, *, task_image=None, run_image=
         if run_meta.get(key) not in (None, '')
         and (reference is None or run_meta.get(key) != reference.get(key))
     ]
+    # A run can have different ROI annotations than the task currently saved.
+    # Show even a change back to full-image processing when it is relevant.
+    run_roi = run_meta.get('roi')
+    task_roi = reference.get('roi') if reference is not None else None
+    if run_roi != task_roi and (run_roi or task_roi):
+        changes.append(('Области ROI', run_roi or 'Не использовались'))
     if run_image and (reference is None or run_image != task_image):
         from pathlib import Path
         # Support Windows paths even when testing on another platform.

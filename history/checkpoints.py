@@ -45,6 +45,7 @@ def save_feature_checkpoint(task, *, cancel_check=None):
         return ""
     payload = {
         "version": CHECKPOINT_VERSION,
+        "roi_sha256": task.roi_fingerprint() if hasattr(task, "roi_fingerprint") else None,
         "knn_results": task.knn_results,
         "statistics_results": task.statistics_results,
         "synchronization_results": task.synchronization_results,
@@ -94,6 +95,8 @@ def restore_feature_checkpoint(task, output_dir):
             payload = pickle.load(stream)
         if not isinstance(payload, dict) or payload.get("version") != CHECKPOINT_VERSION:
             raise ValueError("версия или структура контрольной точки не поддерживается")
+        if payload.get("roi_sha256") != (task.roi_fingerprint() if hasattr(task, "roi_fingerprint") else None):
+            raise ValueError("маски ROI изменились после сохранения KNN")
         if not isinstance(payload.get('knn_results', {}), dict):
             raise ValueError("некорректный список KNN-источников")
     except _RECOVERY_ERRORS as error:

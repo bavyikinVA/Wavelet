@@ -144,6 +144,12 @@ class ProcessingTask:
         self.color1 = None
         self.color2 = None
         self.gram_schmidt_applied = False
+        # None means the original full-image pipeline; overlapping masks are independent.
+        self.roi_collection = None
+        # Saved region metadata can be restored without inflating pixel masks.
+        self._roi_saved_folder = None
+        self._roi_saved_metadata = None
+        self.ml_roi_mode = "independent"
 
         # Явная методика каналов. data/data_copy всегда хранят исходный RGB.
         self.detected_color_type = "unknown"
@@ -264,6 +270,9 @@ class ProcessingTask:
         self.color1 = None
         self.color2 = None
         self.gram_schmidt_applied = False
+        self.roi_collection = None
+        self._roi_saved_folder = None
+        self._roi_saved_metadata = None
         self.detected_color_type = "unknown"
         self.grayscale_similarity = None
         self.channel_representation = "rgb"
@@ -273,6 +282,69 @@ class ProcessingTask:
         self.analysis_channel_keys = []
         self.analysis_channel_codes = []
         self.analysis_channel_labels = []
+
+    def set_roi_collection(self, regions):
+        """Change point-analysis inputs without invalidating full-image CWT."""
+        if regions is not None and len(regions):
+            if self.original_image is None or regions.shape != self.original_image.shape[:2]:
+                raise ValueError("Маски ROI должны совпадать с текущим изображением")
+        self.roi_collection = regions if regions is not None and len(regions) else None
+        self._roi_saved_folder = None
+        self._roi_saved_metadata = None
+        self.knn_results = {}
+        self.statistics_results = {}
+        self.synchronization_results = {}
+        self.ml_result = None
+        self.ml_dataset_key = None
+        # Do not clear self.result or self.last_completed_cwt_signature.
+
+    @property
+    def has_roi(self):
+        return bool((self.roi_collection is not None and len(self.roi_collection)) or
+                    (self._roi_saved_metadata and self._roi_saved_metadata.get("regions")))
+
+    def roi_fingerprint(self):
+        if self.roi_collection is not None and len(self.roi_collection):
+            return self.roi_collection.fingerprint()
+        if self._roi_saved_metadata and self._roi_saved_metadata.get("regions"):
+            return self._roi_saved_metadata.get("mask_sha256")
+        return None
+
+    def roi_descriptors(self):
+        if self.roi_collection is not None:
+            return [r.metadata() for r in self.roi_collection.regions]
+        if self._roi_saved_metadata:
+            return list(self._roi_saved_metadata.get("regions", []))
+        return []
+
+    def attach_saved_roi(self, folder):
+        """Read only ROI metadata while restoring large research queues."""
+        import json
+        from pathlib import Path
+        manifest = Path(folder) / "roi" / "regions.json"
+        self.roi_collection = None
+        self._roi_saved_folder = None
+        self._roi_saved_metadata = None
+        if manifest.is_file():
+            meta = json.loads(manifest.read_text(encoding="utf-8"))
+            if meta.get("version") != 1 or not isinstance(meta.get("regions"), list):
+                raise ValueError("Недопустимый формат описания ROI")
+            self._roi_saved_folder = str(folder)
+            self._roi_saved_metadata = meta
+
+    def ensure_roi_loaded(self):
+        """Inflate masks only for an editor session or a computation."""
+        if self.roi_collection is None and self._roi_saved_folder:
+            from image_tools.roi_model import ROICollection
+            expected = (self.original_image.shape[:2]
+                        if self.original_image is not None else
+                        self._roi_saved_metadata.get("shape"))
+            self.roi_collection = ROICollection.load(self._roi_saved_folder, expected)
+        return self.roi_collection
+
+    def release_roi_masks(self):
+        if self._roi_saved_folder and self._roi_saved_metadata:
+            self.roi_collection = None
 
     def invalidate_analysis_results(self):
         """Clear derived data after changing the analysis representation/basis."""
@@ -495,11 +567,14 @@ class ProcessingTask:
             "synchronization_output_heatmap", "synchronization_output_matrix_csv",
             "synchronization_output_pairs_csv", "scale_block_sizes",
             "row_sync_stride", "row_sync_tolerance", "row_sync_metrics",
-            "reuse_existing_results", "k_neighbors", "ml_algorithm", "ml_point_filter", "ml_feature_set",
+            "reuse_existing_results", "k_neighbors", "ml_algorithm", "ml_roi_mode", "ml_point_filter", "ml_feature_set",
             "ml_standardize", "ml_n_clusters", "ml_random_state", "ml_eps",
             "ml_min_samples", "ml_dataset_key", "ml_plan", "ml_dbscan_batch_size", "save_source_channels", "save_centering_means",
         )
         snapshot = {name: getattr(self, name) for name in fields}
+        snapshot["roi_enabled"] = self.has_roi
+        snapshot["roi_sha256"] = self.roi_fingerprint()
+        snapshot["roi_regions"] = self.roi_descriptors()
         if self.analysis_mode == "2d":
             # Old angle-based snapshots never count as a completed isotropic run.
             snapshot["morlet_variant"] = "isotropic_j0_angular_mean_v1"
@@ -624,6 +699,9 @@ class ProcessingTask:
         self._cwt_source_sha256 = snapshot.get("cwt_source_sha256")
         self._cwt_source_shape = snapshot.get("cwt_source_shape")
         self._restore_cwt_signature = False
+        self.roi_collection = None
+        self._roi_saved_folder = None
+        self._roi_saved_metadata = None
         self.image_path = snapshot.get("image_path", "")
         self.task_folder_path = ""
         self.result = {}

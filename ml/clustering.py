@@ -104,20 +104,39 @@ def _iter_knn_groups(knn_results: dict):
 def knn_dataset_options(knn_results: dict):
     """Return stable descriptors used by the GUI to select one ML source."""
     result = []
+    groups_by_science = {}
     for direction, channel, scale, point_type, payload in _iter_knn_groups(knn_results):
         count = knn_payload_point_count(payload)
         key = (direction, channel, float(scale), point_type)
+        if "@roi" in channel:
+            base = channel.split("@roi", 1)[0]
+            combined = (direction, base, float(scale), point_type)
+            groups_by_science.setdefault(combined, []).append((key, count))
         direction_name = (
             "CWT по строкам" if direction in {"rows", "row", "str", "0"}
             else "CWT по столбцам"
         )
+        base_channel = channel.split("@roi", 1)[0]
+        roi_label = (" · ROI " + channel.rsplit("@roi", 1)[-1]
+                     if "@roi" in channel else "")
         channel_name = {
             "red": "Красный", "green": "Зелёный", "blue": "Синий",
             "r": "Красный", "g": "Зелёный", "b": "Синий",
             "gray": "Gray", "gs1": "GS1", "gs2": "GS2", "gs3": "GS3",
-        }.get(channel, channel)
+        }.get(base_channel, base_channel)
+        channel_name += roi_label
         label = f"{channel_name} · a={float(scale):g} · {POINT_TYPE_LABELS.get(point_type, point_type)} · {direction_name} · {count:,} точек"
         result.append({"key": key, "label": label, "count": count})
+    # Synthetic global ML option: concatenate independently computed KNN
+    # feature sets for the same CWT/channel/scale/point kind.
+    for (direction, base, scale, point_type), groups in groups_by_science.items():
+        result.append({
+            "key": (direction, f"{base}@allroi", scale, point_type),
+            "label": (f"Все ROI · {base} · a={scale:g} · "
+                      f"{POINT_TYPE_LABELS.get(point_type, point_type)} · "
+                      f"{sum(n for _, n in groups):,} точек"),
+            "count": sum(n for _, n in groups),
+        })
     return sorted(result, key=lambda x: (x["key"][1], x["key"][2], x["key"][0], x["key"][3]))
 
 
@@ -127,7 +146,16 @@ def select_knn_dataset(knn_results: dict, dataset_key):
         return knn_results
     wanted = tuple(dataset_key)
     selected = {}
+    # @allroi is not a physical KNN dataset.  It selects all independent
+    # ROI payloads for the same scientific CWT/feature coordinates.
+    is_union = len(wanted) == 4 and str(wanted[1]).endswith("@allroi")
+    base_channel = str(wanted[1]).split("@", 1)[0] if is_union else None
     for direction, channel, scale, point_type, payload in _iter_knn_groups(knn_results):
+        if (is_union and direction == wanted[0]
+                and channel.startswith(base_channel + "@roi")
+                and float(scale) == float(wanted[2]) and point_type == wanted[3]):
+            selected[(direction, channel, scale, point_type)] = payload
+            continue
         key = (direction, channel, float(scale), point_type)
         if key == wanted:
             selected[key] = payload
@@ -217,9 +245,11 @@ def extract_knn_features(
         for point_id, point in enumerate(points):
             if point_id % 1000 == 0:
                 _check_cancel(cancel_callback)
+            roi_part = str(channel).split("@roi", 1)[-1] if "@roi" in str(channel) else ""
+            region_id = int(roi_part) if roi_part.isdecimal() else None
             record = {
                 "direction": direction,
-                "channel": str(channel),
+                "channel": str(channel).split("@", 1)[0],
                 "scale": _safe_number(scale),
                 "point_type": point_type,
                 "point_type_name": POINT_TYPE_LABELS.get(point_type, point_type),
@@ -227,6 +257,8 @@ def extract_knn_features(
                 "x": float(point[0]),
                 "y": float(point[1]),
             }
+            if region_id is not None:
+                record["roi_id"] = region_id
             for j in range(k):
                 rank = j + 1
                 record[f"neighbor_{rank}_id"] = int(indices[point_id, j])
@@ -345,10 +377,12 @@ def _plot_on_image(records, labels, image, algorithm_name, output_path):
 
 
 def _write_csv(records, labels, output_path):
+    has_roi = any(record.get("roi_id") is not None for record in records)
     columns = [
-        ("cluster", "Кластер"), ("channel", "Канал"),
-        ("scale", "Масштаб"), ("point_type_name", "Тип точки"),
-        ("direction", "Направление"),
+        ("cluster", "Кластер"),
+        *([("roi_id", "ROI")] if has_roi else []),
+        ("channel", "Канал"), ("scale", "Масштаб"),
+        ("point_type_name", "Тип точки"), ("direction", "Направление"),
         *_raw_knn_columns(records),
     ]
     with atomic_text_writer(output_path, encoding="utf-8-sig", newline="") as stream:
@@ -431,12 +465,17 @@ def _dataset_slug(records):
     if not records:
         return "dataset"
     r = records[0]
-    return ml_dataset_slug(
+    slug = ml_dataset_slug(
         r.get("direction", "row"),
-        r.get("channel", "r"),
+        str(r.get("channel", "r")).split("@", 1)[0],
         r.get("scale", 0),
         r.get("point_type", "max_by_row"),
     )
+    regions = {r.get("roi_id") for r in records if r.get("roi_id") is not None}
+    if regions:
+        slug += ("_roi" + str(next(iter(regions))) if len(regions) == 1
+                 else "_roi_combined")
+    return slug
 
 def run_clustering(
     knn_results: dict,

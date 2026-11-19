@@ -844,6 +844,15 @@ class ImageProcessor:
         silently treating the extrema axis as the CWT source direction.
         """
         plan = pipeline_plan or task.resolve_pipeline()
+        if getattr(task, "has_roi", False):
+            task.ensure_roi_loaded()
+            from compute.roi_pipeline import process_roi_points
+            return process_roi_points(
+                self, task, plan=plan, row_var=row_var, col_var=col_var,
+                max_var=bool(max_var or plan.maxima_required), min_var=min_var,
+                k=knn_var, knn_text=knn_bool_text_var,
+                knn_image=knn_bool_image_var,
+            )
         protocol = getattr(task, "execution_protocol", None)
         max_var = bool(max_var or plan.maxima_required)
         # Local import keeps this method independently testable when its code
@@ -875,6 +884,7 @@ class ImageProcessor:
         from compute.stage_profiling import StageProfile, current_rss_bytes, format_mib
         from compute.backend_policy import GPU_FALLBACK_ERRORS as _GPU_FALLBACK_ERRORS
         import numpy as _point_np
+        import os  # also required by headless method-extraction tests
 
         point_pipeline_started = _profile_time.perf_counter()
         point_pipeline_rss_start = current_rss_bytes()
@@ -2766,6 +2776,15 @@ class ImageProcessor:
             self.progress.begin_stage(f"{task.task_name} · Подготовка данных")
             task_folder = self.create_task_folder(task)
             self.progress.log_info(f"Создана папка для {task.task_name}: {task_folder}")
+            if getattr(task, "has_roi", False):
+                task.ensure_roi_loaded().save(task_folder)
+                # Allow completed queues to release masks, retaining only tiny ROI metadata.
+                task._roi_saved_folder = str(task_folder)
+                task._roi_saved_metadata = task.roi_collection.metadata()
+                self.progress.log_info(
+                    f"ROI: {len(task.roi_collection)} отдельных масок; "
+                    "CWT не ограничивается выделенными областями"
+                )
             prepared = prepare_task_channels(task)
             self.progress.log_info(
                 "Каналы анализа: " + ", ".join(item.key for item in prepared)
@@ -2781,8 +2800,11 @@ class ImageProcessor:
             current_cwt_signature = cwt_signature(task)
             can_reuse_pipeline = bool(
                 getattr(task, "reuse_existing_results", True)
-                and getattr(task, "last_completed_cwt_signature", None)
-                == current_cwt_signature
+                and (
+                    getattr(task, "last_completed_cwt_signature", None) == current_cwt_signature
+                    or (getattr(task, "has_roi", False)
+                        and stage_statuses(task).get("wavelet") == "ready")
+                )
                 and getattr(task, "task_folder_path", "")
                 and os.path.isdir(task.task_folder_path)
             )
@@ -2827,6 +2849,9 @@ class ImageProcessor:
             self.progress.begin_stage(f"{task.task_name} · {wavelet_stage}")
             self.progress.update_progress(0.0, "Начало вейвлет-преобразования...")
             if task.analysis_mode == "2d":
+                if getattr(task, "has_roi", False):
+                    raise ValueError("ROI после 2D CWT пока не реализован; "
+                                     "выберите 1D CWT или отключите маски ROI")
                 from compute.stage_profiling import StageProfile
                 cwt_profile = StageProfile("CWT 2D (расчёт и сохранение)")
                 with cwt_profile.measure():
@@ -2959,6 +2984,8 @@ class ImageProcessor:
             )
             _rss_before_cleanup = _task_rss()
             task.result = {}
+            if hasattr(task, "release_roi_masks"):
+                task.release_roi_masks()
             clear_prepared_channels(task)
             try:
                 self.clear_gpu_memory()
@@ -5012,6 +5039,19 @@ class App(TkinterApp):
             self._history_detail_line(summary, 'Масштабы', meta.get('scales'))
             self._history_detail_line(summary, 'План этапов', meta.get('stages'))
             self._history_detail_line(summary, 'Каналы и параметры', meta.get('nuances'))
+            # Run settings are authoritative for what was actually computed.
+            # The editable task snapshot can differ after a later ROI edit.
+            pipeline_runs = [r for r in runs if r.get('run_type') != 'ml']
+            roi_meta = meta.get('roi')
+            if pipeline_runs:
+                try:
+                    recorded = json.loads(pipeline_runs[0].get('settings_json') or '{}')
+                    from history.presentation import history_roi_summary
+                    roi_meta = history_roi_summary(recorded)
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            if roi_meta:
+                self._history_detail_line(summary, 'Выделенные области ROI', roi_meta)
             image_path = snapshot.get('image_path')
             if image_path:
                 self._history_detail_line(summary, 'Изображение', os.path.basename(image_path))
@@ -5196,6 +5236,7 @@ class App(TkinterApp):
 
     @staticmethod
     def _format_history_snapshot(snapshot):
+        from history.presentation import history_roi_summary
         task = ProcessingTask()
         task.apply_settings_snapshot(snapshot)
         mode = "1D" if task.analysis_mode == "1d" else "2D"
@@ -5207,6 +5248,7 @@ class App(TkinterApp):
             "scales": task.scales_summary(),
             "stages": task.executed_stage_summary(),
             "nuances": task.nuances_summary() or "без дополнительных особенностей",
+            "roi": history_roi_summary(snapshot),
         }
 
     def _save_history_note(self, run_id, note):
@@ -5274,6 +5316,25 @@ class App(TkinterApp):
         self.channel_section = CollapsibleFrame(content, title="Цветовые каналы")
         self.channel_section.pack(fill="x", padx=5, pady=2)
         self._setup_channel_section()
+
+        self.roi_section = CollapsibleFrame(content, title="Области интереса (ROI)")
+        self.roi_section.pack(fill="x", padx=5, pady=2)
+        roi_actions = ctk.CTkFrame(self.roi_section.content, fg_color="transparent")
+        self.roi_section.add_widget(roi_actions, fill="x", pady=(6, 4))
+        self.roi_button = ctk.CTkButton(
+            roi_actions, text="Выделить область", command=self.open_roi_editor,
+            width=210, height=AppTheme.BUTTON_HEIGHT,
+            font=AppTheme.body_font(), state="disabled"
+        )
+        self.roi_button.pack(side="left")
+        self.roi_label = ctk.CTkLabel(
+            self.roi_section.content,
+            text="ROI не используются — анализируется всё изображение",
+            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w", justify="left",
+        )
+        self.roi_section.add_widget(self.roi_label, fill="x", pady=(0, 7))
+
         self.data_next_button = ctk.CTkButton(
             content,
             text="Далее: параметры расчёта",
@@ -5450,6 +5511,17 @@ class App(TkinterApp):
             active_frame, text="Выберите задачу", anchor="w",
             font=AppTheme.section_title_font(), text_color="#85CAFC")
         self.ml_queue_task_label.pack(padx=11, pady=5)
+
+        self.ml_roi_mode_frame = ctk.CTkFrame(queue_frame, fg_color="transparent")
+        ctk.CTkLabel(self.ml_roi_mode_frame, text="Кластеризация областей:",
+                     font=AppTheme.body_font()).pack(side="left", padx=(0, 10))
+        self.ml_roi_mode_var = tk.StringVar(value="Независимо для каждой ROI")
+        ctk.CTkOptionMenu(
+            self.ml_roi_mode_frame, variable=self.ml_roi_mode_var,
+            values=["Независимо для каждой ROI", "Совместно для всех ROI"],
+            command=self._roi_ml_mode_changed, width=230,
+        ).pack(side="left")
+        # Shown only for tasks with ROI annotations.
 
         # The add action stays directly beneath the task, even when the plan is empty.
         actions = ctk.CTkFrame(queue_frame, fg_color="transparent")
@@ -7077,6 +7149,12 @@ class App(TkinterApp):
                     task.persistent_id = row['id']
                     task.task_folder_path = row['folder_path']
                     try:
+                        if task.task_folder_path:
+                            task.attach_saved_roi(task.task_folder_path)
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        recovery_messages.append(
+                            f"Задача {task.task_name}: ROI недоступны ({error}).")
+                    try:
                         if task.image_path or getattr(task, '_input_snapshot_sha256', None):
                             # A known hash is checked when this image is actually
                             # decoded, not while loading the 11-task index.
@@ -7835,6 +7913,7 @@ class App(TkinterApp):
             self._sync_scales_range_entries(None)
             self._set_scales_ui_mode('editing')
 
+        self._refresh_roi_section()
         self._apply_analysis_mode_ui()
         self._update_pipeline_controls_state()
         self._update_statistics_controls_state()
@@ -7948,6 +8027,90 @@ class App(TkinterApp):
         self._update_pipeline_controls_state()
 
     # Обновляем методы загрузки изображения и работы с каналами для работы с текущей задачей
+    def _refresh_roi_section(self):
+        task = getattr(self, "current_task", None)
+        button = getattr(self, "roi_button", None)
+        label = getattr(self, "roi_label", None)
+        if button is not None:
+            button.configure(state="normal" if task is not None and
+                             (task.original_image is not None or bool(getattr(task, "image_path", "")))
+                             and getattr(task, "analysis_mode", "1d") == "1d"
+                             and not getattr(self, "_compute_ui_locked", False) else "disabled")
+        if label is not None:
+            if task is not None and task.analysis_mode != "1d":
+                label.configure(text="ROI-анализ пока доступен только в CWT 1D")
+            elif task is not None and getattr(task, "has_roi", False):
+                label.configure(text=(
+                    f"Выделено: {len(task.roi_descriptors())} областей."
+                ))
+            else:
+                label.configure(text="")
+
+    def open_roi_editor(self):
+        task = getattr(self, "current_task", None)
+        if task is None or not (task.original_image is not None or task.image_path):
+            mb.showwarning("ROI", "Сначала загрузите изображение", parent=self)
+            return
+        if task.original_image is None:
+            self._hydrate_selected_task_async(task, on_ready=self.open_roi_editor)
+            return
+        if getattr(self, "_compute_ui_locked", False):
+            return
+        if task.analysis_mode != "1d":
+            mb.showwarning("ROI", "ROI-анализ экстремумов, огибающих и KNN "
+                           "пока доступен только в режиме CWT 1D", parent=self)
+            return
+        try:
+            from image_tools.roi_editor import run_roi_editor
+            edited = run_roi_editor(self, task.original_image, task.ensure_roi_loaded())
+            if edited is None:
+                return
+            old_signature = task.roi_fingerprint()
+            if (edited.fingerprint() if len(edited) else None) != old_signature:
+                task.set_roi_collection(edited)
+                # Save annotations as soon as they are accepted, even if the
+                # researcher has not launched CWT for this task yet.
+                if task.has_roi and not task.task_folder_path and self.image_processor.root_folder_path:
+                    self.image_processor.create_task_folder(task)
+                if task.task_folder_path:
+                    # Never expose old region data as if they belonged to the
+                    # newly edited masks.  CWT files live outside this folder.
+                    import shutil
+                    roi_dir = Path(task.task_folder_path) / "roi"
+                    if roi_dir.is_dir():
+                        for old_region in roi_dir.glob("region_*"):
+                            if old_region.is_dir():
+                                shutil.rmtree(old_region)
+                        (roi_dir / "statistics.csv").unlink(missing_ok=True)
+                    if task.has_roi:
+                        task.roi_collection.save(task.task_folder_path)
+                        task.attach_saved_roi(task.task_folder_path)
+                    else:
+                        shutil.rmtree(roi_dir, ignore_errors=True)
+                self._persist_experiment_task(task)
+                self._update_tasks_display()
+                self._update_ml_tab_state()
+                self.progress_manager.log_info(
+                    f"ROI обновлены: {len(edited)} областей; "
+                    "коэффициенты CWT остаются актуальными"
+                )
+            else:
+                # Appearance changes must also persist but never invalidate CWT.
+                task.roi_collection = edited if len(edited) else None
+                task._roi_saved_folder = None
+                task._roi_saved_metadata = None
+                if task.has_roi and not task.task_folder_path and self.image_processor.root_folder_path:
+                    self.image_processor.create_task_folder(task)
+                if task.has_roi and task.task_folder_path:
+                    task.roi_collection.save(task.task_folder_path)
+                    task.attach_saved_roi(task.task_folder_path)
+                self._persist_experiment_task(task)
+            self._refresh_roi_section()
+            self._update_action_availability()
+        except Exception as error:
+            self.progress_manager.log_error(f"Ошибка редактора ROI: {error}")
+            mb.showerror("ROI", str(error), parent=self)
+
     def load_image_callback(self):
         """Обработчик загрузки изображения для текущей задачи"""
         if not self.current_task:
@@ -9484,6 +9647,7 @@ class App(TkinterApp):
 
         widgets_to_disable = [
             self.load_button,
+            getattr(self, "roi_button", None),
             self.pipette_button,
             self.gram_shmidt_button,
             self.button_save_scales,
@@ -9649,6 +9813,20 @@ class App(TkinterApp):
         self._persist_experiment_task(task)
         self._refresh_ml_queue_count()
 
+    def _roi_ml_mode_changed(self, value):
+        task = getattr(self, "current_task", None)
+        if task is None:
+            return
+        self._save_ml_queue_cards()
+        task.ml_roi_mode = ("common" if value == "Совместно для всех ROI"
+                            else "independent")
+        # Previous source filters can contain explicit ROI-specific keys.
+        # Reset only those filters, without discarding algorithm parameters.
+        for cfg in task.ml_plan:
+            cfg["channels"] = "*"
+        self._persist_experiment_task(task)
+        self._render_ml_queue_cards(force=True)
+
     def _render_ml_queue_cards(self, force=False):
         """Task-aware ML cards: no hand-entered codes for channels or point types."""
         from ml.batch_plan import task_source_choices
@@ -9657,7 +9835,10 @@ class App(TkinterApp):
         if not hasattr(self, "ml_queue_cards_frame"):
             return
         choices = task_source_choices(task) if task is not None else {}
-        signature = (getattr(task, 'analysis_mode', None), tuple(
+        signature = (getattr(task, 'analysis_mode', None),
+                     getattr(task, "ml_roi_mode", "independent"),
+                     task.roi_fingerprint() if hasattr(task, "roi_fingerprint") else None,
+                     tuple(
             (key, tuple(choices[key])) for key in ('channels', 'scales', 'directions', 'point_types')
         )) if task is not None else None
         same_task = task is getattr(self, "_ml_cards_task", None)
@@ -9690,6 +9871,16 @@ class App(TkinterApp):
             self._ml_rendering_cards = False
             return
         self.ml_queue_task_label.configure(text=f"●  Активная задача: {task.task_name}")
+        if getattr(task, "has_roi", False) and hasattr(self, "ml_roi_mode_frame"):
+            self.ml_roi_mode_var.set(
+                "Совместно для всех ROI" if task.ml_roi_mode == "common"
+                else "Независимо для каждой ROI"
+            )
+            if not self.ml_roi_mode_frame.winfo_manager():
+                self.ml_roi_mode_frame.pack(fill="x", padx=12, pady=(0, 8),
+                                            before=self.ml_queue_cards_frame if self.ml_queue_cards_frame.winfo_manager() else self.ml_queue_status_label)
+        elif hasattr(self, "ml_roi_mode_frame"):
+            self.ml_roi_mode_frame.pack_forget()
         for index, cfg in enumerate(getattr(task, 'ml_plan', [])):
             algorithm = str(cfg.get('algorithm', 'kmeans')).lower()
             algorithm_name = 'K-means' if algorithm == 'kmeans' else 'DBSCAN'

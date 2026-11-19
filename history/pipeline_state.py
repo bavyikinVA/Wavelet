@@ -33,18 +33,22 @@ def _hash(payload: dict) -> str:
 
 def stage_signatures(task) -> Dict[str, str]:
     wavelet = cwt_signature(task)
-    extrema = _hash({
+    extrema_inputs = {
         "upstream": wavelet,
         "find_maxima": bool(getattr(task, "find_maxima", True)),
         "find_minima": bool(getattr(task, "find_minima", True)),
         "distance": int(getattr(task, "extrema_distance", 1)),
         "prominence": float(getattr(task, "extrema_prominence", 0.0)),
         "algorithm": "strict-local-extrema-distance-prominence-v2",
-    })
+    }
+    if getattr(task, "has_roi", False):
+        extrema_inputs.update(roi_sha256=task.roi_fingerprint(), algorithm="roi-reflect-interval-v1")
+    extrema = _hash(extrema_inputs)
     envelopes = _hash({
         "upstream": extrema,
         "algorithm": "pchip-grouped-v2",
-        "boundary_policy": "constant-nearest-support",
+        "boundary_policy": ("roi-independent-intervals" if getattr(task, "has_roi", False)
+                            else "constant-nearest-support"),
     })
     knn = _hash({
         "upstream": envelopes,
@@ -127,6 +131,9 @@ def _legacy_ready(task, stage: str) -> bool:
             return load_complete_cwt(task, validate_only=True) is not None
         except Exception:
             return False
+    if getattr(task, "has_roi", False):
+        from history.roi_validation import roi_stage_available
+        return roi_stage_available(task, stage)
     if stage == "extrema":
         try:
             return point_bundle_available(task, envelope=False)

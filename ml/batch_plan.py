@@ -117,7 +117,14 @@ def expand_task_ml(task):
     from pathlib import Path
     from .clustering import knn_dataset_options, select_knn_dataset
     from compute.knn.result_format import is_disk_knn_payload
-    operations = expand_ml_plan(task.ml_plan, knn_dataset_options(task.knn_results))
+    datasets = knn_dataset_options(task.knn_results)
+    if getattr(task, "has_roi", False):
+        common = getattr(task, "ml_roi_mode", "independent") == "common"
+        datasets = [d for d in datasets
+                    if (str(d["key"][1]).endswith("@allroi") if common else
+                        ("@roi" in str(d["key"][1]) and
+                         not str(d["key"][1]).endswith("@allroi")))]
+    operations = expand_ml_plan(task.ml_plan, datasets)
     checked = set()
     for operation in operations:
         key = tuple(operation['dataset_key'])
@@ -166,6 +173,16 @@ def task_source_choices(task):
         channels = [(code, rgb_names.get(code, code))]
     else:
         channels = [('r', 'Красный'), ('g', 'Зелёный'), ('b', 'Синий')]
+
+    if getattr(task, "has_roi", False):
+        mode = getattr(task, "ml_roi_mode", "independent")
+        if mode == "common":
+            channels = [(f"{code}@allroi", f"{name} · все ROI")
+                        for code, name in channels]
+        else:
+            channels = [(f"{code}@roi{region['id']}", f"{name} · {region['name']}")
+                        for code, name in channels
+                        for region in task.roi_descriptors()]
 
     # ProcessingTask.scales is normally a NumPy array.  Never use `or []` here:
     # NumPy refuses implicit truth-value conversion for arrays with >1 element.
