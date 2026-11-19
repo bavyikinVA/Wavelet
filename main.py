@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import warnings
 import platform
 from uuid import uuid4
@@ -71,6 +72,10 @@ from PIL import Image, ImageDraw
 
 from Gram_Shmidt import change_channels
 from history.source_image import save_run_image
+from history.service import ResilientHistoryService
+from history.presentation import (
+    sort_researches, sort_runs, group_runs_by_task, format_date, display_status,
+)
 from history.result_catalog import save_coefficient_preview
 from history.pipeline_resume import (
     cwt_signature,
@@ -87,7 +92,7 @@ from result_naming import (
     cwt1d_stem,
     cwt2d_stem,
     point_stem,
-    run_root_folder_name,
+    generate_research_folder_name,
     scale_folder_name,
     source_channel_name,
     statistics_stem,
@@ -140,6 +145,10 @@ class ImageProcessor:
         self.current_task_index = -1
         self.root_folder_path = ""
         self.experiment_id = None
+        self.experiment_name = None
+        self.experiment_note = ''
+        # Optional folder name reserved when the new-research dialog opens.
+        self._pending_root_folder_name = None
 
         # Инициализация бэкендов
         from compute.backend import ComputeBackend
@@ -170,16 +179,20 @@ class ImageProcessor:
 
         # Создаём корневую папку для первой задачи
         if len(self.tasks) == 1:
-            root_folder_name = run_root_folder_name(datetime.now()) + "_" + uuid4().hex[:8]
+            root_folder_name = (getattr(self, '_pending_root_folder_name', None)
+                                or generate_research_folder_name())
             self.create_downloads_folder(root_folder_name)
+            self._pending_root_folder_name = None
             self.experiment_id = uuid4().hex
         return task.task_id
 
     def remove_task(self, task_id):
         self.tasks = [task for task in self.tasks if task.task_id != task_id]
         for i, task in enumerate(self.tasks):
+            old_id = task.task_id
             task.task_id = i + 1
-            task.task_name = f"Задача {task.task_id}"
+            if task.task_name == f"Задача {old_id}":
+                task.task_name = f"Задача {task.task_id}"
 
     def get_current_task(self):
         if 0 <= self.current_task_index < len(self.tasks):
@@ -3215,7 +3228,7 @@ class App(TkinterApp):
         yield "Подготовка рабочей области…"
         self._compute_thread = None
         self._loading_task_settings = False
-        self.run_history = RunHistoryStore()
+        self.run_history = ResilientHistoryService(db_store_factory=RunHistoryStore)
         self.title("Wavelets Analysis Studio")
         self.resizable(True, True)
         # Открываем главное окно крупным, но не растянутым на весь экран,
@@ -3373,6 +3386,33 @@ class App(TkinterApp):
         self._detect_compute_devices_async()
         self._update_action_availability()
         self._show_welcome(force=True)
+        # Reconcile pending history after Tk has painted; never stall startup.
+        if self.run_history.available:
+            self.after_safe(1000, self._start_history_sync_on_startup)
+
+    def _start_history_sync_on_startup(self):
+        def worker():
+            try:
+                self.run_history.bootstrap_legacy_workspaces()
+            except Exception as error:
+                self.after_safe(0, lambda message=str(error): self.progress_manager.log_error(
+                    f'Подготовка старых исследований: {message}'))
+            ok = self.run_history.sync_known_workspaces()
+            errors = self.run_history.sync_errors
+            def done():
+                if getattr(self, '_is_destroyed', False):
+                    return
+                if not ok:
+                    self.progress_manager.log_error(
+                        'SQLite/PostgreSQL: не удалось синхронизировать историю')
+                if errors:
+                    self.progress_manager.log_error(
+                        f'Не удалось восстановить {len(errors)} исследований; '
+                        'откройте их из папки и проверьте файлы состояния')
+                self._refresh_welcome_recent_runs()
+                self._refresh_history_tab(force=True)
+            self.after_safe(0, done)
+        threading.Thread(target=worker, daemon=True).start()
 
     def _create_welcome_page(self):
         """Создать Research Hub: новый эксперимент и последние запуски."""
@@ -3474,12 +3514,16 @@ class App(TkinterApp):
     def _welcome_recent_limit(self):
         """Показывать 4 карточки на обычном Full HD и 3 на низких экранах."""
         try:
-            return 6 if self.winfo_screenheight() >= 900 else 5
+            return 7 if self.winfo_screenheight() >= 900 else 6
         except Exception:
             return 5
 
     def _refresh_welcome_recent_runs(self):
-        """Обновить последние исследования на главном экране."""
+        """Показать последние *исследования*, не подменяя их последним запуском.
+
+        Счётчики задач и общее время запусков уже агрегированы ORM. Не
+        загружаем настройки/изображения/файлы результатов на главной странице.
+        """
         container = getattr(self, "welcome_recent_container", None)
         if container is None:
             return
@@ -3487,24 +3531,8 @@ class App(TkinterApp):
             child.destroy()
 
         try:
-            latest = {}
-            for entry in self.run_history.list_runs(limit=1000):
-                latest.setdefault(entry['experiment_id'], entry)
-            runs = []
-            for experiment in self.run_history.list_experiments(limit=self._welcome_recent_limit()):
-                entry = latest.get(experiment['id'])
-                if entry is None:
-                    entry = {
-                        'id': -1, 'experiment_id': experiment['id'],
-                        'experiment_name': experiment['name'],
-                        'experiment_root': experiment['root_path'],
-                        'created_at': experiment['created_at'],
-                        'status': '', 'output_path': experiment['root_path'],
-                        'analysis_mode': '—', 'pipeline_preset': 'Нет расчётов',
-                        'image_path': '', 'duration_seconds': 0,
-                        'researcher_note': '',
-                    }
-                runs.append(entry)
+            experiments = self.run_history.list_experiments(
+                limit=self._welcome_recent_limit())
         except Exception as error:
             ctk.CTkLabel(
                 container,
@@ -3514,7 +3542,7 @@ class App(TkinterApp):
             ).pack(fill="x", padx=8, pady=12)
             return
 
-        if not runs:
+        if not experiments:
             empty = ctk.CTkFrame(container, fg_color="transparent")
             empty.pack(fill="both", expand=True, padx=8, pady=16)
             ctk.CTkLabel(
@@ -3525,50 +3553,29 @@ class App(TkinterApp):
             ).pack(fill="x", pady=(8, 4))
             ctk.CTkLabel(
                 empty,
-                text="Первый завершённый запуск появится здесь автоматически.",
+                text="Созданные исследования появятся здесь автоматически.",
                 font=AppTheme.body_font(),
                 text_color=AppTheme.TEXT_SECONDARY,
                 anchor="w",
             ).pack(fill="x")
             return
 
-        for run in runs:
-            self._create_welcome_run_card(container, run)
+        for experiment in experiments:
+            self._create_welcome_research_card(container, experiment)
 
-    def _create_welcome_run_card(self, parent, run):
-        """Компактная карточка запуска для Research Hub."""
-        try:
-            details = self._format_history_snapshot(
-                self.run_history.get_settings(run["id"])
-            )
-        except Exception:
-            details = {
-                "wavelet": run.get("analysis_mode", "—"),
-                "scales": "—",
-                "stages": run.get("pipeline_preset", "—"),
-                "nuances": "",
-            }
+    def _create_welcome_research_card(self, parent, experiment):
+        """Краткая сводка *всего* исследования без параметров отдельного запуска."""
+        from history.presentation import format_date
 
-        try:
-            created = time.strftime(
-                "%d.%m.%Y  %H:%M",
-                time.localtime(
-                    datetime.fromisoformat(run["created_at"]).timestamp()
-                ),
-            )
-        except Exception:
-            created = str(run.get("created_at", ""))[:16].replace("T", "  ")
-
-        status_raw = str(run.get("status", "") or "")
-        status_text = {
-            "completed": "Завершён",
-            "cancelled": "Отменён",
-        }.get(status_raw, "Ошибка" if status_raw else "")
-        status_color = (
-            AppTheme.SUCCESS if status_raw == "completed"
-            else AppTheme.TEXT_SECONDARY if status_raw == "cancelled"
-            else AppTheme.DANGER if status_raw
-            else AppTheme.TEXT_SECONDARY
+        created = format_date(experiment.get("created_at"))
+        task_count = int(experiment.get("task_count") or 0)
+        run_count = int(experiment.get("run_count") or 0)
+        duration = experiment.get("total_duration_seconds")
+        # При недоступной БД файловый индекс не содержит полной истории запусков:
+        # не подменяем неизвестную длительность нулём.
+        duration_label = (
+            format_time(float(duration))
+            if run_count > 0 and duration is not None else "—"
         )
 
         card = ctk.CTkFrame(
@@ -3577,70 +3584,45 @@ class App(TkinterApp):
         )
         card.pack(fill="x", padx=4, pady=3)
 
-        top = ctk.CTkFrame(card, fg_color="transparent")
-        top.pack(fill="x", padx=12, pady=(6, 2))
-        ctk.CTkLabel(
-            top, text=run.get("experiment_name", f"Исследование {run['experiment_id'][:8]}"),
-            font=ctk.CTkFont(size=15, weight="bold"), anchor="w"
-        ).pack(side="left")
-        ctk.CTkLabel(
-            top, text=created, font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY
-        ).pack(side="right")
-
-        middle = ctk.CTkFrame(card, fg_color="transparent")
-        middle.pack(fill="x", padx=12, pady=(0, 2))
-        ctk.CTkLabel(
-            middle, text=details.get("wavelet", "—"),
-            font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color=AppTheme.NAV_HOVER, corner_radius=6,
-            padx=8, pady=2
-        ).pack(side="left")
-        if status_text:
-            ctk.CTkLabel(
-                middle, text=status_text, font=AppTheme.caption_font(),
-                text_color=status_color, fg_color=AppTheme.NAV_BACKGROUND,
-                corner_radius=6, padx=7, pady=2
-            ).pack(side="left", padx=(6, 0))
-
-        # Действия держим на той же строке, что и бейджи: это экономит
-        # почти треть высоты карточки, не ухудшая читаемость.
-        if run.get("output_path"):
-            ctk.CTkButton(
-                middle, text="Результаты", width=96, height=25,
-                fg_color="transparent", hover_color=AppTheme.NAV_HOVER,
-                text_color=AppTheme.NAV_TEXT_ACTIVE, font=ctk.CTkFont(size=13),
-                command=lambda folder=run["experiment_root"]: self._open_results_from_welcome(folder),
-            ).pack(side="right", padx=(6, 0))
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(9, 6))
         ctk.CTkButton(
-            middle, text="Продолжить", width=102, height=25,
+            header, text="Открыть исследование", width=178, height=29,
             font=ctk.CTkFont(size=13),
-            command=lambda experiment_id=run["experiment_id"]: self._restore_experiment(experiment_id)
-        ).pack(side="right")
-
-        meta = [
-            f"Масштабы: {details.get('scales', '—')}",
-            f"Сценарий: {run.get('pipeline_preset', '—')}"
-        ]
-        if run.get("duration_seconds"):
-            meta.append(format_time(run["duration_seconds"]))
+            command=lambda experiment_id=experiment["id"]: self._restore_experiment(experiment_id),
+        ).pack(side="right", padx=(12, 0))
+        ctk.CTkButton(
+            header, text='Редактировать', width=75, height=29,
+            fg_color='transparent', hover_color=AppTheme.NAV_HOVER,
+            command=lambda record=experiment: self._edit_research_metadata(record),
+        ).pack(side='right', padx=(8, 0))
         ctk.CTkLabel(
-            card, text="  ·  ".join(meta), font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY, anchor="w", wraplength=900
-        ).pack(fill="x", padx=12, pady=(0, 5))
+            header,
+            text=experiment.get("name") or f"Исследование {str(experiment['id'])[:8]}",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            anchor="w", justify="left", wraplength=640,
+        ).pack(side="left", fill="x", expand=True)
 
-        # Заметка полезна для идентификации запуска, но на главном экране
-        # показываем её одной короткой строкой, чтобы карточки не разрастались.
-        note = str(run.get("researcher_note", "") or "").strip()
-        if note:
-            short_note = note if len(note) <= 110 else note[:107].rstrip() + "..."
+        ctk.CTkLabel(
+            card,
+            text=(f"Создано: {created}  ·  Задач: {task_count}"
+                  f"  ·  Время расчётов: {duration_label}"),
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+            anchor="w", justify="left", wraplength=900,
+        ).pack(fill="x", padx=12, pady=(0, 4) if experiment.get('note') else (0, 10))
+        if experiment.get('note'):
+            note = ' '.join(str(experiment['note']).split())
+            if len(note) > 185:
+                note = note[:182].rstrip() + '…'
             ctk.CTkLabel(
-                card, text=f"Заметка: {short_note}", font=AppTheme.caption_font(),
-                text_color=AppTheme.MUTED, anchor="w", wraplength=900
-            ).pack(fill="x", padx=12, pady=(0, 5))
+                card, text=note, anchor='w', justify='left',
+                text_color=AppTheme.TEXT_SECONDARY,
+                font=AppTheme.body_font(), wraplength=920,
+            ).pack(fill='x', padx=12, pady=(0, 10))
 
     def _workspace_is_busy(self):
-        return any(
+        return bool(getattr(self, '_restore_in_progress', False)) or any(
             thread is not None and thread.is_alive()
             for thread in (
                 getattr(self, "_compute_thread", None),
@@ -3714,26 +3696,358 @@ class App(TkinterApp):
             "history" if current_tab == "Предыдущие запуски" else None
         )
 
-    def _start_new_research(self):
-        """Begin an independent experiment, rather than append to the old one."""
-        if getattr(self, '_compute_ui_locked', False) or getattr(self, '_ml_ui_locked', False):
-            mb.showwarning("Исследование", "Сначала завершите текущий расчёт")
+    def _open_metadata_dialog(self, *, title, name, note, on_save, create=False):
+        """Edit study/task metadata without callbacks outliving the Tk root.
+
+        CTkToplevel schedules some native Windows window-management callbacks.
+        Do not enter a nested event loop to position the dialog; schedule its
+        initial focus/grab on the application's managed Tk callback queue.
+        """
+        from history.metadata import normalize_metadata
+        from utils.tk_lifecycle import active_widget_root
+
+        # Stale button callbacks can still be dispatched while WM_DELETE_WINDOW
+        # is tearing down the application. A destroyed Tcl interpreter cannot
+        # create a CTkToplevel, and attempting to do so cascades Tcl errors.
+        if active_widget_root(self) is None:
             return
-        self.image_processor.tasks.clear()
-        self.image_processor.current_task_index = -1
-        self.image_processor.root_folder_path = ""
-        self.image_processor.experiment_id = None
+
+        existing = getattr(self, '_metadata_dialog', None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    # A previously created but hidden native window must be
+                    # mapped, not just lifted behind the main application.
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except (tk.TclError, RuntimeError):
+                pass
+            self._metadata_dialog = None
+
+        window = None
+        focus_callback = None
+        closed = False
+
+        def alive():
+            if closed or active_widget_root(self) is None:
+                return False
+            try:
+                return window is not None and bool(window.winfo_exists())
+            except (tk.TclError, RuntimeError):
+                return False
+
+        def release_references():
+            nonlocal closed, focus_callback
+            if closed:
+                return False
+            closed = True
+            if focus_callback is not None:
+                self.after_cancel_safe(focus_callback)
+                focus_callback = None
+            if getattr(self, '_metadata_dialog', None) is window:
+                self._metadata_dialog = None
+            if window is not None:
+                self.unregister_child_window(window)
+            return True
+
+        def close():
+            if not release_references() or window is None:
+                return
+            try:
+                if window.winfo_exists():
+                    try:
+                        window.grab_release()
+                    except tk.TclError:
+                        pass
+                    window.destroy()
+            except (tk.TclError, RuntimeError):
+                # Another callback may already have destroyed the Tk root.
+                pass
+
+        def on_window_destroy(event):
+            if event.widget is window:
+                # Tk itself has already started destroying this widget;
+                # do not call destroy() recursively from a <Destroy> event.
+                release_references()
+
+        try:
+            # On Windows, CTkToplevel may withdraw itself while updating the
+            # native title bar, leaving a newly created dialog unmapped. The
+            # other working dialogs (cropper/report) opt out of that behaviour.
+            class _MetadataToplevel(ctk.CTkToplevel):
+                _deactivate_windows_window_header_manipulation = True
+
+            # Do not use update() / update_idletasks() here: nested Tk event
+            # loops may process a shutdown in the middle of construction.
+            window = _MetadataToplevel(self)
+            self._metadata_dialog = window
+            self.register_child_window(window)
+            window.title(title)
+            window.geometry('560x320')
+            window.minsize(480, 295)
+            window.resizable(True, False)
+            window.transient(self)
+            window.configure(fg_color=AppTheme.NAV_BACKGROUND)
+
+            body = ctk.CTkFrame(window, fg_color='transparent')
+            body.pack(fill='both', expand=True, padx=26, pady=(20, 16))
+            is_task = 'задач' in title.lower()
+            ctk.CTkLabel(
+                body, text='Название задачи' if is_task else 'Название исследования',
+                font=AppTheme.body_font(), anchor='w',
+            ).pack(fill='x', pady=(0, 5))
+            name_entry = ctk.CTkEntry(
+                body, height=36,
+                placeholder_text='Название' if is_task else 'Название исследования',
+            )
+            name_entry.pack(fill='x')
+            if name:
+                name_entry.insert(0, name)
+            ctk.CTkLabel(
+                body, text='Заметки / Описание', font=AppTheme.body_font(),
+                anchor='w',
+            ).pack(fill='x', pady=(15, 5))
+            note_box = ctk.CTkTextbox(
+                body, height=110, wrap='word',
+                border_width=1, border_color=AppTheme.BORDER,
+            )
+            note_box.pack(fill='x')
+
+            # CTkTextbox does not have a native placeholder_text option.
+            # Simulate one without including the hint in saved metadata.
+            note_placeholder = 'Опишите цель, особенности исходных данных или методики.'
+            note_placeholder_visible = False
+
+            def show_note_placeholder():
+                nonlocal note_placeholder_visible
+                if note_box.get('1.0', 'end-1c').strip():
+                    return
+                note_box.insert('1.0', note_placeholder)
+                note_box.configure(text_color=AppTheme.TEXT_SECONDARY)
+                note_placeholder_visible = True
+
+            def clear_note_placeholder(_event=None):
+                nonlocal note_placeholder_visible
+                if note_placeholder_visible:
+                    note_box.delete('1.0', 'end')
+                    note_box.configure(text_color=AppTheme.TEXT_ON_DARK)
+                    note_placeholder_visible = False
+
+            def restore_note_placeholder(_event=None):
+                if not note_placeholder_visible and not note_box.get('1.0', 'end-1c').strip():
+                    show_note_placeholder()
+
+            if note:
+                note_box.insert('1.0', note)
+            else:
+                show_note_placeholder()
+            note_box.bind('<FocusIn>', clear_note_placeholder, add='+')
+            note_box.bind('<FocusOut>', restore_note_placeholder, add='+')
+            buttons = ctk.CTkFrame(body, fg_color='transparent')
+            buttons.pack(fill='x', side='bottom', pady=(14, 0))
+
+            def save():
+                if not alive():
+                    return
+                try:
+                    value, description = normalize_metadata(
+                        name_entry.get(),
+                        '' if note_placeholder_visible else note_box.get('1.0', 'end-1c'),
+                        allow_empty_name=True,
+                    )
+                    on_save(value, description)
+                except (OSError, ValueError, KeyError, RuntimeError) as error:
+                    if alive():
+                        mb.showerror('Не удалось сохранить', str(error), parent=window)
+                    return
+                close()
+
+            ctk.CTkButton(buttons, text='Сохранить' if not create else 'Создать',
+                          width=125, command=save).pack(side='right')
+            ctk.CTkButton(buttons, text='Отмена', width=105, command=close,
+                          fg_color=AppTheme.NAV_SELECTED_BACKGROUND,
+                          hover_color=AppTheme.NAV_HOVER).pack(side='right', padx=(0, 8))
+            window.protocol('WM_DELETE_WINDOW', close)
+            window.bind('<Escape>', lambda _event: close())
+            window.bind('<Control-Return>', lambda _event: save())
+
+            # Removing the window externally (including during App shutdown)
+            # must also forget the reference and cancel the scheduled focus.
+            window.bind('<Destroy>', on_window_destroy, add='+')
+
+            # Native Win32 CTkToplevel can be unmapped at construction time.
+            # Centre using the configured size; no nested Tcl event processing.
+            if not alive():
+                close()
+                return
+            x = self.winfo_rootx() + max(0, (self.winfo_width() - 560) // 2)
+            y = self.winfo_rooty() + max(0, (self.winfo_height() - 320) // 2)
+            window.geometry(f'+{x}+{y}')
+            # A modal has to be explicitly mapped. The old implementation
+            # waited for winfo_viewable() without ever calling deiconify(), so
+            # on Windows it could silently remain invisible indefinitely.
+            window.deiconify()
+            window.lift()
+            # A short topmost pulse ensures that Windows does not leave the
+            # newly created modal behind the root after a native WM remap.
+            window.attributes('-topmost', True)
+            print(f'[MetadataDialog] Requested display: {title}', flush=True)
+
+            activation_attempt = 0
+
+            def activate_dialog():
+                nonlocal focus_callback, activation_attempt
+                focus_callback = None
+                if not alive():
+                    return
+                try:
+                    # A WM may defer mapping after deiconify(). Retry with an
+                    # explicit show instead of waiting for the state to change
+                    # by itself. Never leave an invisible, registered dialog.
+                    if not window.winfo_viewable():
+                        window.deiconify()
+                        window.lift()
+                        activation_attempt += 1
+                        if activation_attempt < 12:
+                            focus_callback = self.after_safe(60, activate_dialog)
+                        else:
+                            print('[MetadataDialog] Window did not become visible', flush=True)
+                            close()
+                            if active_widget_root(self) is not None:
+                                mb.showerror(
+                                    'Окно не появилось',
+                                    'Не удалось показать окно названия и заметок. '
+                                    'Повторите действие; подробности в консоли.',
+                                    parent=self,
+                                )
+                        return
+                    window.lift()
+                    window.focus_force()
+                    window.grab_set()
+                    name_entry.focus_set()
+                    window.attributes('-topmost', False)
+                    print(f'[MetadataDialog] Visible: {title}', flush=True)
+                except (tk.TclError, RuntimeError) as error:
+                    print(f'[MetadataDialog] Activation error: {error}', flush=True)
+                    if active_widget_root(self) is not None:
+                        close()
+                        mb.showerror('Не удалось показать окно', str(error), parent=self)
+
+            focus_callback = self.after_safe(50, activate_dialog)
+        except Exception as error:
+            # Include non-Tcl construction errors: previously a missing theme
+            # or widget property could make the button appear to do nothing.
+            print(f'[MetadataDialog] Construction error: {type(error).__name__}: {error}', flush=True)
+            close()
+            if active_widget_root(self) is not None:
+                mb.showerror('Не удалось открыть окно', str(error), parent=self)
+
+    def _start_new_research(self):
+        """Show metadata dialog before replacing the current workspace."""
+        from utils.tk_lifecycle import active_widget_root
+        print('[MetadataDialog] New research button clicked', flush=True)
+        if active_widget_root(self) is None:
+            print('[MetadataDialog] Ignored: Tk root is closing or destroyed', flush=True)
+            return
+        if self._workspace_is_busy() or getattr(self, '_compute_ui_locked', False) or getattr(self, '_ml_ui_locked', False):
+            mb.showwarning('Исследование', 'Сначала завершите текущий расчёт')
+            return
+        # Reserve the exact directory name before the form is shown. This is
+        # also the default title displayed in the input, not a placeholder.
+        folder_name = generate_research_folder_name()
+        suggested_title = f'Исследование {folder_name}'
+        self._open_metadata_dialog(
+            title='Новое исследование', name=suggested_title, note='', create=True,
+            on_save=lambda name, note: self._create_research_with_metadata(
+                name, note, root_folder_name=folder_name))
+
+    def _create_research_with_metadata(self, name, note, *, root_folder_name=None):
+        """Create the first task and persist user metadata independently of DB."""
+        processor = self.image_processor
+        processor.tasks.clear()
+        processor.current_task_index = -1
+        processor.root_folder_path = ''
+        processor.experiment_id = None
+        processor.experiment_name = name or None
+        processor.experiment_note = note
+        processor._pending_root_folder_name = root_folder_name
         self.current_task = None
         self._show_workspace()
         self.add_new_task()
+        if processor.experiment_id and processor.tasks:
+            # The directory is created by add_new_task(). Only at this point
+            # can we build the same stable default name as previous versions.
+            resolved_name = name or (
+                f'Исследование {os.path.basename(processor.root_folder_path)}'
+            )
+            processor.experiment_name = resolved_name
+            self.run_history.update_experiment_metadata(
+                processor.experiment_id, resolved_name, note,
+            )
+            self._refresh_welcome_recent_runs()
+
+    def _edit_research_metadata(self, experiment):
+        experiment_id = experiment['id']
+        if self._workspace_is_busy():
+            mb.showwarning('Исследование', 'Дождитесь завершения расчёта')
+            return
+
+        def save(name, note):
+            if not name:
+                folder = os.path.basename(os.path.normpath(experiment.get('root_path') or ''))
+                name = f'Исследование {folder or experiment_id[:8]}'
+            self.run_history.update_experiment_metadata(experiment_id, name, note)
+            processor = self.image_processor
+            if processor.experiment_id == experiment_id:
+                processor.experiment_name, processor.experiment_note = name, note
+            self._refresh_welcome_recent_runs()
+            self._refresh_history_tab()
+
+        self._open_metadata_dialog(
+            title='Редактировать исследование', name=experiment.get('name', ''),
+            note=experiment.get('note', ''), on_save=save)
+
+    def _edit_task_metadata(self, experiment_id, task_record):
+        if self._workspace_is_busy():
+            mb.showwarning('Задача', 'Дождитесь завершения расчёта')
+            return
+        identifier = task_record['id']
+
+        def save(name, note):
+            if not name:
+                task_number = task_record.get('task_number')
+                if task_number is None:
+                    task_number = next(
+                        (task.task_id for task in self.image_processor.tasks
+                         if task.persistent_id == identifier), None,
+                    )
+                if task_number is None:
+                    task_number = next(
+                        (row['task_number'] for row in self.run_history.list_tasks(experiment_id)
+                         if row['id'] == identifier), None,
+                    )
+                if task_number is None:
+                    raise ValueError('Не удалось определить номер задачи')
+                name = f'Задача {task_number}'
+            self.run_history.update_task_metadata(experiment_id, identifier, name, note)
+            if self.image_processor.experiment_id == experiment_id:
+                for task in self.image_processor.tasks:
+                    if task.persistent_id == identifier:
+                        task.task_name, task.note = name, note
+                        self._update_tasks_display()
+                        break
+            self._refresh_history_tab()
+
+        self._open_metadata_dialog(
+            title='Редактировать задачу',
+            name=task_record.get('name', ''), note=task_record.get('note', ''),
+            on_save=save)
 
     def _continue_research(self, run_id):
         self._show_workspace()
         self._restore_experiment(self.run_history.get_run(run_id)["experiment_id"])
-
-    def _open_results_from_welcome(self, folder):
-        self._show_workspace()
-        self._show_saved_results(folder)
 
     def _show_history_page(self):
         self._show_workspace()
@@ -3873,6 +4187,11 @@ class App(TkinterApp):
         self.history_search_var = tk.StringVar(value="")
         self.history_status_var = tk.StringVar(value="Все статусы")
         self.history_page_size_var = tk.StringVar(value="5")
+        self.history_sort_var = tk.StringVar(value="Сначала новые")
+        # Expansion is UI-only state, preserved through search, filtering and pages.
+        self._history_open_researches = set()
+        self._history_open_tasks = set()
+        self._history_open_runs = set()
         self.history_page = 1
         self.history_total_pages = 1
         self._history_search_after_id = None
@@ -3963,6 +4282,7 @@ class App(TkinterApp):
 
         # Фрейм для списка задач с прокруткой
         tasks_scrollable = ScrollableFrame(panel)
+        tasks_scrollable.canvas.pack_configure(padx=(8, 0), pady=(5,5))
         tasks_scrollable.pack(fill="both", expand=True, padx=10, pady=5)
 
         # Заголовок списка задач
@@ -3991,18 +4311,13 @@ class App(TkinterApp):
         # Pinned execution controls: independent of scrolling and workspace tab.
         launch_footer = ctk.CTkFrame(panel)
         launch_footer.pack(side="bottom", fill="x", padx=10, pady=(6, 12))
-        self.queue_summary_label = ctk.CTkLabel(
-            launch_footer, text="Очередь исследования", anchor="w",
-            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
-        )
-        self.queue_summary_label.pack(fill="x", padx=10, pady=(8, 4))
         self.app_start_button = ctk.CTkButton(
-            launch_footer, text="Запустить очередь", command=self.safe_compute,
+            launch_footer, text="Запустить", command=self.safe_compute,
             height=AppTheme.PRIMARY_BUTTON_HEIGHT,
             font=AppTheme.panel_title_font(), fg_color=AppTheme.PRIMARY,
             hover_color=AppTheme.PRIMARY_HOVER,
         )
-        self.app_start_button.pack(fill="x", padx=10, pady=(0, 9))
+        self.app_start_button.pack(fill="x", padx=(10, 50), pady=(7, 7))
         return panel
 
     def _create_workspace_tabs(self):
@@ -4033,6 +4348,10 @@ class App(TkinterApp):
             "history" if name == "Предыдущие запуски" else None
         )
         self._ensure_workspace_tab(name)
+        if name == 'Результаты' and hasattr(self, 'results_panel'):
+            self.results_panel.load_folder(self.image_processor.root_folder_path)
+        if name == 'ML' and getattr(self, 'current_task', None) is not None:
+            self._hydrate_selected_task_async(self.current_task, features=True)
 
         if name == "ML" and hasattr(self, "ml_panel"):
             # Состояние ML-контролов нельзя брать из старого состояния виджетов.
@@ -4074,10 +4393,25 @@ class App(TkinterApp):
             font=AppTheme.panel_title_font(), anchor="w"
         ).pack(side="left", fill="x", expand=True)
         ctk.CTkButton(
-            header, text="Обновить", width=110,
+            header, text="Обновить", width=90,
             height=AppTheme.SMALL_BUTTON_HEIGHT,
             command=lambda: self._refresh_history_tab(force=True)
         ).pack(side="right")
+        ctk.CTkButton(
+            header, text="Подключить БД", width=125,
+            height=AppTheme.SMALL_BUTTON_HEIGHT,
+            command=self._reconnect_research_history,
+        ).pack(side='right', padx=(0, 8))
+        ctk.CTkButton(
+            header, text="Открыть из папки", width=140,
+            height=AppTheme.SMALL_BUTTON_HEIGHT,
+            command=self._open_research_from_folder,
+        ).pack(side='right', padx=(0, 8))
+        self.history_connect_status = ctk.CTkLabel(
+            panel, text='', font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY, anchor='w'
+        )
+        self.history_connect_status.pack(fill='x', padx=16)
 
         ctk.CTkLabel(
             panel,
@@ -4094,7 +4428,7 @@ class App(TkinterApp):
         self.history_search_entry = ctk.CTkEntry(
             filters,
             textvariable=self.history_search_var,
-            placeholder_text="Поиск по № запуска, изображению, сценарию или задаче",
+            placeholder_text="Поиск по исследованию, задаче, изображению или ML",
             width=360
         )
         self.history_search_entry.pack(side="left", fill="x", expand=True)
@@ -4130,6 +4464,16 @@ class App(TkinterApp):
         )
         self.history_status_menu.pack(side="left", padx=(8, 0))
         self.history_status_menu._read_only_during_compute = True
+
+        self.history_sort_menu = ctk.CTkOptionMenu(
+            filters,
+            variable=self.history_sort_var,
+            values=["Сначала новые", "Сначала старые", "Недавно изменённые"],
+            command=lambda _value: self._on_history_filter_changed(),
+            width=170
+        )
+        self.history_sort_menu.pack(side="left", padx=(8, 0))
+        self.history_sort_menu._read_only_during_compute = True
 
         ctk.CTkLabel(
             filters,
@@ -4226,15 +4570,267 @@ class App(TkinterApp):
         self.history_page = target
         self._refresh_history_tab(force=True)
 
+    @staticmethod
+    def _history_detail_line(parent, heading, value):
+        """Readable label/value row, rather than an unstructured paragraph."""
+        if value in (None, ''):
+            return
+        line = ctk.CTkFrame(parent, fg_color='transparent')
+        line.pack(fill='x', padx=12, pady=3)
+        ctk.CTkLabel(
+            line, text=heading, width=135, anchor='nw',
+            font=AppTheme.caption_font(),
+            text_color=AppTheme.TEXT_SECONDARY,
+        ).pack(side='left', anchor='n')
+        ctk.CTkLabel(
+            line, text=str(value), anchor='w', justify='left',
+            font=AppTheme.body_font(), wraplength=850,
+        ).pack(side='left', fill='x', expand=True)
+
+    def _history_run_metadata(self, parent, run, task_snapshot=None, task_meta=None):
+        """Show only *run-specific* facts; task methodology is displayed once.
+
+        An old attempt may have used different settings from the current task.
+        Preserve that historically important distinction without duplicating
+        all settings for every run that used the same configuration.
+        """
+        body = ctk.CTkFrame(parent, fg_color=AppTheme.NAV_BACKGROUND, corner_radius=7)
+        body.pack(fill='x', padx=6, pady=(3, 8))
+        try:
+            run_snapshot = json.loads(run.get('settings_json') or '{}')
+            if not isinstance(run_snapshot, dict):
+                run_snapshot = {}
+            run_meta = self._format_history_snapshot(run_snapshot) if run_snapshot else None
+        except (ValueError, TypeError, AttributeError, KeyError):
+            run_snapshot, run_meta = {}, None
+
+        differences = []
+        if run_meta:
+            from history.presentation import history_snapshot_changes
+            differences = history_snapshot_changes(
+                task_meta, run_meta,
+                task_image=(task_snapshot or {}).get('image_path'),
+                run_image=run_snapshot.get('image_path'),
+            )
+        if differences:
+            ctk.CTkLabel(
+                body,
+                text=('НАСТРОЙКИ НА МОМЕНТ ЗАПУСКА' if task_meta is None
+                      else 'ОТЛИЧИЯ ОТ НАСТРОЕК ЗАДАЧИ'),
+                anchor='w', text_color=AppTheme.TEXT_SECONDARY,
+                font=ctk.CTkFont(size=11, weight='bold'),
+            ).pack(fill='x', padx=12, pady=(9, 3))
+            for heading, value in differences:
+                self._history_detail_line(body, heading, value)
+
+        if run.get('run_type') == 'ml':
+            self._history_detail_line(body, 'Итог ML', run.get('ml_summary'))
+        self._history_detail_line(body, 'Заметка', run.get('researcher_note'))
+        self._history_detail_line(body, 'Ошибка', run.get('error_message'))
+        output_path = run.get('output_path')
+        if output_path:
+            button = ctk.CTkButton(
+                body, text='Открыть папку результатов', width=190,
+                command=lambda path=output_path: self._open_result_path(path),
+            )
+            button._read_only_during_compute = True
+            button.pack(anchor='w', padx=12, pady=(7, 10))
+        elif not differences and not any(run.get(key) for key in (
+                'ml_summary', 'researcher_note', 'error_message')):
+            ctk.CTkLabel(
+                body, text='Дополнительных сведений нет', anchor='w',
+                text_color=AppTheme.TEXT_SECONDARY,
+            ).pack(fill='x', padx=12, pady=10)
+
+    def _history_run_details(self, parent, records, task_snapshot=None, task_meta=None):
+        """List actual attempts; never repeat CWT methodology from the task."""
+        for run in records:
+            try:
+                duration = float(run.get('duration_seconds') or 0)
+            except (TypeError, ValueError):
+                duration = 0
+            date = format_date(run.get('created_at'))
+            if run.get('run_type') == 'ml':
+                algorithm = str(run.get('ml_algorithm') or 'ML').upper()
+                title = f'{algorithm}  ·  {date}  ·  {duration:.1f} с'
+            else:
+                title = f'{date}  ·  {duration:.1f} с'
+            self._history_disclosure(
+                parent, title, run.get('id'), self._history_open_runs,
+                lambda container, value=run, saved=task_snapshot, meta=task_meta:
+                    self._history_run_metadata(container, value, saved, meta),
+                kind='run', status=run.get('status'),
+            )
+
+    def _history_disclosure(self, parent, title, key, expanded_keys, build_content,
+                             *, kind='task', status=None, preview=None, note_text=None, edit_command=None):
+        """Render header and details in ONE packed widget to preserve order.
+
+        The previous implementation packed the body directly into ``parent``
+        after the surrounding siblings. In Tk, packing it later placed it at
+        the end of the entire task list, not below its own header.
+
+        A wrapper with its header, preview and body as permanent children makes
+        expansion local. Details are still constructed lazily on first click.
+        """
+        palettes = {
+            'research': (AppTheme.NAV_SELECTED_BACKGROUND, AppTheme.BORDER),
+            'task': ('#303030', '#454545'),
+            'run': ('#26313a', '#405568'),
+        }
+        background, border = palettes.get(kind, palettes['task'])
+        item = ctk.CTkFrame(
+            parent, fg_color=background, border_width=1, border_color=border,
+            corner_radius=7,
+        )
+        item.pack(fill='x', padx=4 if kind == 'research' else 8,
+                  pady=4 if kind == 'task' else 3)
+        header = ctk.CTkFrame(item, fg_color='transparent')
+        header.pack(fill='x', padx=7, pady=(4, 3) if kind != 'run' else (2, 2))
+        body = ctk.CTkFrame(item, fg_color='transparent')
+        built = False
+        opened = key in expanded_keys
+        button = None
+
+        def display(should_open):
+            nonlocal built, opened
+            if should_open:
+                if not built:
+                    build_content(body)
+                    built = True
+                # The body is packed inside *item*, not among other tasks.
+                body.pack(fill='x', padx=8, pady=(3, 7))
+                expanded_keys.add(key)
+            else:
+                body.pack_forget()
+                expanded_keys.discard(key)
+            opened = should_open
+            button.configure(text=('▾  ' if should_open else '▸  ') + title)
+
+        button = ctk.CTkButton(
+            header, text='', command=lambda: display(not opened),
+            fg_color='transparent', hover_color=AppTheme.NAV_HOVER,
+            text_color=AppTheme.NAV_TEXT_ACTIVE, anchor='w',
+            font=(ctk.CTkFont(size=13, weight='bold') if kind == 'task'
+                  else AppTheme.body_font()),
+            height=30 if kind == 'task' else AppTheme.COMPACT_CONTROL_HEIGHT,
+            border_spacing=5,
+        )
+        button._read_only_during_compute = True
+        button.pack(side='left', fill='x', expand=True)
+        if edit_command is not None:
+            ctk.CTkButton(
+                header, text='Изменить', width=72, height=25,
+                fg_color='transparent', hover_color=AppTheme.NAV_HOVER,
+                command=edit_command,
+            ).pack(side='right', padx=(5, 0))
+        if status:
+            colors = {
+                'completed': AppTheme.SUCCESS,
+                'failed': AppTheme.DANGER,
+                'partial_failed': AppTheme.WARNING,
+                'cancelled': AppTheme.TEXT_SECONDARY,
+                'running': AppTheme.INFO,
+            }
+            ctk.CTkLabel(
+                header, text=display_status(status),
+                text_color=colors.get(status, AppTheme.TEXT_SECONDARY),
+                font=AppTheme.caption_font(), width=76,
+            ).pack(side='right', padx=(4, 1))
+        if preview or note_text:
+            ctk.CTkLabel(
+                item, text=note_text or preview, anchor='w', justify='left',
+                text_color=AppTheme.TEXT_SECONDARY,
+                font=AppTheme.caption_font(), wraplength=1100,
+            ).pack(fill='x', padx=18, pady=(0, 7))
+        display(opened)
+        return button
+
+    def _history_task_details(self, parent, task, runs):
+        """One canonical settings block followed by compact run chronology."""
+        try:
+            snapshot = json.loads(task.get('settings_json') or '{}')
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            meta = self._format_history_snapshot(snapshot) if snapshot else None
+        except (ValueError, TypeError, KeyError, AttributeError):
+            snapshot, meta = {}, None
+        if meta:
+            summary = ctk.CTkFrame(
+                parent, fg_color=AppTheme.NAV_BACKGROUND, corner_radius=7,
+            )
+            summary.pack(fill='x', padx=5, pady=(2, 10))
+            ctk.CTkLabel(
+                summary, text='НАСТРОЙКИ ЗАДАЧИ', anchor='w',
+                text_color=AppTheme.TEXT_SECONDARY,
+                font=ctk.CTkFont(size=11, weight='bold'),
+            ).pack(fill='x', padx=12, pady=(9, 4))
+            self._history_detail_line(summary, 'Преобразование', meta.get('wavelet'))
+            self._history_detail_line(summary, 'Масштабы', meta.get('scales'))
+            self._history_detail_line(summary, 'План этапов', meta.get('stages'))
+            self._history_detail_line(summary, 'Каналы и параметры', meta.get('nuances'))
+            image_path = snapshot.get('image_path')
+            if image_path:
+                self._history_detail_line(summary, 'Изображение', os.path.basename(image_path))
+
+        pipeline = [r for r in runs if r.get('run_type') != 'ml']
+        ml = [r for r in runs if r.get('run_type') == 'ml']
+        for title, records in (
+            ('ЗАПУСКИ CWT', pipeline),
+            ('ML-ОПЕРАЦИИ', ml),
+        ):
+            if not records:
+                continue
+            section = ctk.CTkFrame(parent, fg_color='transparent')
+            section.pack(fill='x', padx=3, pady=(2, 8))
+            ctk.CTkLabel(
+                section, text=title,
+                anchor='w', text_color=AppTheme.TEXT_SECONDARY,
+                font=ctk.CTkFont(size=11, weight='bold'),
+            ).pack(fill='x', padx=12, pady=(6, 2))
+            self._history_run_details(section, records, snapshot, meta)
+        if not runs:
+            ctk.CTkLabel(parent, text='Эта задача ещё не запускалась',
+                         text_color=AppTheme.TEXT_SECONDARY,
+                         anchor='w').pack(fill='x', padx=12, pady=8)
+
+    def _history_experiment_details(self, parent, tasks, runs):
+        """Each task expands immediately beneath itself, with visible context."""
+        by_task = group_runs_by_task(runs)
+        for task in tasks:
+            attempts = by_task.get(task['id'], [])
+            pipeline_count = sum(r.get('run_type') != 'ml' for r in attempts)
+            ml_count = len(attempts) - pipeline_count
+            title = f"{task['name']}     CWT: {pipeline_count}  ·  ML: {ml_count}"
+            self._history_disclosure(
+                parent, title, task['id'], self._history_open_tasks,
+                lambda container, row=task, values=attempts:
+                    self._history_task_details(container, row, values),
+                kind='task', status=attempts[0].get('status') if attempts else None,
+                note_text=(task.get('note') or '')[:220],
+                edit_command=lambda row=task: self._edit_task_metadata(row['experiment_id'], row),
+            )
+        if not tasks:
+            ctk.CTkLabel(parent, text='В исследовании нет сохранённых задач',
+                         text_color=AppTheme.TEXT_SECONDARY,
+                         anchor='w').pack(fill='x', padx=18, pady=8)
+
     def _refresh_history_tab(self, force=False):
-        """One history card per experiment, with its complete task/run tree."""
-        if not hasattr(self, "history_scrollable"):
+        """Chronological compact research cards; details constructed lazily."""
+        if not hasattr(self, 'history_scrollable'):
             return
         if (not force and hasattr(self, 'history_panel') and
                 self.workspace_tabs._current_name != "Предыдущие запуски"):
             self._history_dirty = True
             return
         self._history_dirty = False
+        label = getattr(self, 'history_connect_status', None)
+        if label is not None:
+            if self.run_history.available:
+                label.configure(text='История доступна · SQLAlchemy ORM')
+            else:
+                label.configure(text='База истории недоступна. Расчёты доступны; '
+                    'откройте исследование из папки или повторите подключение.')
         for card in self.history_cards:
             card.destroy()
         self.history_cards.clear()
@@ -4244,7 +4840,7 @@ class App(TkinterApp):
         status_filter = self.history_status_var.get()
         runs = self.run_history.list_runs(limit=100000)
         grouped = {}
-        for run in runs:
+        for run in sort_runs(runs):
             grouped.setdefault(run['experiment_id'], []).append(run)
         filtered = []
         for experiment in experiments:
@@ -4256,14 +4852,23 @@ class App(TkinterApp):
             if status_filter == "Отменённые" and not any(r['status'] == 'cancelled' for r in experiment_runs):
                 continue
             task_rows = self.run_history.list_tasks(experiment['id'])
-            search_blob = ' '.join([experiment['name'], experiment['root_path'], experiment['id']]
-                                   + [row['name'] for row in task_rows]
+            search_blob = ' '.join([experiment['name'], experiment.get('note',''),
+                                    experiment['root_path'], experiment['id']]
+                                   + [str(row.get(field, '')) for row in task_rows
+                                      for field in ('name', 'note')]
                                    + [str(value) for r in experiment_runs for value in (
                 r.get('task_name', ''), r.get('ml_algorithm', ''), r.get('researcher_note', ''),
-                r.get('image_path', ''))]).casefold()
+                r.get('image_path', ''), r.get('id', ''), r.get('created_at', ''),
+                r.get('status', ''))]).casefold()
             if query and query not in search_blob:
                 continue
             filtered.append((experiment, task_rows, experiment_runs))
+        # The key is explicit rather than relying on SQL or registry insertion
+        # order; pagination is applied only AFTER sorting.
+        order = self.history_sort_var.get()
+        order_ids = {exp['id']: i for i, exp in enumerate(
+            sort_researches([item[0] for item in filtered], order))}
+        filtered.sort(key=lambda item: order_ids[item[0]['id']])
         try:
             page_size = max(1, int(self.history_page_size_var.get()))
         except (TypeError, ValueError):
@@ -4297,34 +4902,37 @@ class App(TkinterApp):
             self.history_cards.append(card)
             ctk.CTkLabel(card, text=experiment['name'], font=AppTheme.section_title_font(),
                          anchor='w').pack(fill='x', padx=12, pady=(9, 2))
-            ctk.CTkLabel(card, text=(f"Создано: {experiment['created_at'].replace('T', ' ')} · "
-                                     f"Задач: {len(tasks)} · Запусков: {len(task_runs)} · ML: {experiment['ml_count']}"),
-                         text_color=AppTheme.TEXT_SECONDARY, anchor='w',
-                         font=AppTheme.caption_font()).pack(fill='x', padx=12, pady=(0, 4))
-            for row in tasks:
-                nested = [r for r in task_runs if r['task_id'] == row['id']]
-                ml = sum(r['run_type'] == 'ml' for r in nested)
-                info = f"{row['name']} · {len(nested)} запусков · ML: {ml}"
-                if nested:
-                    info += ' · Последний: ' + nested[0]['status']
-                ctk.CTkLabel(card, text=info, anchor='w',
-                             font=AppTheme.caption_font()).pack(fill='x', padx=22, pady=1)
-                for run in nested:
-                    label = ("ML " + run['ml_algorithm'].upper()) if run['run_type'] == 'ml' else 'CWT / конвейер'
-                    ctk.CTkLabel(card,
-                                 text=f"    {run['created_at'].replace('T', ' ')} · {label} · {run['status']}",
-                                 text_color=AppTheme.TEXT_SECONDARY,
-                                 font=AppTheme.caption_font(), anchor='w').pack(fill='x', padx=32, pady=0)
+            meta = (f"Создано: {format_date(experiment.get('created_at'))}  ·  "
+                    f"Задач: {len(tasks)}  ·  "
+                    f"Запусков: {len(task_runs)}  ·  "
+                    f"ML: {sum(r.get('run_type') == 'ml' for r in task_runs)}")
+            ctk.CTkLabel(card, text=meta, text_color=AppTheme.TEXT_SECONDARY,
+                         anchor='w', font=AppTheme.caption_font()).pack(
+                             fill='x', padx=12, pady=(0, 4))
+            if experiment.get('note'):
+                ctk.CTkLabel(
+                    card, text=experiment['note'][:500], anchor='w', justify='left',
+                    text_color=AppTheme.TEXT_SECONDARY, wraplength=1000,
+                    font=AppTheme.body_font(),
+                ).pack(fill='x', padx=12, pady=(0, 6))
+            self._history_disclosure(
+                card, f'Задачи и история запусков  ·  {len(tasks)}', experiment['id'],
+                self._history_open_researches,
+                lambda content, rows=tasks, values=task_runs:
+                    self._history_experiment_details(content, rows, values),
+                kind='research',
+            )
             buttons = ctk.CTkFrame(card, fg_color='transparent')
-            buttons.pack(fill='x', padx=12, pady=(7, 10))
+            buttons.pack(fill='x', padx=12, pady=(3, 10))
             eid = experiment['id']
             root = experiment['root_path']
-            ctk.CTkButton(buttons, text="Продолжить исследование", width=190,
+            ctk.CTkButton(buttons, text='Изменить название / заметку', width=205,
+                          fg_color=AppTheme.NAV_SELECTED_BACKGROUND,
+                          hover_color=AppTheme.NAV_HOVER,
+                          command=lambda record=experiment: self._edit_research_metadata(record)
+                          ).pack(side='right')
+            ctk.CTkButton(buttons, text="Открыть исследование", width=190,
                           command=lambda value=eid: self._restore_experiment(value)).pack(side='left', padx=(0, 8))
-            view_button = ctk.CTkButton(buttons, text="Результаты", width=110,
-                                        command=lambda value=root: self._show_saved_results(value))
-            view_button._read_only_during_compute = True
-            view_button.pack(side='left', padx=(0, 8))
             folder_button = ctk.CTkButton(buttons, text="Открыть папку", width=130,
                                           command=lambda value=root: self._open_result_path(value))
             folder_button._read_only_during_compute = True
@@ -4731,7 +5339,10 @@ class App(TkinterApp):
             text="ML выполняется…" if getattr(self, "_ml_ui_locked", False)
             else "Выполнить план")
         if not ready:
-            hint = "Доступно после расчёта KNN"
+            if task is not None and (id(task), 'features') in getattr(self, '_task_hydration_pending', ()):
+                hint = 'Восстанавливаем KNN-признаки из контрольной точки…'
+            else:
+                hint = "Доступно после расчёта KNN"
         elif not has_plan:
             hint = "Добавьте хотя бы один алгоритм"
         elif busy:
@@ -6082,77 +6693,256 @@ class App(TkinterApp):
             return
         self.run_history.ensure_experiment(
             processor.experiment_id, processor.root_folder_path,
+            processor.experiment_name or
             f"Исследование {os.path.basename(processor.root_folder_path)}"
         )
         self.run_history.save_task(processor.experiment_id, task)
 
-    def _restore_experiment(self, experiment_id):
-        """Restore the original experiment, including tasks with no calculations."""
+    def _open_research_from_folder(self):
+        """Open a disk-backed research workspace even without an available DB."""
+        from tkinter import filedialog
         if self._workspace_is_busy():
-            mb.showwarning("Исследование", "Дождитесь окончания расчёта")
+            mb.showwarning('Исследование', 'Дождитесь окончания расчёта')
+            return
+        root = filedialog.askdirectory(parent=self, title='Выберите папку исследования')
+        if not root:
             return
         try:
-            record = self.run_history.get_experiment(experiment_id)
-            saved_tasks = self.run_history.list_tasks(experiment_id)
-            if not os.path.isdir(record['root_path']):
-                mb.showerror("Исследование", "Каталог результатов не существует")
+            record, _rows = self.run_history.open_workspace_folder(root)
+        except (OSError, ValueError, KeyError) as error:
+            mb.showerror('Исследование', f'Не удалось прочитать файловое описание: {error}')
+            return
+        self._restore_experiment(record['id'])
+
+    def _reconnect_research_history(self):
+        """Retry and replay in a worker; DB latency must not freeze Tk."""
+        label = getattr(self, 'history_connect_status', None)
+        if label is not None:
+            label.configure(text='Синхронизация истории…')
+        def worker():
+            ok = self.run_history.reconnect(replay=True)
+            error = self.run_history.last_error
+            def finish():
+                if getattr(self, '_is_destroyed', False):
+                    return
+                if not ok:
+                    self.progress_manager.log_error(f'История временно недоступна: {error}')
+                self._refresh_history_tab(force=True)
+                self._refresh_welcome_recent_runs()
+            self.after_safe(0, finish)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _restore_experiment(self, experiment_id):
+        """Open a research without blocking Tk on disk, hashes or checkpoints.
+
+        Only the worker reads the ORM/workspace documents. Tk widgets and the
+        live ImageProcessor are updated exclusively on the main thread.
+        """
+        if self._workspace_is_busy() or getattr(self, '_restore_in_progress', False):
+            mb.showwarning("Исследование", "Дождитесь окончания текущей операции")
+            return
+        self._restore_in_progress = True
+        if hasattr(self, 'tasks_status_label'):
+            self.tasks_status_label.configure(text='Открываем исследование…',
+                                              text_color=AppTheme.TEXT_SECONDARY)
+        generation = getattr(self, '_restore_generation', 0) + 1
+        self._restore_generation = generation
+        self.progress_manager.set_status("Открываем исследование: чтение задач…", AppTheme.TEXT_SECONDARY)
+        started = time.perf_counter()
+
+        def worker():
+            from history.source_image import attach_workspace_input
+            recovery_messages = []
+            try:
+                self.run_history.prepare_restore(experiment_id)
+                record = self.run_history.get_experiment(experiment_id)
+                if not os.path.isdir(record['root_path']):
+                    raise FileNotFoundError('Каталог результатов не существует')
+                saved_tasks = self.run_history.list_tasks(experiment_id)
+                read_seconds = time.perf_counter() - started
+                tasks = []
+                for row in saved_tasks:
+                    task = ProcessingTask()
+                    try:
+                        task.apply_settings_snapshot(json.loads(row['settings_json']))
+                    except (ValueError, TypeError, KeyError, AttributeError) as error:
+                        recovery_messages.append(f"Задача {row['name']}: настройки недоступны ({error}).")
+                        continue
+                    task.task_id = row['task_number']
+                    task.task_name = row['name']
+                    task.note = row.get('note', '') or ''
+                    task.persistent_id = row['id']
+                    task.task_folder_path = row['folder_path']
+                    try:
+                        if task.image_path or getattr(task, '_input_snapshot_sha256', None):
+                            # A known hash is checked when this image is actually
+                            # decoded, not while loading the 11-task index.
+                            attach_workspace_input(task, record['root_path'], defer_verify=True)
+                    except (OSError, ValueError) as error:
+                        recovery_messages.append(
+                            f"Задача {task.task_name}: источник недоступен ({error}). "
+                            "Результаты остаются доступны для просмотра.")
+                    if (task.image_path and not os.path.isfile(task.image_path)
+                            and getattr(task, '_input_snapshot_path', None)):
+                        task.image_path = task._input_snapshot_path
+                    if task.task_folder_path and not os.path.isdir(task.task_folder_path):
+                        recovery_messages.append(
+                            f"Задача {task.task_name}: каталог результатов недоступен.")
+                    tasks.append(task)
+                io_seconds = time.perf_counter() - started - read_seconds
+                self.after_safe(0, finish, record, tasks, recovery_messages,
+                                read_seconds, io_seconds, None)
+            except Exception as error:
+                self.after_safe(0, finish, None, [], [], 0, 0, error)
+
+        def finish(record, tasks, recovery_messages, read_seconds, io_seconds, error):
+            if getattr(self, '_is_destroyed', False) or generation != getattr(self, '_restore_generation', 0):
+                return
+            self._restore_in_progress = False
+            if error is not None:
+                mb.showerror('Исследование', f'Не удалось продолжить исследование: {error}')
                 return
             processor = self.image_processor
-            processor.tasks.clear()
-            processor.current_task_index = -1
+            # Do not retain hundreds of old widgets and an old image in RAM.
+            for card in getattr(self, '_task_cards', {}).values():
+                card['frame'].destroy()
+            self._task_cards = {}
+            self.task_widgets.clear()
+            processor.tasks = tasks
+            processor.current_task_index = 0 if tasks else -1
             processor.experiment_id = experiment_id
+            processor.experiment_name = record.get('name')
+            processor.experiment_note = record.get('note', '') or ''
             processor.root_folder_path = record['root_path']
-            recovery_messages = []
-            for row in saved_tasks:
-                task = ProcessingTask()
-                try:
-                    task.apply_settings_snapshot(__import__('json').loads(row['settings_json']))
-                except (ValueError, TypeError, KeyError, AttributeError) as error:
-                    recovery_messages.append(f"Задача {row['name']}: настройки недоступны ({error}).")
-                    continue
-                task.task_id = row['task_number']
-                task.task_name = row['name']
-                task.persistent_id = row['id']
-                task.task_folder_path = row['folder_path']
-                # Reopening 100+ tasks must NOT decode all sources or feature
-                # checkpoints at once. Attach validated disk snapshots only.
-                from history.source_image import attach_workspace_input
-                try:
-                    attach_workspace_input(task, processor.root_folder_path)
-                except (OSError, ValueError) as error:
-                    recovery_messages.append(
-                        f"Задача {task.task_name}: источник недоступен ({error}). "
-                        "Результаты остаются доступны для просмотра.")
-                if not (task.task_folder_path and os.path.isdir(task.task_folder_path)):
-                    recovery_messages.append(
-                        f"Задача {task.task_name}: каталог результатов недоступен.")
-                # KNN feature checkpoint is loaded by _update_ui_for_current_task
-                # only after the user selects this task.
-                processor.tasks.append(task)
-            for message in recovery_messages:
-                self.progress_manager.log_error(message)
-            if recovery_messages:
-                mb.showwarning("Исследование открыто с замечаниями",
-                               "\n\n".join(recovery_messages[:10]) +
-                               ("\n\nОстальные сообщения — в журнале." if len(recovery_messages) > 10 else "") +
-                               "\n\nАвтоматический пересчёт не запускался.")
-            if not processor.tasks:
-                self.current_task = None
-                self._show_workspace()
-                self._update_ui_for_current_task()
-                self._update_tasks_display()
-                return
-            processor.current_task_index = 0
-            self.current_task = processor.tasks[0]
+            self.current_task = tasks[0] if tasks else None
             self._show_workspace()
-            self._update_ui_for_current_task()
-            self._update_tasks_display()
-            self.workspace_tabs.set("Данные")
-            self._update_ml_tab_state()
-        except Exception as error:
-            mb.showerror("Исследование", f"Не удалось продолжить исследование: {error}")
+            # Render settings immediately; no PNG, NPZ, SHA or result-tree scan.
+            self._update_ui_for_current_task(defer_heavy=True, refresh_task_list=False)
+            self.workspace_tabs.set('Данные')
+            self._update_tasks_display_batched()
+            self.progress_manager.log_info(
+                f'Открытие исследования: {len(tasks)} задач, чтение метаданных '
+                f'{read_seconds:.2f} с, подготовка источников {io_seconds:.2f} с, '
+                f'без загрузки изображений/KNN.')
+            if recovery_messages:
+                for message in recovery_messages:
+                    self.progress_manager.log_error(message)
+                mb.showwarning('Исследование открыто с замечаниями',
+                               '\n\n'.join(recovery_messages[:10]) +
+                               ('\n\nОстальные сообщения — в журнале.'
+                                if len(recovery_messages) > 10 else '') +
+                               '\n\nАвтоматический пересчёт не запускался.')
+        self._restore_thread = threading.Thread(
+            target=worker, daemon=True, name='research-metadata-restore')
+        self._restore_thread.start()
+
+    def _update_tasks_display_batched(self, chunk=2):
+        """Populate cards a few at a time so Tk remains responsive."""
+        tasks = list(self.image_processor.tasks)
+        render_started = time.perf_counter()
+        self.tasks_status_label.configure(
+            text=f'Всего задач: {len(tasks)} · восстановление списка…',
+            text_color=AppTheme.TEXT_ON_DARK)
+        generation = getattr(self, '_restore_generation', 0)
+        self._task_cards = getattr(self, '_task_cards', {})
+
+        def render(start=0):
+            if getattr(self, '_is_destroyed', False) or generation != getattr(self, '_restore_generation', 0):
+                return
+            if start >= len(tasks):
+                self._update_tasks_display()
+                self.progress_manager.log_info(
+                    f'Построение панели задач: {len(tasks)} карточек за '
+                    f'{time.perf_counter() - render_started:.3f} с')
+                self.progress_manager.set_status(
+                    f'Исследование открыто: {len(tasks)} задач. Изображения и KNN загружаются по требованию.',
+                    AppTheme.TEXT_ON_DARK)
+                return
+            for task in tasks[start:start + chunk]:
+                if task in self.image_processor.tasks and id(task) not in self._task_cards:
+                    self._create_task_widget(task)
+            self.after_safe(1, render, start + chunk)
+        self.after_safe(0, render)
+
+    def _hydrate_selected_task_async(self, task, *, features=False, on_ready=None):
+        """Lazy, integrity-checked input/ML loading, never inside a Tk handler."""
+        if task is None or not getattr(task, 'task_folder_path', None) and features:
+            return
+        key = (id(task), 'features' if features else 'source')
+        pending = getattr(self, '_task_hydration_pending', None)
+        if pending is None:
+            pending = self._task_hydration_pending = set()
+        callbacks = getattr(self, '_task_hydration_callbacks', None)
+        if callbacks is None:
+            callbacks = self._task_hydration_callbacks = {}
+        if key in pending:
+            if on_ready is not None:
+                bucket = callbacks.setdefault(key, [])
+                if on_ready not in bucket:
+                    bucket.append(on_ready)
+            return
+        if features:
+            from history.checkpoints import feature_checkpoint_available
+            if task.knn_results or not feature_checkpoint_available(task.task_folder_path):
+                return
+        elif not getattr(task, '_input_snapshot_path', None) or task.original_image is not None:
+            return
+        pending.add(key)
+        if on_ready is not None:
+            callbacks.setdefault(key, []).append(on_ready)
+        generation = getattr(self, '_restore_generation', 0)
+
+        def worker():
+            error = None
+            try:
+                if features:
+                    # Standalone ML needs both the scientific feature arrays
+                    # and the effective input image used for its PNG previews.
+                    if task.original_image is None and getattr(task, '_input_snapshot_path', None):
+                        from history.source_image import ensure_task_source
+                        ensure_task_source(task)
+                    from history.checkpoints import restore_feature_checkpoint
+                    restore_feature_checkpoint(task, task.task_folder_path)
+                else:
+                    from history.source_image import ensure_task_source
+                    ensure_task_source(task)
+            except Exception as exc:
+                error = exc
+            self.after_safe(0, finish, error)
+
+        def finish(error):
+            pending.discard(key)
+            ready_callbacks = callbacks.pop(key, [])
+            if getattr(self, '_is_destroyed', False):
+                return
+            if generation != getattr(self, '_restore_generation', 0) or self.current_task is not task:
+                if task.original_image is not None or task.knn_results:
+                    from history.source_image import release_task_source
+                    release_task_source(task)
+                return
+            if error is not None:
+                self.progress_manager.log_error(
+                    f'Фоновая загрузка {task.task_name}: {error}')
+                if ready_callbacks:
+                    mb.showerror('Данные задачи', f'Не удалось загрузить данные: {error}')
+                return
+            elif features:
+                for warning in getattr(task, 'recovery_warnings', ()):
+                    self.progress_manager.log_error(f'{task.task_name}: {warning}')
+                self._update_ml_tab_state()
+                if hasattr(self, 'ml_panel'):
+                    self._refresh_ml_controls_state()
+            else:
+                self.print_load_image.configure(
+                    text=self._source_image_info(task), text_color=AppTheme.TEXT_ON_DARK)
+            for callback in ready_callbacks:
+                callback()
+        threading.Thread(target=worker, daemon=True,
+                         name=f'load-{key[1]}-{task.task_id}').start()
 
     def add_new_task(self):
+        if getattr(self, '_restore_in_progress', False):
+            return
         try:
             # Создаем новую задачу
             new_task = ProcessingTask()
@@ -6218,6 +7008,15 @@ class App(TkinterApp):
                 h, w = task.original_image.shape[:2]
                 image_info += f' ({w}×{h}px)'
             card['title'].configure(text=task.task_name)
+            note_value = getattr(task, 'note', '') or ''
+            if 'note' in card:
+                label = card['note']
+                if note_value:
+                    label.configure(text=note_value[:175] + ('…' if len(note_value) > 175 else ''))
+                    if not label.winfo_manager():
+                        label.pack(fill='x', pady=(0, 4), before=card['info_first_row'])
+                elif label.winfo_manager():
+                    label.pack_forget()
             card['mode'].configure(text='1D' if task.analysis_mode == '1d' else '2D',
                                    fg_color=AppTheme.PRIMARY if task.analysis_mode == '1d' else AppTheme.MODE_2D)
             card['status'].configure(text=status, text_color=self._get_status_color(status))
@@ -6227,6 +7026,27 @@ class App(TkinterApp):
             selected = self.current_task is task
             card['frame'].configure(border_color=AppTheme.ACTIVE_BORDER if selected else AppTheme.BORDER,
                                     border_width=2 if selected else 1)
+
+    @staticmethod
+    def _task_edit_pencil_image_task_edit_pencil_image():
+        """Draw a crisp diagonal edit pencil without depending on emoji/fonts."""
+        scale = 4
+        image = Image.new('RGBA', (24 * scale, 24 * scale), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        def points(coords):
+            return [(round(x * scale), round(y * scale)) for x, y in coords]
+
+        # Standard edit orientation: eraser upper-right, sharpened tip lower-left.
+        draw.polygon(points([(5.4, 15.5), (16.5, 4.4), (19.6, 7.5), (8.5, 18.6)]),
+                     fill='#C4CCD5')
+        draw.line(points([(7.5, 18.1), (18.1, 7.5)]), fill='#8796A4', width=scale)
+        draw.polygon(points([(5.4, 15.5), (8.5, 18.6), (3.2, 20.8)]), fill='#CED4DB')
+        draw.polygon(points([(3.2, 20.8), (4.4, 17.7), (6.2, 19.5)]), fill='#8796A4')
+        draw.polygon(points([(16.5, 4.4), (18.4, 2.5), (21.5, 5.6), (19.6, 7.5)]),
+                     fill='#C4CCD5')
+        draw.line(points([(17.4, 4.0), (20.0, 6.6)]), fill='#8796A4', width=scale)
+        image = image.resize((24, 24), Image.Resampling.LANCZOS)
+        return ctk.CTkImage(light_image=image, dark_image=image, size=(17, 17))
 
     def _create_task_widget(self, task):
         """Создание виджета для отображения задачи"""
@@ -6240,22 +7060,20 @@ class App(TkinterApp):
         task_frame.pack(fill="x", padx=5, pady=2)
         self.task_widgets.append(task_frame)
 
-        # Верхняя часть - заголовок и статус
         header_frame = ctk.CTkFrame(task_frame, fg_color="transparent")
         header_frame.pack(fill="x", padx=10, pady=(7, 3))
-
-        # Заголовок задачи с номером и статусом
         title_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         title_frame.pack(fill="x")
 
-        # Номер задачи и название
-        task_title = ctk.CTkLabel(
-            title_frame,
-            text=f"{task.task_name}",
-            font=AppTheme.section_title_font(),
-            anchor="w"
+        # Status and mode occupy the right edge; the name/edit group gets the
+        # remaining width.  The pencil is packed directly after the name.
+        status_text = self._get_task_status(task)
+        status_color = self._get_status_color(status_text)
+        task_status = ctk.CTkLabel(
+            title_frame, text=status_text, font=AppTheme.caption_font(),
+            text_color=status_color
         )
-        task_title.pack(side="left", fill="x", expand=True)
+        task_status.pack(side="right", padx=(5, 0))
 
         mode_badge = ctk.CTkLabel(
             title_frame,
@@ -6266,22 +7084,77 @@ class App(TkinterApp):
             fg_color=AppTheme.PRIMARY if task.analysis_mode == "1d" else AppTheme.MODE_2D,
             font=AppTheme.caption_font()
         )
-        mode_badge.pack(side="left", padx=(6, 4))
+        mode_badge.pack(side="right", padx=(4, 5))
 
-        # Статус задачи
-        status_text = self._get_task_status(task)
-        status_color = self._get_status_color(status_text)
-        task_status = ctk.CTkLabel(
-            title_frame,
-            text=status_text,
-            font=AppTheme.caption_font(),
-            text_color=status_color
+        name_edit_frame = ctk.CTkFrame(title_frame, fg_color="transparent")
+        name_edit_frame.pack(side="left", fill="x", expand=True)
+        task_title = ctk.CTkLabel(
+            name_edit_frame, text=task.task_name,
+            font=AppTheme.section_title_font(), anchor="w"
         )
-        task_status.pack(side="right", padx=(5, 0))
+        task_title.pack(side="left")
+
+        
+        ICON_STYLE = "fluent"
+
+        ICONS = {
+            "fluent": (
+                "\uE70F",
+                ("Segoe Fluent Icons", 16),
+            ),
+            "mdl2": (
+                "\uE70F",
+                ("Segoe MDL2 Assets", 16),
+            ),
+            "emoji": (
+                "\u270F\uFE0F",
+                ("Segoe UI Emoji", 16),
+            ),
+        }
+
+        icon_text, icon_font = ICONS[ICON_STYLE]
+
+        edit_task_button = ctk.CTkButton(
+            name_edit_frame,
+            text=icon_text,
+            font=icon_font,
+            width=25,
+            height=25,
+            border_spacing=0,
+            corner_radius=6,
+            border_width=1,
+            border_color='#575757',
+            fg_color=AppTheme.NAV_SELECTED_BACKGROUND,
+            hover_color=AppTheme.NAV_HOVER,
+            text_color=AppTheme.TEXT_SECONDARY,
+            command=lambda current=task: self._edit_task_metadata(
+                self.image_processor.experiment_id,
+                {
+                    "id": current.persistent_id,
+                    "task_number": current.task_id,
+                    "name": current.task_name,
+                    "note": getattr(current, "note", ""),
+                },
+            ),
+        )
+
+        edit_task_button.pack(
+            side="left",
+            padx=(5, 0),
+        )
+
 
         # Основная информация о задаче
         info_frame = ctk.CTkFrame(task_frame, fg_color="transparent")
         info_frame.pack(fill="x", padx=10, pady=(0, 3))
+        note_label = ctk.CTkLabel(
+            info_frame, text='', anchor='w', justify='left',
+            text_color=AppTheme.TEXT_SECONDARY, font=AppTheme.caption_font(),
+            wraplength=340,
+        )
+        if getattr(task, 'note', ''):
+            note_label.configure(text=task.note[:175] + ('…' if len(task.note) > 175 else ''))
+            note_label.pack(fill='x', pady=(0, 4))
 
         # Первая строка информации
         row1_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
@@ -6337,13 +7210,19 @@ class App(TkinterApp):
         button_frame.pack(fill="x", padx=10, pady=(3, 7))
 
         def make_task_active():
+            if self._workspace_is_busy():
+                return
             self._save_ml_queue_cards()
             self.current_task = task
             self.image_processor.set_current_task(task.task_id)
-            self._update_ui_for_current_task()
-            self._update_tasks_display()
+            # Selecting a row loads only its settings; no PNG/KNN I/O.
+            self._update_ui_for_current_task(defer_heavy=True)
+            if self.workspace_tabs.current_tab() == 'ML':
+                self._hydrate_selected_task_async(task, features=True)
 
         def remove_task():
+            if self._workspace_is_busy():
+                return
             self.image_processor.remove_task(task.task_id)
             self.run_history.remove_task(
                 getattr(self.image_processor, 'experiment_id', None),
@@ -6354,7 +7233,9 @@ class App(TkinterApp):
                 self.image_processor.current_task_index = 0
                 self.current_task = self.image_processor.tasks[0]
             self._update_tasks_display()
-            self._update_ui_for_current_task()
+            self._update_ui_for_current_task(defer_heavy=True)
+            if self.current_task is not None and self.workspace_tabs.current_tab() == 'ML':
+                self._hydrate_selected_task_async(self.current_task, features=True)
 
         # Кнопка активации
         activate_btn = ctk.CTkButton(
@@ -6387,7 +7268,7 @@ class App(TkinterApp):
             task_frame.configure(border_color=AppTheme.ACTIVE_BORDER, border_width=2)
         self._task_cards[id(task)] = dict(frame=task_frame, title=task_title, mode=mode_badge,
                                           status=task_status, image=image_label, scales=scales_label,
-                                          lines=line_label)
+                                          lines=line_label, note=note_label, info_first_row=row1_frame)
 
     @staticmethod
     def _get_task_status(task):
@@ -6479,10 +7360,10 @@ class App(TkinterApp):
 
         return lines
 
-    def _update_ui_for_current_task(self):
-        """Обновление UI в соответствии с текущей задачей"""
+    def _update_ui_for_current_task(self, *, defer_heavy=False, refresh_task_list=True):
+        """Update settings; optionally defer image, KNN and results scanning."""
         from history.source_image import ensure_task_source, release_task_source
-        if self.current_task is not None and getattr(self.current_task, '_input_snapshot_path', None):
+        if not defer_heavy and self.current_task is not None and getattr(self.current_task, '_input_snapshot_path', None):
             if self.current_task.original_image is None:
                 try:
                     ensure_task_source(self.current_task)
@@ -6503,7 +7384,9 @@ class App(TkinterApp):
                         and getattr(other, '_input_snapshot_path', None)
                         and other.original_image is not None):
                     release_task_source(other)
-        if hasattr(self, 'results_panel'):
+        if (not defer_heavy and hasattr(self, 'results_panel')
+                and hasattr(self, 'workspace_tabs')
+                and self.workspace_tabs.current_tab() == 'Результаты'):
             self.results_panel.load_folder(self.image_processor.root_folder_path)
         if self.current_task:
             self.analysis_mode_selector.configure(state="normal")
@@ -6691,8 +7574,9 @@ class App(TkinterApp):
         self._update_action_availability()
         self._update_ml_tab_state()
 
-        # Всегда обновляем отображение задач для подсветки активной
-        self._update_tasks_display()
+        # On research opening cards are created in short scheduled batches.
+        if refresh_task_list:
+            self._update_tasks_display()
 
     def _update_action_availability(self):
         """Применить естественную последовательность обязательных шагов."""
@@ -6762,7 +7646,7 @@ class App(TkinterApp):
 
         self.app_start_button.configure(
             state="normal",
-            text="Запустить очередь",
+            text="Запустить",
             fg_color=AppTheme.PRIMARY,
             hover_color=AppTheme.PRIMARY_HOVER
         )
@@ -6836,6 +7720,10 @@ class App(TkinterApp):
         if not self.current_task.image_path:
             mb.showwarning("Внимание", "Сначала загрузите изображение")
             return
+        if self.current_task.original_image is None and getattr(self.current_task, '_input_snapshot_path', None):
+            self.progress_manager.set_status('Проверяем изображение для пипетки…', AppTheme.TEXT_SECONDARY)
+            self._hydrate_selected_task_async(self.current_task, on_ready=self.pipette_channel)
+            return
 
         try:
             selected = self.image_processor.pipette_channel_for_task(self.current_task, self)
@@ -6844,6 +7732,7 @@ class App(TkinterApp):
             if selected:
                 self._update_ui_for_current_task()
                 self._update_tasks_display()
+                self._persist_experiment_task(self.current_task)
         except Exception as error:
             if self._is_destroyed:
                 return
@@ -6854,6 +7743,10 @@ class App(TkinterApp):
         """Выбрать Gram–Schmidt как представление текущего исследования."""
         if not self.current_task:
             mb.showwarning("Внимание", "Сначала создайте задачу")
+            return
+        if self.current_task.original_image is None and getattr(self.current_task, '_input_snapshot_path', None):
+            self.progress_manager.set_status('Загружаем источник для Gram–Schmidt…', AppTheme.TEXT_SECONDARY)
+            self._hydrate_selected_task_async(self.current_task, on_ready=self.gramm_shmidt_transform)
             return
         if (getattr(self.current_task, "color1", None) is None or
                 getattr(self.current_task, "color2", None) is None):
@@ -8267,6 +9160,14 @@ class App(TkinterApp):
             text='Отмена запрошена: ожидаем завершения текущей операции…'
         )
 
+    def _close_research_history(self):
+        history = getattr(self, 'run_history', None)
+        if history is not None and hasattr(history, 'close'):
+            try:
+                history.close()
+            except Exception as error:
+                print(f'[Shutdown] History connection close: {error}', flush=True)
+
     def safe_destroy(self):
         """Handle the Windows close button without indefinite worker polling.
 
@@ -8289,6 +9190,7 @@ class App(TkinterApp):
         ) if thread is not None and thread.is_alive()]
         if not running:
             print("[Shutdown] No active workers; closing window", flush=True)
+            self._close_research_history()
             super().safe_destroy()
             return
 
@@ -8306,6 +9208,7 @@ class App(TkinterApp):
             print("[Shutdown] Worker timeout (5 s); closing GUI", flush=True)
             # Workers must not keep the interpreter running after Tk exits.
             # Both _compute_thread and _ml_thread are started as daemon threads.
+            self._close_research_history()
             super().safe_destroy()
             return
 
@@ -8322,6 +9225,9 @@ class App(TkinterApp):
 
     def safe_compute(self):
         """Безопасный запуск вычислений в отдельном потоке"""
+        if getattr(self, '_restore_in_progress', False):
+            mb.showwarning('Исследование', 'Дождитесь окончания открытия исследования')
+            return
         # Инициализируем _compute_thread если он None
         if self._compute_thread is None:
             self._compute_thread = threading.Thread()
@@ -8333,8 +9239,12 @@ class App(TkinterApp):
         if self._ml_thread is not None and self._ml_thread.is_alive():
             mb.showwarning('Выполнение', 'Дождитесь завершения отдельного ML-расчёта')
             return
-
         task = self.current_task
+        if task is not None and any(
+                key[0] == id(task) for key in getattr(self, '_task_hydration_pending', ())):
+            mb.showwarning('Подготовка данных', 'Данные задачи восстанавливаются; дождитесь завершения загрузки')
+            return
+
         if task is None or task not in self.image_processor.tasks:
             mb.showwarning('Выполнение', 'Выберите задачу для расчёта')
             return
@@ -8388,7 +9298,13 @@ class App(TkinterApp):
                 self.progress_manager.log_error(f'Очистка GPU: {error}')
             self.after_safe(0, lambda: self.cancel_compute_button.configure(state='disabled', text='Отменить расчёт'))
             try:
-                self.after_safe(0, lambda: (self._disable_ui_during_compute(False), self._update_ui_for_current_task()))
+                # Never reload a huge feature checkpoint while unlocking Tk.
+                self.after_safe(0, lambda: (
+                    self._disable_ui_during_compute(False),
+                    self._update_ui_for_current_task(defer_heavy=True),
+                    self._hydrate_selected_task_async(self.current_task, features=True)
+                    if self.current_task is not None and self.workspace_tabs.current_tab() == 'ML'
+                    else None))
             except Exception as e:
                 self.progress_manager.log_error(f"Ошибка при отключении UI: {str(e)}")
 
@@ -8763,22 +9679,6 @@ class App(TkinterApp):
         if hasattr(self, "ml_queue_status_label"):
             self.ml_queue_status_label.configure(
                 text=f"ML-план задачи: {len(plan)} конфигураций{preview}")
-        if hasattr(self, "queue_summary_label") and hasattr(self, "image_processor"):
-            tasks = self.image_processor.tasks
-            from ml.batch_plan import preview_task_ml_operations
-            total = 0
-            sources = 0
-            invalid = 0
-            for planned in tasks:
-                try:
-                    expanded = preview_task_ml_operations(planned)
-                    total += len(expanded)
-                    sources += len({tuple(op['dataset_key']) for op in expanded})
-                except ValueError:
-                    invalid += 1
-            note = f" · Ошибки плана: {invalid}" if invalid else ""
-            self.queue_summary_label.configure(
-                text=f"{len(tasks)} задач · {sources} наборов KNN · {total} операций ML{note}")
         self._refresh_ml_controls_state()
 
     def _refresh_ml_queue_summary(self):

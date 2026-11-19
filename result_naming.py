@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import datetime
+from uuid import uuid4
 
 
 CHANNEL_CODES = ("r", "g", "b", "gray", "gs1", "gs2", "gs3")
@@ -75,6 +76,16 @@ def scale_folder_name(scale) -> str:
 def run_root_folder_name(moment: datetime) -> str:
     """Return a readable, filesystem-safe folder name for one studio run."""
     return f"wavelet_studio_{moment.strftime('%d_%m_%Y_%H_%M')}"
+
+
+def generate_research_folder_name(moment: datetime | None = None) -> str:
+    """Generate the existing timestamp + 8 UUID4 hex folder naming scheme.
+
+    Call once when opening the creation dialog and reuse the result when
+    creating the first task; otherwise the displayed default and actual
+    directory may differ if the minute changes before confirmation.
+    """
+    return f"{run_root_folder_name(moment or datetime.now())}_{uuid4().hex[:8]}"
 
 
 def task_run_folder_name(task_id, moment: datetime, unique_suffix: str) -> str:

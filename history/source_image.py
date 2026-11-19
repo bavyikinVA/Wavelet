@@ -37,6 +37,9 @@ def release_task_source(task):
     The input path and scientific settings remain available for lazy restoration.
     This is intentionally only called by the disk-backed batch lifecycle.
     """
+    if task.original_image is not None:
+        from history.pipeline_resume import cwt_signature_payload
+        cwt_signature_payload(task)  # capture decoded-pixel fingerprint before unloading
     task.original_image = None
     task.data = []
     task.data_copy = []
@@ -121,10 +124,15 @@ def stage_task_input(task, experiment_root):
     # Publish the pointers only after the PNG is complete and checksummed.
     task._input_snapshot_path = str(destination)
     task._input_snapshot_sha256 = checksum
+    # Store the decoded-pixel fingerprint in settings alongside the PNG hash.
+    # The two hashes are not interchangeable: PNG hashes compressed bytes,
+    # while CWT provenance hashes the exact RGB array used for computation.
+    from history.pipeline_resume import cwt_signature_payload
+    cwt_signature_payload(task)
     return destination
 
 
-def attach_workspace_input(task, experiment_root):
+def attach_workspace_input(task, experiment_root, *, defer_verify=False):
     """Attach a prior task without eagerly retaining its image or KNN arrays.
 
     Modern tasks reuse the immutable checksum recorded in the SQLite settings.
@@ -138,8 +146,13 @@ def attach_workspace_input(task, experiment_root):
         raise ValueError('У задачи отсутствует постоянный идентификатор')
     staged = (root / '.inputs' / (str(task.persistent_id) + '.png')).resolve()
     if staged.is_file():
-        actual_hash = digest(staged)
         saved_hash = getattr(task, '_input_snapshot_sha256', None)
+        # Fast research opening: do not hash every compressed PNG in the
+        # workspace. ensure_task_source() verifies the saved hash before use.
+        if defer_verify and saved_hash:
+            task._input_snapshot_path = str(staged)
+            return staged
+        actual_hash = digest(staged)
         if saved_hash and saved_hash != actual_hash:
             raise ValueError(f'Повреждён сохранённый источник задачи: {staged}')
         task._input_snapshot_path = str(staged)

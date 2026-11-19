@@ -36,6 +36,17 @@ def cwt_signature_payload(task) -> dict:
         array = np.ascontiguousarray(image)
         source_shape = list(array.shape)
         source_digest = hashlib.sha256(array.view(np.uint8)).hexdigest()
+        # The GUI and batch runner release decoded images to limit RAM usage.
+        # Preserve the fingerprint of the actual *pixels*, not the compressed
+        # PNG checksum: these are different hashes and cannot be interchanged.
+        task._cwt_source_sha256 = source_digest
+        task._cwt_source_shape = list(source_shape)
+    else:
+        # An unloaded image does not mean that the scientific source changed.
+        # The saved fingerprint remains stable until the source is explicitly
+        # replaced (ProcessingTask.invalidate_source_results).
+        source_digest = getattr(task, '_cwt_source_sha256', None)
+        source_shape = getattr(task, '_cwt_source_shape', None)
 
     return {
         "analysis_mode": str(getattr(task, "analysis_mode", "1d")),

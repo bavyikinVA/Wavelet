@@ -8,3 +8,6 @@ scikit-learn==1.6.1
 scipy==1.14.1
 
 psutil==7.0.0
+
+# Portable ORM for SQLite / PostgreSQL history
+SQLAlchemy>=2.0,<2.1

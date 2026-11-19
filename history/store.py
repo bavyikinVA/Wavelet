@@ -1,11 +1,22 @@
-"""Current experiment -> task -> run schema. No legacy conversion or reset."""
+"""Database-independent run-history repository: SQLAlchemy ORM, SQLite/PostgreSQL.
+
+Scientific data belongs to the workspace, not to this secondary database index.
+Existing SQLite databases are opened in-place with no destructive migration.
+"""
 import json
 import os
-import sqlite3
 import sys
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
+
+from sqlalchemy import create_engine, event, inspect, select, func, text, case
+from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool, StaticPool
+
+from history.models import Base, Experiment, Task, Run
 
 
 def _default_database_path():
@@ -22,206 +33,394 @@ def _now():
     return datetime.now().astimezone().isoformat(timespec='seconds')
 
 
-class RunHistoryStore:
-    """Experiments, saved tasks and immutable execution records."""
+def _database_url(database_path=None, database_url=None):
+    """WAVELETS_DATABASE_URL selects SQLAlchemy backend (e.g. postgresql+psycopg)."""
+    if database_url:
+        return database_url
+    if database_path and '://' in str(database_path):
+        return str(database_path)
+    if database_path:
+        return 'sqlite:///' + Path(database_path).absolute().as_posix()
+    configured = os.environ.get('WAVELETS_DATABASE_URL')
+    return configured or 'sqlite:///' + Path(_default_database_path()).absolute().as_posix()
 
-    def __init__(self, database_path=None):
-        self.database_path = database_path or _default_database_path()
-        os.makedirs(os.path.dirname(os.path.abspath(self.database_path)), exist_ok=True)
+
+class RunHistoryStore:
+    """ORM-only CRUD with the same public API and JSON row shapes as the old store."""
+
+    def __init__(self, database_path=None, *, database_url=None):
+        self.database_url = _database_url(database_path, database_url)
+        url = make_url(self.database_url)
+        self.database_path = url.database if url.get_backend_name() == 'sqlite' else None
+        options = {'pool_pre_ping': True}
+        if url.get_backend_name() == 'postgresql':
+            # A dead server must not keep the Tk startup splash blocked.
+            # A URL query parameter may override the default when necessary.
+            if 'connect_timeout' not in url.query:
+                options['connect_args'] = {'connect_timeout': 3}
+        if url.get_backend_name() == 'sqlite':
+            filename = url.database
+            if filename and filename != ':memory:':
+                os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+            # In-memory SQLite must retain the same DB-API connection.
+            if not filename or filename == ':memory:':
+                options.update(poolclass=StaticPool, connect_args={'check_same_thread': False})
+            else:
+                # Short timeout allows the GUI's DB-offline mode to start quickly.
+                options.update(poolclass=NullPool, connect_args={'timeout': 1.5})
+        self.engine = create_engine(self.database_url, **options)
+        if url.get_backend_name() == 'sqlite':
+            @event.listens_for(self.engine, 'connect')
+            def sqlite_foreign_keys(dbapi_connection, _connection_record):
+                cursor = dbapi_connection.cursor()
+                cursor.execute('PRAGMA foreign_keys=ON')
+                cursor.close()
+        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         self._initialize()
 
     @contextmanager
     def _connect(self):
-        connection = sqlite3.connect(self.database_path, timeout=30)
+        """Legacy diagnostic DB-API access used by existing SQLite-only tests.
+
+        Production operations exclusively use ORM sessions; never use this for CRUD.
+        """
+        raw = self.engine.raw_connection()
+        dbapi = raw.dbapi_connection
         try:
-            connection.row_factory = sqlite3.Row
-            connection.execute('PRAGMA foreign_keys = ON')
-            with connection:
-                yield connection
+            yield dbapi
+            raw.commit()
+        except BaseException:
+            raw.rollback()
+            raise
         finally:
-            connection.close()
+            raw.close()
+
+    @contextmanager
+    def _session(self):
+        with self.Session.begin() as session:
+            yield session
 
     def _initialize(self):
-        with self._connect() as db:
-            db.executescript('''
-                CREATE TABLE IF NOT EXISTS experiments (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    root_path TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    note TEXT NOT NULL DEFAULT ''
-                );
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id TEXT PRIMARY KEY,
-                    experiment_id TEXT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
-                    task_number INTEGER NOT NULL,
-                    name TEXT NOT NULL,
-                    folder_path TEXT NOT NULL DEFAULT '',
-                    settings_json TEXT NOT NULL DEFAULT '{}',
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(experiment_id, task_number)
-                );
-                CREATE TABLE IF NOT EXISTS runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    run_type TEXT NOT NULL CHECK(run_type IN ('pipeline', 'ml')),
-                    created_at TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    duration_seconds REAL NOT NULL DEFAULT 0,
-                    output_path TEXT NOT NULL DEFAULT '',
-                    ml_algorithm TEXT NOT NULL DEFAULT '',
-                    ml_summary TEXT NOT NULL DEFAULT '',
-                    error_message TEXT NOT NULL DEFAULT '',
-                    researcher_note TEXT NOT NULL DEFAULT '',
-                    settings_json TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_tasks_experiment ON tasks(experiment_id, task_number);
-                CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, id);
-            ''')
-            columns = {row[1] for row in db.execute('PRAGMA table_info(runs)')}
-            if 'attempt_id' not in columns:
-                db.execute('ALTER TABLE runs ADD COLUMN attempt_id TEXT')
-            db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_attempt ON runs(attempt_id)')
+        # Only additive migration required by old schema: runs.attempt_id.
+        # SQLAlchemy metadata create_all is idempotent and never drops existing data.
+        with self.engine.begin() as conn:
+            inspector = inspect(conn)
+            if 'runs' in inspector.get_table_names():
+                columns = {column['name'] for column in inspector.get_columns('runs')}
+                if 'attempt_id' not in columns:
+                    conn.execute(text('ALTER TABLE runs ADD COLUMN attempt_id TEXT'))
+        with self.engine.begin() as conn:
+            inspector = inspect(conn)
+            if 'tasks' in inspector.get_table_names():
+                fields = {column['name'] for column in inspector.get_columns('tasks')}
+                if 'note' not in fields:
+                    # Additive, portable migration: valid for SQLite and PostgreSQL.
+                    conn.execute(text("ALTER TABLE tasks ADD COLUMN note TEXT NOT NULL DEFAULT ''"))
+        Base.metadata.create_all(self.engine)
 
     def ensure_experiment(self, experiment_id, root_path, name=None):
         if not experiment_id or not root_path:
             raise ValueError('Идентификатор и каталог исследования обязательны')
-        with self._connect() as db:
-            db.execute('''INSERT INTO experiments(id,name,root_path,created_at,updated_at)
-                VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
-                name=excluded.name, updated_at=excluded.updated_at''',
-                (experiment_id, name or f'Исследование {experiment_id[:8]}', root_path, _now(), _now()))
+        with self._session() as db:
+            row = db.get(Experiment, experiment_id)
+            timestamp = _now()
+            if row is None:
+                db.add(Experiment(id=experiment_id,
+                    name=name or f'Исследование {experiment_id[:8]}',
+                    root_path=str(root_path), created_at=timestamp,
+                    updated_at=timestamp, note=''))
+            else:
+                # Never replace a user title with a default on routine saves.
+                if name is not None:
+                    row.name = name
+                row.root_path = str(root_path)
+                row.updated_at = timestamp
 
     def save_task(self, experiment_id, task):
-        task_uuid = getattr(task, 'persistent_id', None)
-        if not task_uuid:
-            task_uuid = uuid4().hex
-            task.persistent_id = task_uuid
+        task_id = getattr(task, 'persistent_id', None)
+        if not task_id:
+            task_id = uuid4().hex
+            task.persistent_id = task_id
         snapshot = json.dumps(task.settings_snapshot(), ensure_ascii=False)
-        with self._connect() as db:
-            db.execute('''INSERT INTO tasks(id,experiment_id,task_number,name,folder_path,settings_json,updated_at)
-                VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
-                name=excluded.name, folder_path=excluded.folder_path,
-                settings_json=excluded.settings_json,updated_at=excluded.updated_at''',
-                (task_uuid, experiment_id, int(task.task_id), task.task_name,
-                 task.task_folder_path or '', snapshot, _now()))
-            db.execute('UPDATE experiments SET updated_at=? WHERE id=?', (_now(), experiment_id))
-        return task_uuid
+        with self._session() as db:
+            row = db.get(Task, task_id)
+            if row is None:
+                row = Task(id=task_id, experiment_id=experiment_id,
+                    task_number=int(task.task_id), name=task.task_name,
+                    note=getattr(task, 'note', '') or '', folder_path=task.task_folder_path or '',
+                    settings_json=snapshot, updated_at=_now())
+                db.add(row)
+            else:
+                if row.experiment_id != experiment_id:
+                    raise ValueError('Задача принадлежит другому исследованию')
+                row.task_number = int(task.task_id)
+                row.name = task.task_name
+                row.note = getattr(task, 'note', '') or ''
+                row.folder_path = task.task_folder_path or ''
+                row.settings_json = snapshot
+                row.updated_at = _now()
+            experiment = db.get(Experiment, experiment_id)
+            if experiment is not None:
+                experiment.updated_at = _now()
+        return task_id
 
     def add_run(self, *, task, status, duration_seconds, settings,
                 ml_summary='', error_message='', ml_algorithm=None, run_type=None,
                 output_path=None, attempt_id=None):
         task_id = getattr(task, 'persistent_id', None)
         if not task_id:
-            raise ValueError('Сначала зарегистрируйте задачу в SQLite')
+            raise ValueError('У задачи отсутствует постоянный идентификатор')
         algorithm = ml_algorithm if ml_algorithm is not None else ''
         kind = run_type or ('ml' if algorithm else 'pipeline')
         if kind not in ('pipeline', 'ml'):
             raise ValueError('Неизвестный тип запуска')
-        with self._connect() as db:
+        with self._session() as db:
             if attempt_id:
-                db.execute('BEGIN IMMEDIATE')
-                previous = db.execute('SELECT id,task_id FROM runs WHERE attempt_id=?',
-                                      (attempt_id,)).fetchone()
-                if previous:
-                    if previous['task_id'] != task_id:
+                previous = db.scalar(select(Run).where(Run.attempt_id == attempt_id))
+                if previous is not None:
+                    if previous.task_id != task_id:
                         raise ValueError('Идентификатор попытки принадлежит другой задаче')
-                    return previous['id']
-            cursor = db.execute('''INSERT INTO runs(task_id,run_type,created_at,status,duration_seconds,
-                output_path,ml_algorithm,ml_summary,error_message,settings_json,attempt_id)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
-                (task_id, kind, _now(), status, float(duration_seconds),
-                 output_path if output_path is not None else (task.task_folder_path or ''),
-                 algorithm, ml_summary, error_message,
-                 json.dumps(settings, ensure_ascii=False), attempt_id))
-            db.execute('''UPDATE tasks SET folder_path=?,settings_json=?,updated_at=? WHERE id=?''',
-                       (task.task_folder_path or '', json.dumps(settings, ensure_ascii=False), _now(), task_id))
-            db.execute('''UPDATE experiments SET updated_at=? WHERE id=(SELECT experiment_id FROM tasks WHERE id=?)''',
-                       (_now(), task_id))
-            return cursor.lastrowid
+                    return previous.id
+            row = Run(task_id=task_id, run_type=kind, created_at=_now(),
+                status=status, duration_seconds=float(duration_seconds),
+                output_path=output_path if output_path is not None else (task.task_folder_path or ''),
+                ml_algorithm=algorithm, ml_summary=ml_summary,
+                error_message=error_message, researcher_note='',
+                settings_json=json.dumps(settings, ensure_ascii=False), attempt_id=attempt_id)
+            db.add(row)
+            saved_task = db.get(Task, task_id)
+            if saved_task is None:
+                raise ValueError('Сначала зарегистрируйте задачу в истории')
+            saved_task.folder_path = task.task_folder_path or ''
+            saved_task.settings_json = json.dumps(settings, ensure_ascii=False)
+            saved_task.updated_at = _now()
+            experiment = db.get(Experiment, saved_task.experiment_id)
+            if experiment is not None:
+                experiment.updated_at = _now()
+            db.flush()
+            return row.id
 
-    _RUN_SELECT = '''SELECT r.*,t.name AS task_name,t.task_number,t.experiment_id,
-        t.folder_path AS task_folder_path,e.root_path AS experiment_root,
-        e.name AS experiment_name,json_extract(r.settings_json,'$.image_path') AS image_path,
-        json_extract(r.settings_json,'$.analysis_mode') AS analysis_mode,
-        json_extract(r.settings_json,'$.pipeline_preset') AS pipeline_preset
-        FROM runs r JOIN tasks t ON r.task_id=t.id
-        JOIN experiments e ON t.experiment_id=e.id'''
+    @staticmethod
+    def _record(row):
+        return {c.name:getattr(row,c.name) for c in row.__table__.columns}
+
+    def _run_record(self, run, task, experiment):
+        record = self._record(run)
+        record.update(task_name=task.name, task_number=task.task_number,
+            experiment_id=task.experiment_id, task_folder_path=task.folder_path,
+            experiment_root=experiment.root_path, experiment_name=experiment.name)
+        try:
+            settings = json.loads(run.settings_json)
+        except (ValueError, TypeError):
+            settings = {}
+        for key in ('image_path', 'analysis_mode', 'pipeline_preset'):
+            record[key] = settings.get(key)
+        return record
 
     def find_ml_operation(self, task, operation_id, output_path):
-        """Find a committed operation without scanning a truncated history page."""
-        with self._connect() as db:
-            row = db.execute("""SELECT id FROM runs WHERE task_id=? AND run_type='ml'
-                AND status='completed' AND output_path=?
-                AND json_extract(settings_json, '$.ml_operation_id')=?
-                ORDER BY id DESC LIMIT 1""",
-                (task.persistent_id, output_path, operation_id)).fetchone()
-        return row['id'] if row else None
+        with self._session() as db:
+            records = db.scalars(select(Run).where(Run.task_id == task.persistent_id,
+                Run.run_type == 'ml', Run.status == 'completed',
+                Run.output_path == output_path).order_by(Run.id.desc())).all()
+            for row in records:
+                try:
+                    if json.loads(row.settings_json).get('ml_operation_id') == operation_id:
+                        return row.id
+                except (ValueError, TypeError):
+                    continue
+        return None
 
     def list_runs(self, limit=100):
-        with self._connect() as db:
-            rows = db.execute(self._RUN_SELECT + ' ORDER BY r.id DESC LIMIT ?', (int(limit),)).fetchall()
-        return [dict(row) for row in rows]
+        with self._session() as db:
+            rows = db.execute(select(Run, Task, Experiment).join(Task, Run.task_id == Task.id)
+                .join(Experiment, Task.experiment_id == Experiment.id)
+                .order_by(Run.created_at.desc(), Run.id.desc()).limit(int(limit))).all()
+            return [self._run_record(*row) for row in rows]
 
     def get_run(self, run_id):
-        with self._connect() as db:
-            row = db.execute(self._RUN_SELECT + ' WHERE r.id=?', (int(run_id),)).fetchone()
-        if row is None:
-            raise KeyError(f'Запуск {run_id} не найден')
-        return dict(row)
+        with self._session() as db:
+            row = db.execute(select(Run, Task, Experiment).join(Task, Run.task_id == Task.id)
+                .join(Experiment, Task.experiment_id == Experiment.id)
+                .where(Run.id == int(run_id))).first()
+            if row is None:
+                raise KeyError(f'Запуск {run_id} не найден')
+            return self._run_record(*row)
 
     def get_settings(self, run_id):
         return json.loads(self.get_run(run_id)['settings_json'])
 
     def list_experiments(self, limit=100):
-        with self._connect() as db:
-            rows = db.execute('''SELECT e.*,
-                (SELECT COUNT(*) FROM tasks t WHERE t.experiment_id=e.id) AS task_count,
-                (SELECT COUNT(*) FROM runs r JOIN tasks t ON t.id=r.task_id
-                   WHERE t.experiment_id=e.id AND r.run_type='ml') AS ml_count,
-                (SELECT COUNT(*) FROM runs r JOIN tasks t ON t.id=r.task_id
-                   WHERE t.experiment_id=e.id) AS run_count
-                FROM experiments e ORDER BY updated_at DESC LIMIT ?''', (int(limit),)).fetchall()
-        return [dict(row) for row in rows]
+        """One portable aggregate SELECT, not three queries per research card."""
+        task_counts = (select(Task.experiment_id.label('experiment_id'),
+                func.count(Task.id).label('task_count'))
+            .group_by(Task.experiment_id).subquery())
+        run_counts = (select(Task.experiment_id.label('experiment_id'),
+                func.count(Run.id).label('run_count'),
+                func.sum(case((Run.run_type == 'ml', 1), else_=0)).label('ml_count'),
+                func.sum(Run.duration_seconds).label('total_duration_seconds'))
+            .join(Run, Run.task_id == Task.id).group_by(Task.experiment_id).subquery())
+        with self._session() as db:
+            query = (select(Experiment,
+                    func.coalesce(task_counts.c.task_count, 0),
+                    func.coalesce(run_counts.c.run_count, 0),
+                    func.coalesce(run_counts.c.ml_count, 0),
+                    func.coalesce(run_counts.c.total_duration_seconds, 0.0))
+                .outerjoin(task_counts, task_counts.c.experiment_id == Experiment.id)
+                .outerjoin(run_counts, run_counts.c.experiment_id == Experiment.id)
+                .order_by(Experiment.created_at.desc(), Experiment.id.desc()).limit(int(limit)))
+            return [{**self._record(exp), 'task_count':int(tasks),
+                'run_count':int(runs), 'ml_count':int(ml),
+                'total_duration_seconds':float(duration)}
+                for exp, tasks, runs, ml, duration in db.execute(query)]
 
     def get_experiment(self, experiment_id):
-        with self._connect() as db:
-            row = db.execute('SELECT * FROM experiments WHERE id=?', (experiment_id,)).fetchone()
-        if row is None:
-            raise KeyError(f'Исследование {experiment_id} не найдено')
-        return dict(row)
+        with self._session() as db:
+            row = db.get(Experiment, experiment_id)
+            if row is None:
+                raise KeyError(f'Исследование {experiment_id} не найдено')
+            return self._record(row)
 
     def list_tasks(self, experiment_id):
-        with self._connect() as db:
-            rows = db.execute('SELECT * FROM tasks WHERE experiment_id=? ORDER BY task_number', (experiment_id,)).fetchall()
-        return [dict(row) for row in rows]
+        with self._session() as db:
+            return [self._record(row) for row in db.scalars(
+                select(Task).where(Task.experiment_id == experiment_id).order_by(Task.task_number))]
 
     def remove_task(self, experiment_id, task_id, remaining_tasks):
-        """Remove a workspace task and its run records, keeping files untouched."""
         if not experiment_id or not task_id:
             return
-        with self._connect() as db:
-            db.execute('DELETE FROM tasks WHERE id=? AND experiment_id=?',
-                       (task_id, experiment_id))
-            # Two-phase numbering avoids conflicts with UNIQUE(experiment_id,task_number).
+        with self._session() as db:
+            doomed = db.get(Task, task_id)
+            if doomed is not None and doomed.experiment_id == experiment_id:
+                db.delete(doomed)
+                db.flush()
+            # Avoid UNIQUE(experiment_id,task_number) while swapping numbers.
             for index, task in enumerate(remaining_tasks, 1):
-                if getattr(task, 'persistent_id', None):
-                    db.execute('UPDATE tasks SET task_number=? WHERE id=? AND experiment_id=?',
-                               (1000000 + index, task.persistent_id, experiment_id))
+                row = db.get(Task, getattr(task, 'persistent_id', None))
+                if row is not None and row.experiment_id == experiment_id:
+                    row.task_number = 1000000 + index
+            db.flush()
             for index, task in enumerate(remaining_tasks, 1):
-                if getattr(task, 'persistent_id', None):
-                    db.execute('UPDATE tasks SET task_number=?,name=?,updated_at=? WHERE id=?',
-                               (index, task.task_name, _now(), task.persistent_id))
-            db.execute('UPDATE experiments SET updated_at=? WHERE id=?', (_now(), experiment_id))
+                row = db.get(Task, getattr(task, 'persistent_id', None))
+                if row is not None and row.experiment_id == experiment_id:
+                    row.task_number, row.name, row.updated_at = index, task.task_name, _now()
+                    row.note = getattr(task, 'note', '') or '' 
+            experiment = db.get(Experiment, experiment_id)
+            if experiment is not None:
+                experiment.updated_at = _now()
+
+    def iter_runs(self, *, page_size=500):
+        """Iterate all history records in stable keyset pages (backend neutral)."""
+        cursor = 0
+        while True:
+            with self._session() as db:
+                rows = db.execute(select(Run, Task, Experiment)
+                    .join(Task, Run.task_id == Task.id)
+                    .join(Experiment, Task.experiment_id == Experiment.id)
+                    .where(Run.id > cursor).order_by(Run.id.asc()).limit(page_size)).all()
+                page = [self._run_record(*row) for row in rows]
+            if not page:
+                break
+            for record in page:
+                yield record
+            cursor = page[-1]['id']
+
+    def import_run(self, record, *, source_namespace):
+        """Losslessly import historic run metadata, preserving timestamps and notes.
+
+        Old NULL-attempt rows receive a deterministic import identity, making
+        repeated migrations idempotent without relying on SQLite-specific SQL.
+        """
+        attempt_id = record.get('attempt_id') or f"import:{source_namespace}:{record['id']}"
+        with self._session() as db:
+            previous = db.scalar(select(Run).where(Run.attempt_id == attempt_id))
+            if previous is not None:
+                if previous.task_id != record['task_id']:
+                    raise ValueError('Коллизия идентификатора попытки при импорте')
+                return previous.id, False
+            if db.get(Task, record['task_id']) is None:
+                raise ValueError('Сначала импортируйте задачу')
+            row = Run(task_id=record['task_id'], run_type=record['run_type'],
+                created_at=record['created_at'], status=record['status'],
+                duration_seconds=record['duration_seconds'],
+                output_path=record.get('output_path') or '',
+                ml_algorithm=record.get('ml_algorithm') or '',
+                ml_summary=record.get('ml_summary') or '',
+                error_message=record.get('error_message') or '',
+                researcher_note=record.get('researcher_note') or '',
+                settings_json=record['settings_json'], attempt_id=attempt_id)
+            db.add(row)
+            db.flush()
+            return row.id, True
+
+    def replace_tasks(self, experiment_id, rows):
+        """Make an ORM index reflect the authoritative workspace after offline edits.
+
+        Single transaction, two-phase numbering and deletes prevent uniqueness
+        conflicts, including swaps and removed tasks. Unchanged run records
+        remain associated with the same immutable task IDs.
+        """
+        desired = {row['id']: row for row in rows}
+        with self._session() as db:
+            existing = list(db.scalars(select(Task).where(Task.experiment_id == experiment_id)))
+            for row in existing:
+                if row.id not in desired:
+                    db.delete(row)
+                else:
+                    row.task_number = 1000000 + int(desired[row.id]['task_number'])
+            db.flush()
+            for data in rows:
+                row = db.get(Task, data['id'])
+                if row is None:
+                    row = Task(id=data['id'], experiment_id=experiment_id)
+                    db.add(row)
+                elif row.experiment_id != experiment_id:
+                    raise ValueError('ID задачи уже занят другим исследованием')
+                row.task_number = int(data['task_number'])
+                row.name = data['name']
+                row.note = data.get('note', '') or ''
+                row.folder_path = data.get('folder_path') or ''
+                row.settings_json = data['settings_json']
+                row.updated_at = data.get('updated_at') or _now()
+            experiment = db.get(Experiment, experiment_id)
+            if experiment is not None:
+                experiment.updated_at = _now()
+
+    def update_experiment_metadata(self, experiment_id, name, note):
+        from history.metadata import normalize_metadata
+        name, note = normalize_metadata(name, note)
+        with self._session() as db:
+            record = db.get(Experiment, experiment_id)
+            if record is None:
+                raise KeyError(f'Исследование {experiment_id} не найдено')
+            record.name = name
+            record.note = note
+            record.updated_at = _now()
+
+    def update_task_metadata(self, experiment_id, task_id, name, note):
+        from history.metadata import normalize_metadata
+        name, note = normalize_metadata(name, note)
+        with self._session() as db:
+            record = db.get(Task, task_id)
+            if record is None or record.experiment_id != experiment_id:
+                raise KeyError(f'Задача {task_id} не найдена в исследовании')
+            record.name = name
+            record.note = note
+            record.updated_at = _now()
 
     def update_note(self, run_id, note):
-        with self._connect() as db:
-            cursor = db.execute('UPDATE runs SET researcher_note=? WHERE id=?', (str(note).strip(), int(run_id)))
-        if not cursor.rowcount:
-            raise KeyError(f'Запуск {run_id} не найден')
+        with self._session() as db:
+            row = db.get(Run, int(run_id))
+            if row is None:
+                raise KeyError(f'Запуск {run_id} не найден')
+            row.researcher_note = str(note).strip()
 
     def delete_run(self, run_id):
-        with self._connect() as db:
-            cursor = db.execute('DELETE FROM runs WHERE id=?', (int(run_id),))
-        return cursor.rowcount > 0
+        with self._session() as db:
+            row = db.get(Run, int(run_id))
+            if row is None:
+                return False
+            db.delete(row)
+            return True
+
+    def close(self):
+        self.engine.dispose()

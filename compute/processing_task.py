@@ -132,6 +132,7 @@ class ProcessingTask:
     def __init__(self):
         self.task_id = 0
         self.task_name = ""
+        self.note = ""  # User annotation, not a reproducible compute parameter.
         # Режим является частью задачи, а не глобальной настройкой интерфейса.
         # Для 1D доступен управляемый конвейер последующих этапов; 2D пока
         # выполняет отдельный базовый Morlet без 1D-зависимостей.
@@ -247,6 +248,8 @@ class ProcessingTask:
         """Detach derived data and old output paths after replacing the source."""
         self._input_snapshot_path = None
         self._input_snapshot_sha256 = None
+        self._cwt_source_sha256 = None
+        self._cwt_source_shape = None
         self._restore_cwt_signature = False
         self.result = {}
         self.knn_results = {}
@@ -501,6 +504,8 @@ class ProcessingTask:
         snapshot["color2"] = None if self.color2 is None else np.asarray(self.color2).tolist()
         # The staged source checksum is durable across a workspace restart.
         snapshot["input_snapshot_sha256"] = getattr(self, '_input_snapshot_sha256', None)
+        snapshot["cwt_source_sha256"] = getattr(self, '_cwt_source_sha256', None)
+        snapshot["cwt_source_shape"] = getattr(self, '_cwt_source_shape', None)
         return snapshot
 
     def execution_stage_names(self):
@@ -608,6 +613,8 @@ class ProcessingTask:
         # Source is restored by the application only if the file is still readable.
         self._input_snapshot_path = None
         self._input_snapshot_sha256 = snapshot.get("input_snapshot_sha256")
+        self._cwt_source_sha256 = snapshot.get("cwt_source_sha256")
+        self._cwt_source_shape = snapshot.get("cwt_source_shape")
         self._restore_cwt_signature = False
         self.image_path = snapshot.get("image_path", "")
         self.task_folder_path = ""
