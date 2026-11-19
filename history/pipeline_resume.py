@@ -48,7 +48,7 @@ def cwt_signature_payload(task) -> dict:
         source_digest = getattr(task, '_cwt_source_sha256', None)
         source_shape = getattr(task, '_cwt_source_shape', None)
 
-    return {
+    payload = {
         "analysis_mode": str(getattr(task, "analysis_mode", "1d")),
         "source_sha256": source_digest,
         "source_shape": source_shape,
@@ -60,10 +60,22 @@ def cwt_signature_payload(task) -> dict:
         "color2": None if getattr(task, "color2", None) is None else _normalise(np.asarray(task.color2)),
         "process_rows": bool(getattr(task, "process_rows", True)),
         "process_columns": bool(getattr(task, "process_columns", True)),
-        "orientations": [float(x) for x in getattr(task, "orientations", [])],
-        "morlet_omega0": float(getattr(task, "morlet_omega0", 6.0)),
-        "morlet_anisotropy": float(getattr(task, "morlet_anisotropy", 1.0)),
     }
+    if payload["analysis_mode"] == "2d":
+        # New version marker prevents reuse of old orientation-specific CWT.
+        payload.update(
+            morlet_variant="isotropic_j0_angular_mean_v1",
+            morlet_input_amplitude="source_channel/255",
+            morlet_omega0=float(getattr(task, "morlet_omega0", 6.0)),
+        )
+    else:
+        # Preserve the existing 1D signature for historical incremental caches.
+        payload.update(
+            orientations=[float(x) for x in getattr(task, "orientations", [])],
+            morlet_omega0=float(getattr(task, "morlet_omega0", 6.0)),
+            morlet_anisotropy=float(getattr(task, "morlet_anisotropy", 1.0)),
+        )
+    return payload
 
 
 def cwt_signature(task) -> str:

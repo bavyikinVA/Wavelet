@@ -34,9 +34,9 @@ def _task_working_bytes(task, h, w):
     scales = len(task.scales)
     channels = max(1, len(task.analysis_channel_codes_for_settings()))
     if task.analysis_mode == '2d':
-        radius = max(2, math.ceil(4 * max(task.scales) * max(1., task.morlet_anisotropy)))
+        radius = math.ceil(4 * max(task.scales))
         fft_pixels = (h + 2 * radius) * (w + 2 * radius)
-        # One scale/orientation/channel at a time; do not multiply by angles.
+        # One isotropic scale/channel at a time; no angle dimension.
         work = n * 32 + fft_pixels * 128 + (2 * radius + 1) ** 2 * 96
         return int(work), int(work)
 

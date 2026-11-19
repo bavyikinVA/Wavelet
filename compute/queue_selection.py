@@ -104,10 +104,10 @@ def _ml_outputs_complete(task, previous, control):
 
 
 def _complete_2d_coefficients(task, control):
-    """Validate every complex Morlet output for a previously completed 2D task.
+    """Only complete *isotropic float32* 2D results can be reused.
 
-    2D is not yet part of the 1D stage-state DAG; do not rely on it for reuse.
-    Verify exactly the expected channel/scale/orientation files instead.
+    Angle-specific complex files from old experiments remain viewer-readable,
+    but they do not satisfy this contract and must be recomputed.
     """
     import numpy as np
     from result_naming import cwt2d_stem, scale_folder_name
@@ -117,32 +117,30 @@ def _complete_2d_coefficients(task, control):
     expected_shape = tuple(image.shape[:2])
     channels = task.analysis_channel_codes_for_settings()
     scales = getattr(task, 'scales', [])
-    angles = getattr(task, 'orientations', [])
-    if not channels or not len(scales) or not angles:
+    if not channels or not len(scales):
         return False
     folder = Path(task.task_folder_path) / 'scales'
     for channel in channels:
         for scale in scales:
-            for angle in angles:
-                if control is not None:
-                    control.check()
-                path = (folder / scale_folder_name(scale) / 'wavelets'
-                        / (cwt2d_stem(channel, scale, angle) + '.npy'))
-                try:
-                    values = np.load(path, mmap_mode='r', allow_pickle=False)
-                    if values.shape != expected_shape or values.dtype.kind != 'c':
-                        return False
-                    for start in range(0, len(values), 256):
-                        if control is not None:
-                            control.check()
-                        if not np.isfinite(values[start:start + 256]).all():
-                            return False
-                except (OSError, ValueError, EOFError):
+            if control is not None:
+                control.check()
+            path = (folder / scale_folder_name(scale) / 'wavelets'
+                    / (cwt2d_stem(channel, scale) + '.npy'))
+            values = None
+            try:
+                values = np.load(path, mmap_mode='r', allow_pickle=False)
+                if values.shape != expected_shape or values.dtype != np.float32:
                     return False
-                finally:
-                    if 'values' in locals() and isinstance(values, np.memmap):
-                        values._mmap.close()
-                    values = None
+                for start in range(0, len(values), 256):
+                    if control is not None:
+                        control.check()
+                    if not np.isfinite(values[start:start + 256]).all():
+                        return False
+            except (OSError, ValueError, EOFError):
+                return False
+            finally:
+                if isinstance(values, np.memmap):
+                    values._mmap.close()
     return True
 
 

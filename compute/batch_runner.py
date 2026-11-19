@@ -4,6 +4,7 @@ One writer owns a batch. GPU selection/fallback belongs to ComputeBackend.
 History is a secondary index: its failure must not replace a scientific error.
 """
 import errno
+import numpy as np
 import json
 import os
 import time
@@ -241,20 +242,48 @@ def run_batch(journal, tasks, execute, record_history, control, log, *, lazy_inp
     return result
 
 
-def validate_task(task):
+def validate_task_configuration(task):
+    """Fast queue preflight: settings only, no PNG hydration or disk I/O.
+
+    Restored tasks may intentionally have ``original_image is None`` until
+    the worker hydrates their durable input snapshot. That is not a missing
+    configuration and must not prevent starting a research-wide queue.
+    """
     from compute.validation import validate_scales
     from compute.extremes.detection import normalize_peak_parameters
     validate_scales(task.scales)
-    if not task.image_path or task.original_image is None:
+    if not task.image_path:
         raise ValueError('Не загружено изображение')
     if task.channel_representation == 'gram_schmidt' and not task.has_colors_selected():
         raise ValueError('Не задан цветовой базис Gram–Schmidt')
     if task.analysis_mode == '1d':
         if not (task.process_rows or task.process_columns):
             raise ValueError('Не выбран источник 1D CWT')
-        normalize_peak_parameters(task.extrema_distance,task.extrema_prominence)
-    elif not task.orientations:
-        raise ValueError('Не заданы ориентации 2D Morlet')
+        normalize_peak_parameters(task.extrema_distance, task.extrema_prominence)
+    elif task.analysis_mode == '2d':
+        if not np.isfinite(task.morlet_omega0) or task.morlet_omega0 <= 0:
+            raise ValueError('Центральная частота ω₀ для 2D Morlet должна быть положительной')
+    else:
+        raise ValueError(f'Неизвестный режим анализа: {task.analysis_mode}')
+
+
+def queue_configuration_errors(tasks):
+    """Return (task name, reason) pairs so no draft silently fails mid-queue."""
+    errors = []
+    for task in tasks:
+        try:
+            validate_task_configuration(task)
+        except (ValueError, TypeError, OverflowError) as error:
+            errors.append((task.task_name or f'Задача {task.task_id}', str(error)))
+    return tuple(errors)
+
+
+def validate_task(task):
+    validate_task_configuration(task)
+    # Only the execution/snapshot stages require decoded pixels. The GUI
+    # preflight deliberately does not, to support lazily restored experiments.
+    if task.original_image is None:
+        raise ValueError('Не загружено изображение')
 
 
 def snapshot_inputs(journal, tasks, control, *, release_memory=False):

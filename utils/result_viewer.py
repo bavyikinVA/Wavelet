@@ -154,7 +154,8 @@ class ArtifactPane(ctk.CTkFrame):
             menu.configure(state='disabled')
             menu.grid(row=8, column=column, sticky='ew', padx=(0, 3) if column == 0 else (3, 0), pady=(0, 6))
             self.parameters[key] = menu
-        # Retain the orientation filter for 2D results, below the compact pair.
+        # Orientation remains available only to inspect older oriented 2D files;
+        # current isotropic runs have no angle and keep this filter disabled.
         self.parameter_labels['orientation'] = ctk.CTkLabel(
             selection, text='Ориентация, °', anchor='w', height=20)
         self.parameter_labels['orientation'].grid(row=9, column=0, columnspan=2, sticky='w')

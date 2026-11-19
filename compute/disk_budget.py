@@ -73,8 +73,7 @@ def forecast_task_bytes(task, row=None):
     channel_codes = task.analysis_channel_codes_for_settings()
     channels = max(1, len(channel_codes))
     if getattr(task, 'analysis_mode', '1d') == '2d':
-        angles = max(1, len(getattr(task, 'orientations', ())))
-        cwt = pixels * scales * channels * angles * 8  # complex64
+        cwt = pixels * scales * channels * 4  # isotropic float32, one map per scale
         requested_points = False
         requested_knn = False
     else:
@@ -118,7 +117,7 @@ def forecast_task_bytes(task, row=None):
     # atomic_* writers temporarily require one extra artifact on the same
     # filesystem.  The true largest NPZ/PNG is data-dependent.  Model it as
     # a fraction of sparse scientific output, or one float32 CWT file.
-    single_coefficient = pixels * (8 if getattr(task, 'analysis_mode', '1d') == '2d' else 4)
+    single_coefficient = pixels * 4  # both 1D and isotropic 2D use float32
     temporary = max(single_coefficient, int(0.06 * (point_bytes + knn_bytes)))
     return dict(
         image_shape=(height, width),

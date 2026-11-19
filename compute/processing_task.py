@@ -182,9 +182,11 @@ class ProcessingTask:
         self.extrema_distance = 1
         self.extrema_prominence = 0.0
 
-        # Параметры 2D Morlet
-        self.orientations = [0.0, 45.0, 90.0, 135.0]
+        # Новый 2D Morlet изотропный (J0), параметр только omega0.
         self.morlet_omega0 = 6.0
+        # Не участвуют в новых вычислениях; нужны для чтения старых
+        # settings_snapshot и совместимости старых 1D CWT-сигнатур.
+        self.orientations = [0.0, 45.0, 90.0, 135.0]
         self.morlet_anisotropy = 1.0
 
         # Форматы результатов
@@ -371,7 +373,7 @@ class ProcessingTask:
             'k_neighbors': self.k_neighbors,
             'process_rows': self.process_rows,
             'process_columns': self.process_columns,
-            'orientations': self.orientations.copy(),
+            'morlet_variant': 'isotropic_j0_angular_mean_v1' if self.analysis_mode == '2d' else None,
             'calculate_statistics': self.calculate_statistics,
             'calculate_synchronization': self.calculate_synchronization,
             'calculate_extrema': self.calculate_extrema,
@@ -482,8 +484,7 @@ class ProcessingTask:
             "detected_color_type", "grayscale_similarity",
             "channel_representation", "rgb_channel_mode",
             "rgb_single_channel", "grayscale_method",
-            "orientations", "morlet_omega0",
-            "morlet_anisotropy", "pipeline_preset", "calculate_extrema",
+            "morlet_omega0", "pipeline_preset", "calculate_extrema",
             "calculate_envelopes", "calculate_knn", "calculate_statistics",
             "calculate_synchronization", "output_wavelet_image",
             "output_wavelet_text", "output_wavelet_numpy", "output_extremes_text",
@@ -499,6 +500,13 @@ class ProcessingTask:
             "ml_min_samples", "ml_dataset_key", "ml_plan", "ml_dbscan_batch_size", "save_source_channels", "save_centering_means",
         )
         snapshot = {name: getattr(self, name) for name in fields}
+        if self.analysis_mode == "2d":
+            # Old angle-based snapshots never count as a completed isotropic run.
+            snapshot["morlet_variant"] = "isotropic_j0_angular_mean_v1"
+        else:
+            # Keep the exact existing 1D settings contract for queued tasks.
+            snapshot["orientations"] = self.orientations
+            snapshot["morlet_anisotropy"] = self.morlet_anisotropy
         snapshot["scales"] = np.asarray(self.scales).tolist()
         snapshot["color1"] = None if self.color1 is None else np.asarray(self.color1).tolist()
         snapshot["color2"] = None if self.color2 is None else np.asarray(self.color2).tolist()
@@ -564,7 +572,7 @@ class ProcessingTask:
                 directions.append("столбцы")
             details.append(" + ".join(directions) if directions else "направление не выбрано")
         else:
-            details.append(f"ориентации: {', '.join(f'{value:g}°' for value in self.orientations)}")
+            details.append("изотропное 2D CWT · усреднение по всем направлениям")
         point_types = []
         if self.find_maxima:
             point_types.append("максимумы")

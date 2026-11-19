@@ -269,10 +269,12 @@ def _scientific_parameters_manifest(task) -> dict:
         })
     else:
         wavelet.update({
+            "variant": "isotropic_j0_angular_mean_v1",
             "omega0": float(getattr(task, "morlet_omega0", 6.0)),
-            "anisotropy": float(getattr(task, "morlet_anisotropy", 1.0)),
-            "orientations_deg": [float(x) for x in getattr(task, "orientations", [])],
-            "output_dtype": "complex64",
+            "boundary": "zero_padding_same",
+            "normalization": "1/scale; discrete_zero_mean",
+            "input_amplitude": "source_channel/255",
+            "output_dtype": "float32",
         })
 
     return {

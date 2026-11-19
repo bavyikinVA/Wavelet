@@ -311,6 +311,7 @@ def result_parameters(path):
     return dict(
         scale=current_scale or numeric(r'(?:масштаб|scale)[_ ]*'),
         orientation=current_angle or numeric(r'(?:angle|угол)[_ ]*'),
+        wavelet_variant=('isotropic' if artifact == 'cwt2d' and '_iso' in basename else None),
         channel=channel,
         family=family,
         algorithm=algorithm,
@@ -370,6 +371,8 @@ def result_display_label(path, parameters=None):
         parts.append(parameters['channel'])
     if parameters.get('scale') is not None:
         parts.append(f"масштаб {parameters['scale']}")
+    if parameters.get('wavelet_variant') == 'isotropic':
+        parts.append('изотропное · все направления')
     if parameters.get('orientation') is not None:
         parts.append(f"ориентация {parameters['orientation']}°")
     kind_labels = {

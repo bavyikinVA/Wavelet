@@ -115,11 +115,14 @@ def cwt1d_stem(cwt_axis, channel, scale) -> str:
     return f"cwt1d_{_axis(cwt_axis)}_{_channel(channel)}_s{number_token(scale)}"
 
 
-def cwt2d_stem(channel, scale, angle) -> str:
-    return (
-        f"cwt2d_xy_{_channel(channel)}_s{number_token(scale)}_"
-        f"a{number_token(angle)}"
-    )
+def cwt2d_stem(channel, scale, angle=None) -> str:
+    """Isotropic results use _iso; explicit angle reads legacy oriented results.
+
+    The optional angle exists *only* for discovering earlier experiments; the
+    new 2D engine never generates an angle-specific result.
+    """
+    prefix = f"cwt2d_xy_{_channel(channel)}_s{number_token(scale)}"
+    return f"{prefix}_iso" if angle is None else f"{prefix}_a{number_token(angle)}"
 
 
 def point_stem(artifact, cwt_axis, feature_axis, channel, scale, point_kind) -> str:

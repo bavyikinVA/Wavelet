@@ -645,7 +645,7 @@ class ImageProcessor:
         self.progress.update_progress(1.0, "Вейвлет-преобразование завершено")
 
     def compute_wavelets_2d(self, task):
-        """Выполнить отдельное ориентационное 2D-преобразование Морле."""
+        """Изотропное 2D Morlet CWT, усреднённое по всем направлениям."""
         import matplotlib.pyplot as plt
         from compute.wavelets.morlet_2d import (
             cwt2d_morlet_cpu,
@@ -656,115 +656,101 @@ class ImageProcessor:
         if not task.analysis_data:
             prepare_task_channels(task)
         channel_meta = prepared_channel_meta(task)
-        total = len(channel_meta) * len(task.scales) * len(task.orientations)
+        total = len(channel_meta) * len(task.scales)
         completed = 0
         use_gpu = self.backend.use_gpu and self.backend.is_gpu_available()
 
         for channel_index, (_channel_key, channel_code, channel_name) in enumerate(channel_meta):
-            channel = task.analysis_data[channel_index].astype(np.float32)
+            # morlet2d_short.load_image_grayscale scales 8-bit pixels to [0, 1].
+            # Apply the same amplitude convention to RGB/Gray/GS channels;
+            # GS projections may legitimately contain negative values.
+            channel = np.asarray(task.analysis_data[channel_index], dtype=np.float32) / 255.0
             for scale in task.scales:
+                completed += 1
+                self.progress.update_progress(
+                    completed / max(total, 1),
+                    f"2D Morlet (изотропный): {channel_name}, масштаб {scale:g}"
+                )
                 scale_folder = self.create_scale_folder(scale, task_folder)
                 output_folder = os.path.join(scale_folder, "wavelets")
                 os.makedirs(output_folder, exist_ok=True)
+                stage_name = f"wavelet_2d_isotropic:{channel_code}:{float(scale):g}"
+                details = {"wavelet_variant": "isotropic_j0", "omega0": float(task.morlet_omega0)}
 
-                for angle in task.orientations:
-                    completed += 1
-                    self.progress.update_progress(
-                        completed / max(total, 1),
-                        (f"2D Morlet: {channel_name}, масштаб {scale}, "
-                         f"ориентация {angle:g}°")
-                    )
-
-                    stage_name = (
-                        f"wavelet_2d:{channel_code}:{float(scale):g}:{float(angle):g}"
-                    )
-                    if use_gpu:
-                        try:
-                            coefficients = cwt2d_morlet_gpu(
-                                channel, [scale], [angle],
-                                task.morlet_omega0,
-                                task.morlet_anisotropy
-                            )[0, 0]
-                            task.execution_protocol.record_stage(
-                                stage_name, actual_backend="gpu", dtype="complex64"
-                            )
-                        except Exception as error:
-                            mapped = classify_gpu_exception(error)
-                            if mapped is None:
-                                raise
-                            self.progress.log_error(
-                                f"Ошибка 2D Morlet на GPU ({mapped.__class__.__name__}): "
-                                f"{mapped}. Переход на CPU."
-                            )
-                            task.execution_protocol.record_fallback(
-                                stage_name, reason=mapped.__class__.__name__,
-                                message=str(mapped),
-                            )
-                            use_gpu = False
-                            coefficients = cwt2d_morlet_cpu(
-                                channel, [scale], [angle],
-                                task.morlet_omega0,
-                                task.morlet_anisotropy
-                            )[0, 0]
-                            task.execution_protocol.record_stage(
-                                stage_name, actual_backend="cpu", dtype="complex64",
-                                fallback=True,
-                                details={"fallback_reason": mapped.__class__.__name__},
-                            )
-                    else:
-                        coefficients = cwt2d_morlet_cpu(
-                            channel, [scale], [angle],
-                            task.morlet_omega0,
-                            task.morlet_anisotropy
-                        )[0, 0]
+                if use_gpu:
+                    try:
+                        coefficients = cwt2d_morlet_gpu(
+                            channel, [scale], task.morlet_omega0
+                        )[0]
                         task.execution_protocol.record_stage(
-                            stage_name, actual_backend="cpu", dtype="complex64"
+                            stage_name, actual_backend="gpu", dtype="float32",
+                            details=details,
                         )
+                    except Exception as error:
+                        mapped = classify_gpu_exception(error)
+                        if mapped is None:
+                            raise
+                        self.progress.log_error(
+                            f"Ошибка 2D Morlet на GPU ({mapped.__class__.__name__}): "
+                            f"{mapped}. Переход на CPU."
+                        )
+                        task.execution_protocol.record_fallback(
+                            stage_name, reason=mapped.__class__.__name__,
+                            message=str(mapped),
+                        )
+                        use_gpu = False
+                        coefficients = cwt2d_morlet_cpu(
+                            channel, [scale], task.morlet_omega0
+                        )[0]
+                        task.execution_protocol.record_stage(
+                            stage_name, actual_backend="cpu", dtype="float32",
+                            fallback=True,
+                            details={**details, "fallback_reason": mapped.__class__.__name__},
+                        )
+                else:
+                    coefficients = cwt2d_morlet_cpu(
+                        channel, [scale], task.morlet_omega0
+                    )[0]
+                    task.execution_protocol.record_stage(
+                        stage_name, actual_backend="cpu", dtype="float32",
+                        details=details,
+                    )
 
-                    file_stem = cwt2d_stem(channel_code, scale, angle)
-                    magnitude = np.abs(coefficients)
-                    save_coefficient_preview(output_folder, file_stem, coefficients)
-                    phase = np.angle(coefficients)
+                # Одна вещественная карта на канал/масштаб, без угла и фазы.
+                file_stem = cwt2d_stem(channel_code, scale)
+                save_coefficient_preview(output_folder, file_stem, coefficients)
 
-                    if task.output_wavelet_text:
-                        from history.atomic_io import atomic_savetxt
-                        atomic_savetxt(
-                            os.path.join(output_folder, file_stem + "_magnitude.csv"),
-                            magnitude, fmt="%.6g", delimiter=","
-                        )
-                        from history.atomic_io import atomic_savetxt
-                        atomic_savetxt(
-                            os.path.join(output_folder, file_stem + "_phase.csv"),
-                            phase, fmt="%.6g", delimiter=","
-                        )
+                if task.output_wavelet_text:
+                    from history.atomic_io import atomic_savetxt
+                    atomic_savetxt(
+                        os.path.join(output_folder, file_stem + ".csv"),
+                        coefficients, fmt="%.6g", delimiter=","
+                    )
 
-                    if task.output_wavelet_image:
-                        fig, axes = plt.subplots(1, 2, figsize=(11, 5))
-                        magnitude_plot = axes[0].imshow(magnitude, cmap="viridis")
-                        axes[0].set_title("Модуль коэффициентов")
-                        axes[0].axis("off")
-                        fig.colorbar(magnitude_plot, ax=axes[0], fraction=0.046)
+                if task.output_wavelet_image:
+                    maximum = max(float(np.max(np.abs(coefficients))), 1e-12)
+                    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+                    axes[0].imshow(channel, cmap="gray")
+                    axes[0].set_title("Исходный канал")
+                    axes[0].axis("off")
+                    plot = axes[1].imshow(
+                        coefficients, cmap="RdBu_r", vmin=-maximum, vmax=maximum
+                    )
+                    axes[1].set_title("Изотропное 2D CWT")
+                    axes[1].axis("off")
+                    fig.colorbar(plot, ax=axes[1], fraction=0.046)
+                    fig.suptitle(
+                        f"{channel_name}: масштаб {scale:g}, ω₀={task.morlet_omega0:g}"
+                    )
+                    fig.tight_layout()
+                    from history.atomic_io import atomic_savefig
+                    atomic_savefig(
+                        os.path.join(output_folder, file_stem + ".png"),
+                        figure=fig, dpi=220, bbox_inches="tight"
+                    )
+                    plt.close(fig)
 
-                        phase_plot = axes[1].imshow(
-                            phase, cmap="twilight", vmin=-np.pi, vmax=np.pi
-                        )
-                        axes[1].set_title("Фаза")
-                        axes[1].axis("off")
-                        fig.colorbar(phase_plot, ax=axes[1], fraction=0.046)
-                        fig.suptitle(
-                            f"{channel_name}: масштаб {scale}, ориентация {angle:g}°"
-                        )
-                        fig.tight_layout()
-                        from history.atomic_io import atomic_savefig
-                        atomic_savefig(
-                            os.path.join(output_folder, file_stem + ".png"),
-                            figure=fig,
-                            dpi=220,
-                            bbox_inches="tight"
-                        )
-                        plt.close(fig)
-
-        self.progress.update_progress(1.0, "2D-преобразование Морле завершено")
+        self.progress.update_progress(1.0, "Изотропное 2D-преобразование Морле завершено")
 
     def save_print_wavelets(self, task, type_data, info_out):
         import matplotlib.pyplot as plt
@@ -3359,8 +3345,7 @@ class App(TkinterApp):
                 self.calculate_extrema_var, self.calculate_envelopes_var,
                 self.calculate_knn_var,
                 self.print_channels_txt_var, self.centering_means_var,
-                self.orientations_var,
-                self.morlet_omega0_var, self.morlet_anisotropy_var,
+                self.morlet_omega0_var,
                 self.calculate_statistics_var, self.statistics_image_var,
                 self.statistics_csv_var, self.calculate_sync_var,
                 self.sync_heatmap_var, self.sync_matrix_csv_var,
@@ -4144,9 +4129,7 @@ class App(TkinterApp):
 
         self.data = tk.StringVar()
         self.knn_text_var = tk.StringVar(value="0")
-        self.orientations_var = tk.StringVar(value="0, 45, 90, 135")
         self.morlet_omega0_var = tk.StringVar(value="6.0")
-        self.morlet_anisotropy_var = tk.StringVar(value="1.0")
 
         # ML-настройки. Набор полей алгоритма перестраивается динамически.
         self.ml_algorithm_var = tk.StringVar(value="K-means")
@@ -5218,7 +5201,7 @@ class App(TkinterApp):
         mode = "1D" if task.analysis_mode == "1d" else "2D"
         wavelet = f"Morlet · {mode}"
         if task.analysis_mode == "2d":
-            wavelet += f" · ω₀={task.morlet_omega0:g} · γ={task.morlet_anisotropy:g}"
+            wavelet += f" · изотропный · ω₀={task.morlet_omega0:g}"
         return {
             "wavelet": wavelet,
             "scales": task.scales_summary(),
@@ -5957,7 +5940,7 @@ class App(TkinterApp):
                     (task.analysis_mode == "1d" and (
                             task.process_rows or task.process_columns
                     ))
-                    or (task.analysis_mode == "2d" and task.orientations)
+                    or task.analysis_mode == "2d"
             )
         )
         if getattr(self, "data_next_button", None) is not None:
@@ -6005,77 +5988,29 @@ class App(TkinterApp):
         section._header_help_attached = True
 
     def _setup_2d_section(self):
-        """Настройки ориентационного двумерного вейвлета Морле."""
-
-        # Ориентации — поле на всю ширину карточки.
-        self._help_label(self.two_d_section.content,
-                         "Ориентации, градусы (через запятую)",
-                         "morlet.orientations", padx=(5, 5), pady=(0, 4))
-
-        ctk.CTkEntry(
-            self.two_d_section.content,
-            textvariable=self.orientations_var,
-            placeholder_text="0, 45, 90, 135"
-        ).pack(fill="x", pady=(0, 8), padx=(5, 10))
-
-        # Центральная частота ω₀ — подпись и поле в одной строке.
-        omega_row = ctk.CTkFrame(
-            self.two_d_section.content,
-            fg_color="transparent"
-        )
-        omega_row.pack(fill="x", pady=(0, 8))
-
-        ctk.CTkLabel(
-            omega_row,
-            text="Центральная частота ω₀",
-            font=AppTheme.body_font(),
-            anchor="w"
-        ).pack(side="left", padx=(5, 0))
-        HelpIcon(omega_row, "morlet.omega0").pack(side="left", padx=(5, 0))
-
-        ctk.CTkEntry(
-            omega_row,
-            textvariable=self.morlet_omega0_var,
-            placeholder_text="6.0",
-            width=110
-        ).pack(side="right", padx=(0, 10))
-
-        # Анизотропность — подпись и поле в одной строке.
-        anisotropy_row = ctk.CTkFrame(
-            self.two_d_section.content,
-            fg_color="transparent"
-        )
-        anisotropy_row.pack(fill="x", pady=(0, 8))
-
-        ctk.CTkLabel(
-            anisotropy_row,
-            text="Анизотропность",
-            font=AppTheme.body_font(),
-            anchor="w"
-        ).pack(side="left", padx=(5, 0))
-        HelpIcon(anisotropy_row, "morlet.anisotropy").pack(side="left", padx=(5, 0))
-
-        ctk.CTkEntry(
-            anisotropy_row,
-            textvariable=self.morlet_anisotropy_var,
-            placeholder_text="1.0",
-            width=110
-        ).pack(side="right", padx=(0, 10))
-
-        # # Пояснение параметров.
-        # ctk.CTkLabel(
+        # """Настройки изотропного двумерного вейвлета Морле (угловое среднее)."""
+        # info = ctk.CTkLabel(
         #     self.two_d_section.content,
-        #     text=(
-        #         "Ориентация задаёт направление чувствительности фильтра; "
-        #         "ω₀ управляет частотой несущей, а анизотропность — "
-        #         "вытянутостью вейвлета."
-        #     ),
+        #     text=("Изотропное 2D CWT: непрерывное усреднение по всем "
+        #           "направлениям (ядро J₀). Для каждого масштаба "
+        #           "формируется одна карта вещественных коэффициентов."),
         #     font=AppTheme.caption_font(),
         #     text_color=AppTheme.TEXT_SECONDARY,
-        #     anchor="w",
-        #     justify="left",
-        #     wraplength=420
-        # ).pack(fill="x", pady=(8, 0), padx=(5, 0))
+        #     anchor="w", justify="left", wraplength=420,
+        # )
+        # info.pack(fill="x", padx=(5, 10), pady=(0, 12))
+
+        omega_row = ctk.CTkFrame(self.two_d_section.content, fg_color="transparent")
+        omega_row.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(
+            omega_row, text="Центральная частота ω₀",
+            font=AppTheme.body_font(), anchor="w"
+        ).pack(side="left", padx=(5, 0))
+        HelpIcon(omega_row, "morlet.omega0").pack(side="left", padx=(5, 0))
+        ctk.CTkEntry(
+            omega_row, textvariable=self.morlet_omega0_var,
+            placeholder_text="6.0", width=110
+        ).pack(side="right", padx=(0, 10))
 
     def _setup_analysis_mode_section(self, parent, manage_geometry=True):
         """Создать отдельный блок выбора режима анализа."""
@@ -6197,8 +6132,7 @@ class App(TkinterApp):
                     section.pack(fill="x", padx=5, pady=4, before=self.intermediate_section)
         else:
             self.analysis_mode_description.configure(
-                text=("Двумерное комплексное преобразование Морле по масштабам "
-                      "и ориентациям. Результат содержит модуль и фазу."),
+                text=("Изотропное двумерное преобразование Морле."),
                 text_color=AppTheme.TEXT_SECONDARY
             )
             self.extremes_section.grid_remove()
@@ -6978,8 +6912,8 @@ class App(TkinterApp):
         values = None
         if task is not None:
             scales = np.asarray(task.scales, dtype=float).reshape(-1)
-            if not scales.size:
-                values = (1, 10, 1)
+            # Unapplied defaults must remain placeholders, not look like
+            # saved scales belonging to this task.
             if scales.size and np.all(np.isfinite(scales)) and np.allclose(
                 scales, np.round(scales), rtol=0, atol=1e-9,
             ):
@@ -7711,7 +7645,7 @@ class App(TkinterApp):
                 if plan.knn else "KNN: выключен"
             )
         else:
-            lines.append(f"{mode_name}. Ориентаций: {len(task.orientations)}")
+            lines.append(f"{mode_name}")
             lines.append("KNN: не используется в режиме 2D")
 
         if task.has_colors_selected():
@@ -7836,11 +7770,7 @@ class App(TkinterApp):
                 self.current_task.row_sync_metrics[0]
                 if self.current_task.row_sync_metrics else "jaccard"
             )
-            self.orientations_var.set(
-                ", ".join(f"{value:g}" for value in self.current_task.orientations)
-            )
             self.morlet_omega0_var.set(f"{self.current_task.morlet_omega0:g}")
-            self.morlet_anisotropy_var.set(f"{self.current_task.morlet_anisotropy:g}")
             self.channel_representation_var.set({
                                                     "rgb": "RGB",
                                                     "grayscale": "Grayscale",
@@ -8265,27 +8195,9 @@ class App(TkinterApp):
             task.row_sync_metrics = [self.sync_metric_var.get()]
 
         try:
-            orientations = [
-                float(value.strip())
-                for value in self.orientations_var.get().split(',')
-                if value.strip()
-            ]
-            if orientations:
-                task.orientations = orientations
-        except ValueError:
-            pass
-
-        try:
             omega0 = float(self.morlet_omega0_var.get())
             if omega0 > 0:
                 task.morlet_omega0 = omega0
-        except ValueError:
-            pass
-
-        try:
-            anisotropy = float(self.morlet_anisotropy_var.get())
-            if anisotropy > 0:
-                task.morlet_anisotropy = anisotropy
         except ValueError:
             pass
 
@@ -9493,6 +9405,27 @@ class App(TkinterApp):
             task.extrema_distance = distance
             task.extrema_prominence = prominence
         self._store_settings_for_current_task()
+        # The Start button reflects only the selected task. A research queue
+        # contains *all* tasks, including drafts with no applied scales. Check
+        # all configurations before creating a batch or locking the GUI.
+        from compute.batch_runner import queue_configuration_errors
+        configuration_errors = queue_configuration_errors(self.image_processor.tasks)
+        if configuration_errors:
+            shown = configuration_errors[:10]
+            details = "\n".join(
+                f"• {task_name}: {reason}" for task_name, reason in shown
+            )
+            extra = (f"\n…и ещё {len(configuration_errors) - len(shown)} задач."
+                     if len(configuration_errors) > len(shown) else "")
+            mb.showwarning(
+                'Очередь: незавершённые настройки',
+                f'Очередь не запущена: проверьте настройки {len(configuration_errors)} '
+                f'задач.\n\n{details}{extra}\n\n'
+                'Выберите указанные задачи, задайте параметры и нажмите '
+                '«Применить» для масштабов. После этого запустите очередь снова.',
+                parent=self,
+            )
+            return
         self._save_ml_queue_cards()  # Tk variables are read in the GUI thread, before worker starts.
         self._refresh_memory_estimate()
         self.progress_manager.run_control.reset()

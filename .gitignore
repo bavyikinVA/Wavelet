@@ -110,10 +110,11 @@ processed/
 processed_images/
 
 
-tests/
+# Tests, mathematics docs and source analyses belong in version control.
 benchmarks/
-cross_spectra/
+tests/
+actual*.zip
 docs/
-
+cross_spectra/
 test_images/
 create_test_images.py
