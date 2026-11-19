@@ -110,9 +110,10 @@ processed/
 processed_images/
 
 
+tests/
+benchmarks/
+cross_spectra/
+docs/
+
 test_images/
-gaussian_validation_inputs/
 create_test_images.py
-gaussian_cwt_validation.py
-patch_viewer.py
-Инструкция*.md

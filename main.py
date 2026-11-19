@@ -3450,36 +3450,16 @@ class App(TkinterApp):
             font=ctk.CTkFont(size=21, weight="bold"),
             anchor="w",
         ).pack(fill="x", padx=24, pady=(30, 8))
-        ctk.CTkLabel(
-            new_card,
-            text=(
-                "Создайте новую задачу, загрузите изображение и настройте "
-                "вейвлет-преобразование и этапы обработки."
-            ),
-            font=AppTheme.body_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            justify="left",
-            anchor="nw",
-            wraplength=300,
-        ).pack(fill="x", padx=24, pady=(0, 22))
+
         ctk.CTkButton(
             new_card,
-            text="+  Новое исследование",
+            text="+  Создать",
             command=self._start_new_research,
             height=48,
             font=ctk.CTkFont(size=15, weight="bold"),
             fg_color=AppTheme.PRIMARY,
             hover_color=AppTheme.PRIMARY_HOVER,
         ).pack(fill="x", padx=24, pady=(0, 12))
-        ctk.CTkLabel(
-            new_card,
-            text="Текущие задачи в этой сессии сохранятся в рабочей области.",
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.MUTED,
-            justify="left",
-            anchor="w",
-            wraplength=300,
-        ).pack(fill="x", padx=24, pady=(0, 24))
 
         recent_card = ctk.CTkFrame(
             outer, border_width=1, border_color=AppTheme.BORDER, corner_radius=10
@@ -4192,9 +4172,11 @@ class App(TkinterApp):
         self._history_open_researches = set()
         self._history_open_tasks = set()
         self._history_open_runs = set()
+        self._history_open_timings = set()
         self.history_page = 1
         self.history_total_pages = 1
         self._history_search_after_id = None
+        self._history_filters_visible = False
 
         # Widget references
         self.load_button = None
@@ -4218,8 +4200,8 @@ class App(TkinterApp):
         self.entry_end = None
         self.entry_step = None
         self.button_save_scales = None
-        self.label_custom_scale = None
         self.button_load_scales_file = None
+        self._scales_ui_mode = 'editing'  # editing / applied / error
         self.entry_near_point = None
         # Run control is owned by the permanent task sidebar.
         self.task_widgets = []
@@ -4317,7 +4299,10 @@ class App(TkinterApp):
             font=AppTheme.panel_title_font(), fg_color=AppTheme.PRIMARY,
             hover_color=AppTheme.PRIMARY_HOVER,
         )
-        self.app_start_button.pack(fill="x", padx=(10, 50), pady=(7, 7))
+        self.launch_help_icon = HelpIcon(launch_footer, "queue.resume")
+        self.launch_help_icon.pack(side="right", padx=(0, 16), pady=(7, 7))
+        self.app_start_button.pack(side="left", fill="x", expand=True,
+                                   padx=(10, 10), pady=(7, 7))
         return panel
 
     def _create_workspace_tabs(self):
@@ -4391,39 +4376,69 @@ class App(TkinterApp):
         ctk.CTkLabel(
             header, text="История исследований",
             font=AppTheme.panel_title_font(), anchor="w"
-        ).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(
-            header, text="Обновить", width=90,
-            height=AppTheme.SMALL_BUTTON_HEIGHT,
-            command=lambda: self._refresh_history_tab(force=True)
-        ).pack(side="right")
-        ctk.CTkButton(
-            header, text="Подключить БД", width=125,
-            height=AppTheme.SMALL_BUTTON_HEIGHT,
+        ).pack(side="left")
+        HelpIcon(header, "history.overview").pack(side="left", padx=(9, 0))
+        # Одна кнопка синхронизации вместо «Подключить БД» и «Обновить».
+        # Рисуем две круговые стрелки средствами Pillow: знак не зависит от
+        # наличия шрифтов Segoe Fluent Icons на конкретном компьютере.
+        sync_bitmap = Image.new('RGBA', (96, 96), (0, 0, 0, 0))
+        sync_draw = ImageDraw.Draw(sync_bitmap)
+        sync_color = '#c4cbd2'
+        sync_draw.arc((17, 17, 79, 79), start=200, end=335,
+                      fill=sync_color, width=8)
+        sync_draw.polygon([(77, 34), (72, 18), (63, 34)], fill=sync_color)
+        sync_draw.arc((17, 17, 79, 79), start=20, end=155,
+                      fill=sync_color, width=8)
+        sync_draw.polygon([(19, 62), (24, 78), (33, 62)], fill=sync_color)
+        self._history_sync_icon = ctk.CTkImage(
+            light_image=sync_bitmap, dark_image=sync_bitmap, size=(20, 20),
+        )
+        self.history_sync_button = ctk.CTkButton(
+            header, text='', image=self._history_sync_icon,
+            width=38, height=AppTheme.SMALL_BUTTON_HEIGHT,
+            corner_radius=7, border_width=1,
+            fg_color='transparent', border_color=AppTheme.BORDER,
+            hover_color=AppTheme.NAV_HOVER,
             command=self._reconnect_research_history,
-        ).pack(side='right', padx=(0, 8))
+        )
+        # Packing from the right is reversed on screen.  Pack the text
+        # button first, then the sync icon, then the search icon so the
+        # final left-to-right order is: search, sync, open folder.
         ctk.CTkButton(
             header, text="Открыть из папки", width=140,
             height=AppTheme.SMALL_BUTTON_HEIGHT,
             command=self._open_research_from_folder,
-        ).pack(side='right', padx=(0, 8))
+        ).pack(side='right')
+        self.history_sync_button.pack(side='right', padx=(0, 8))
+
+        # A vector magnifier is more stable on Windows than an emoji glyph.
+        icon_bitmap = Image.new('RGBA', (48, 48), (0, 0, 0, 0))
+        icon_draw = ImageDraw.Draw(icon_bitmap)
+        icon_draw.ellipse((9, 8, 31, 30), outline='#c4cbd2', width=4)
+        icon_draw.line((29, 28, 40, 39), fill='#c4cbd2', width=5)
+        self._history_search_icon = ctk.CTkImage(
+            light_image=icon_bitmap, dark_image=icon_bitmap, size=(19, 19),
+        )
+        self.history_search_toggle_button = ctk.CTkButton(
+            header, text='', image=self._history_search_icon,
+            width=38, height=AppTheme.SMALL_BUTTON_HEIGHT,
+            corner_radius=7, border_width=1,
+            fg_color='transparent', border_color=AppTheme.BORDER,
+            hover_color=AppTheme.NAV_HOVER,
+            command=self._toggle_history_filters,
+        )
+        self.history_search_toggle_button._read_only_during_compute = True
+        self.history_search_toggle_button.pack(side='right', padx=(0, 8))
+
+        # Hidden in the healthy state; keep only actionable DB warnings.
         self.history_connect_status = ctk.CTkLabel(
             panel, text='', font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY, anchor='w'
+            text_color=AppTheme.TEXT_SECONDARY, anchor='w',
         )
-        self.history_connect_status.pack(fill='x', padx=16)
 
-        ctk.CTkLabel(
-            panel,
-            text=("Здесь сохраняются настройки и результаты исследований. "
-                  "Любой запуск можно повторить как новую задачу."),
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.TEXT_SECONDARY,
-            anchor="w", justify="left"
-        ).pack(fill="x", padx=12, pady=(0, 8))
-
+        # The magnifier expands/collapses search, filters and pagination.
         filters = ctk.CTkFrame(panel, fg_color="transparent")
-        filters.pack(fill="x", padx=12, pady=(0, 8))
+        self.history_filters_frame = filters
 
         self.history_search_entry = ctk.CTkEntry(
             filters,
@@ -4499,7 +4514,7 @@ class App(TkinterApp):
         self.history_cards = []
 
         pagination = ctk.CTkFrame(panel, fg_color="transparent")
-        pagination.pack(fill="x", padx=12, pady=(2, 8))
+        self.history_pagination_frame = pagination
 
         self.history_prev_button = ctk.CTkButton(
             pagination,
@@ -4531,6 +4546,57 @@ class App(TkinterApp):
 
         self._refresh_history_tab(force=True)
         return panel
+
+    def _toggle_history_filters(self):
+        """Expand/collapse history search, status, sorting and pagination."""
+        visible = not self._history_filters_visible
+        self._history_filters_visible = visible
+        if visible:
+            self.history_filters_frame.pack(
+                fill='x', padx=12, pady=(0, 8),
+                before=self.history_scrollable,
+            )
+            self.history_pagination_frame.pack(
+                fill='x', padx=12, pady=(2, 8),
+                after=self.history_scrollable,
+            )
+            self.history_search_entry.focus_set()
+        else:
+            self.history_filters_frame.pack_forget()
+            self.history_pagination_frame.pack_forget()
+        self._update_history_search_toggle_appearance()
+
+    def _update_history_search_toggle_appearance(self):
+        """Keep the magnifier highlighted while filters are active, even if hidden."""
+        button = getattr(self, 'history_search_toggle_button', None)
+        if button is None:
+            return
+        filters_active = (
+            bool(self.history_search_var.get().strip())
+            or self.history_status_var.get() != 'Все статусы'
+            or self.history_sort_var.get() != 'Сначала новые'
+            or self.history_page_size_var.get() != '5'
+        )
+        highlighted = self._history_filters_visible or filters_active
+        button.configure(
+            fg_color=(AppTheme.NAV_SELECTED_BACKGROUND if highlighted else 'transparent'),
+            border_color=(AppTheme.ACTIVE_BORDER if highlighted else AppTheme.BORDER),
+        )
+
+    def _set_history_connection_message(self, message):
+        """Show only DB outage/reconnection notices, never a success banner."""
+        label = getattr(self, 'history_connect_status', None)
+        if label is None:
+            return
+        label.configure(text=message)
+        if not message:
+            if label.winfo_manager():
+                label.pack_forget()
+            return
+        if not label.winfo_manager():
+            first_content = (self.history_filters_frame if self._history_filters_visible
+                             else self.history_scrollable)
+            label.pack(fill='x', padx=16, pady=(0, 8), before=first_content)
 
     def _on_history_search_key_event(self, _event=None):
         """Запустить реактивный поиск после ввода/вставки текста."""
@@ -4686,7 +4752,10 @@ class App(TkinterApp):
         item.pack(fill='x', padx=4 if kind == 'research' else 8,
                   pady=4 if kind == 'task' else 3)
         header = ctk.CTkFrame(item, fg_color='transparent')
-        header.pack(fill='x', padx=7, pady=(4, 3) if kind != 'run' else (2, 2))
+        header.pack(
+            fill='x', padx=7,
+            pady=(5, 5) if kind == 'research' else ((4, 3) if kind != 'run' else (2, 2)),
+        )
         body = ctk.CTkFrame(item, fg_color='transparent')
         built = False
         opened = key in expanded_keys
@@ -4713,14 +4782,15 @@ class App(TkinterApp):
             text_color=AppTheme.NAV_TEXT_ACTIVE, anchor='w',
             font=(ctk.CTkFont(size=13, weight='bold') if kind == 'task'
                   else AppTheme.body_font()),
-            height=30 if kind == 'task' else AppTheme.COMPACT_CONTROL_HEIGHT,
+            height=(34 if kind == 'research' else
+                    (30 if kind == 'task' else AppTheme.COMPACT_CONTROL_HEIGHT)),
             border_spacing=5,
         )
         button._read_only_during_compute = True
         button.pack(side='left', fill='x', expand=True)
         if edit_command is not None:
             ctk.CTkButton(
-                header, text='Изменить', width=72, height=25,
+                header, text='Редактировать', width=114, height=25,
                 fg_color='transparent', hover_color=AppTheme.NAV_HOVER,
                 command=edit_command,
             ).pack(side='right', padx=(5, 0))
@@ -4745,6 +4815,196 @@ class App(TkinterApp):
             ).pack(fill='x', padx=18, pady=(0, 7))
         display(opened)
         return button
+
+    @staticmethod
+    def _history_stage_timings(run):
+        """Read measured stage times from a *single attempt's* saved log.
+
+        SQLite's Run.duration_seconds stores the overall attempt duration,
+        not individual stages.  The existing stage profiler already writes
+        CWT/Extrema/Envelopes/KNN timings to run_log.txt.  Parse only those
+        recorded figures: never distribute the total using guessed ratios.
+
+        History details are built lazily, so this runs only when a researcher
+        expands the corresponding task.  Large log files are read in bounded
+        pieces so rendering history does not load a huge experiment log.
+        """
+        import re
+        folder = run.get('output_path')
+        if not folder:
+            return {}
+        log_path = Path(folder) / 'run_log.txt'
+        try:
+            size = log_path.stat().st_size
+            if size <= 0:
+                return {}
+            with log_path.open('rb') as stream:
+                if size <= 4 * 1024 * 1024:
+                    raw = stream.read()
+                else:
+                    # CWT profile is normally near the beginning, and point
+                    # profiles near the end.  No unbounded main-thread reads.
+                    first = stream.read(1024 * 1024)
+                    stream.seek(max(0, size - 2 * 1024 * 1024))
+                    raw = first + b'\n' + stream.read(2 * 1024 * 1024)
+            lines = raw.decode('utf-8', errors='replace').splitlines()
+        except (OSError, ValueError):
+            return {}
+        names = {
+            'CWT': 'cwt',
+            'Extrema': 'extrema',
+            'Envelopes': 'envelopes',
+            'KNN total': 'knn',
+        }
+        result = {}
+        for line in lines:
+            if 'Профиль ' not in line or 'compute=' not in line:
+                continue
+            matched = re.search(
+                r'Профиль (CWT|Extrema|Envelopes|KNN total)\s+—\s+[^\n]*?'
+                r'\bcompute=(\d+(?:\.\d+)?)\s*s\b', line,
+            )
+            if matched:
+                # Last record is used if a task was retried inside a log.
+                result[names[matched.group(1)]] = float(matched.group(2))
+        return result
+
+    def _history_task_timing_summary(self, parent, attempts):
+        """Collapsible timing overview for the latest pipeline attempt.
+
+        Stage profiles and detailed widgets are created on first expansion,
+        not when the task accordion is opened. This keeps history responsive.
+        """
+        run = attempts[0]  # group_runs_by_task() returns newest first.
+        try:
+            raw_total = run.get('duration_seconds')
+            total = max(0.0, float(raw_total)) if raw_total is not None else None
+        except (TypeError, ValueError):
+            total = None
+        total_label = f'{total:.2f} с' if total is not None else 'нет данных'
+
+        section = ctk.CTkFrame(
+            parent, fg_color=AppTheme.NAV_BACKGROUND,
+            corner_radius=7, border_width=1, border_color=AppTheme.BORDER,
+        )
+        section.pack(fill='x', padx=5, pady=(2, 10))
+        heading = ctk.CTkFrame(section, fg_color='transparent')
+        heading.pack(fill='x', padx=7, pady=5)
+        detail_frame = ctk.CTkFrame(section, fg_color='transparent')
+
+        # Attempt UUID is stable across ORM refreshes and filesystem recovery.
+        timing_key = str(run.get('id') or run.get('output_path') or
+                         (run.get('created_at'), run.get('task_id')))
+        opened_keys = self._history_open_timings
+        built = False
+        opened = timing_key in opened_keys
+
+        def build_details():
+            profile = self._history_stage_timings(run)
+            last_run = format_date(run.get('created_at'))
+            status = display_status(run.get('status'))
+            history_note = (f'Последний запуск: {last_run} · {status}'
+                            + (f' · Всего запусков: {len(attempts)}'
+                               if len(attempts) > 1 else ''))
+            ctk.CTkLabel(
+                detail_frame, text=history_note, anchor='w',
+                text_color=AppTheme.TEXT_SECONDARY,
+                font=AppTheme.caption_font(),
+            ).pack(fill='x', padx=12, pady=(2, 8))
+
+            metrics = []
+            for name, key in (
+                ('CWT', 'cwt'), ('Экстремумы', 'extrema'),
+                ('Огибающие', 'envelopes'), ('KNN', 'knn'),
+            ):
+                if key in profile:
+                    metrics.append((name, profile[key]))
+            if total is not None and len(profile) == 4:
+                # These are distinct profiler measurements; their difference
+                # with wall time comprises preparation, saving and overhead.
+                remainder = total - sum(profile.values())
+                if remainder > 0.005:
+                    metrics.append(('Прочие операции', remainder))
+
+            if metrics:
+                tiles = ctk.CTkFrame(detail_frame, fg_color='transparent')
+                tiles.pack(fill='x', padx=9, pady=(0, 8))
+                for column in range(3):
+                    tiles.grid_columnconfigure(column, weight=1, uniform='timing')
+                for i, (name, seconds) in enumerate(metrics):
+                    tile = ctk.CTkFrame(tiles, fg_color='#303030', corner_radius=6)
+                    tile.grid(row=i // 3, column=i % 3, sticky='ew', padx=3, pady=3)
+                    ctk.CTkLabel(
+                        tile, text=name, anchor='w',
+                        text_color=AppTheme.TEXT_SECONDARY,
+                        font=AppTheme.caption_font(),
+                    ).pack(fill='x', padx=10, pady=(5, 0))
+                    value_row = ctk.CTkFrame(tile, fg_color='transparent')
+                    value_row.pack(fill='x', padx=10, pady=(0, 6))
+                    ctk.CTkLabel(
+                        value_row, text=f'{seconds:.2f} с', anchor='w',
+                        font=AppTheme.body_font(),
+                    ).pack(side='left')
+                    if name == 'Прочие операции':
+                        HelpIcon(value_row, 'history.timing.other').pack(
+                            side='left', padx=(8, 0),
+                        )
+            else:
+                ctk.CTkLabel(
+                    detail_frame,
+                    text='В журнале нет измерений отдельных этапов.',
+                    text_color=AppTheme.TEXT_SECONDARY,
+                    font=AppTheme.caption_font(), anchor='w',
+                ).pack(fill='x', padx=12, pady=(0, 8))
+
+            if run.get('error_message'):
+                self._history_detail_line(detail_frame, 'Ошибка', run['error_message'])
+            if run.get('researcher_note'):
+                self._history_detail_line(detail_frame, 'Заметка', run['researcher_note'])
+            output_path = run.get('output_path')
+            if output_path:
+                button = ctk.CTkButton(
+                    detail_frame, text='Открыть папку результатов', width=200,
+                    command=lambda path=output_path: self._open_result_path(path),
+                )
+                button._read_only_during_compute = True
+                button.pack(anchor='w', padx=12, pady=(0, 10))
+
+        def toggle():
+            nonlocal built, opened
+            if not opened:
+                if not built:
+                    build_details()
+                    built = True
+                detail_frame.pack(fill='x', padx=8, pady=(0, 7))
+                opened_keys.add(timing_key)
+            else:
+                detail_frame.pack_forget()
+                opened_keys.discard(timing_key)
+            opened = not opened
+            button.configure(
+                text=('▾  ' if opened else '▸  ') +
+                     f'Общее время выполнения задачи: {total_label}',
+            )
+
+        button = ctk.CTkButton(
+            heading, text='', command=toggle,
+            fg_color='transparent', hover_color=AppTheme.NAV_HOVER,
+            text_color=AppTheme.NAV_TEXT_ACTIVE, anchor='w',
+            font=ctk.CTkFont(size=13, weight='bold'),
+            height=38, border_spacing=6,
+        )
+        button._read_only_during_compute = True
+        button.pack(side='left', fill='x', expand=True)
+        HelpIcon(heading, 'history.timing.expand').pack(
+            side='right', padx=(5, 8),
+        )
+        # Restore expanded state only if the user previously opened this run.
+        if opened:
+            opened = False
+            toggle()
+        else:
+            button.configure(text=f'▸  Общее время выполнения задачи: {total_label}')
 
     def _history_task_details(self, parent, task, runs):
         """One canonical settings block followed by compact run chronology."""
@@ -4775,20 +5035,22 @@ class App(TkinterApp):
 
         pipeline = [r for r in runs if r.get('run_type') != 'ml']
         ml = [r for r in runs if r.get('run_type') == 'ml']
-        for title, records in (
-            ('ЗАПУСКИ CWT', pipeline),
-            ('ML-ОПЕРАЦИИ', ml),
-        ):
-            if not records:
-                continue
+        if pipeline:
+            # No nested CWT run accordions: show timing for the latest attempt
+            # directly inside the task.  Previous attempts are still kept in
+            # SQLite and the original .runs journals.
+            self._history_task_timing_summary(parent, pipeline)
+        if ml:
+            # ML operations retain their distinct history; scientific details
+            # of previous CWT attempts are not silently reclassified as ML.
             section = ctk.CTkFrame(parent, fg_color='transparent')
             section.pack(fill='x', padx=3, pady=(2, 8))
             ctk.CTkLabel(
-                section, text=title,
+                section, text='ML-ОПЕРАЦИИ',
                 anchor='w', text_color=AppTheme.TEXT_SECONDARY,
                 font=ctk.CTkFont(size=11, weight='bold'),
             ).pack(fill='x', padx=12, pady=(6, 2))
-            self._history_run_details(section, records, snapshot, meta)
+            self._history_run_details(section, ml, snapshot, meta)
         if not runs:
             ctk.CTkLabel(parent, text='Эта задача ещё не запускалась',
                          text_color=AppTheme.TEXT_SECONDARY,
@@ -4799,9 +5061,7 @@ class App(TkinterApp):
         by_task = group_runs_by_task(runs)
         for task in tasks:
             attempts = by_task.get(task['id'], [])
-            pipeline_count = sum(r.get('run_type') != 'ml' for r in attempts)
-            ml_count = len(attempts) - pipeline_count
-            title = f"{task['name']}     CWT: {pipeline_count}  ·  ML: {ml_count}"
+            title = task['name']
             self._history_disclosure(
                 parent, title, task['id'], self._history_open_tasks,
                 lambda container, row=task, values=attempts:
@@ -4824,13 +5084,13 @@ class App(TkinterApp):
             self._history_dirty = True
             return
         self._history_dirty = False
-        label = getattr(self, 'history_connect_status', None)
-        if label is not None:
-            if self.run_history.available:
-                label.configure(text='История доступна · SQLAlchemy ORM')
-            else:
-                label.configure(text='База истории недоступна. Расчёты доступны; '
-                    'откройте исследование из папки или повторите подключение.')
+        if self.run_history.available:
+            self._set_history_connection_message('')
+        else:
+            self._set_history_connection_message(
+                'База истории недоступна. Расчёты доступны; '
+                'откройте исследование из папки или повторите подключение.'
+            )
         for card in self.history_cards:
             card.destroy()
         self.history_cards.clear()
@@ -4838,6 +5098,7 @@ class App(TkinterApp):
         query = self.history_search_entry.get().strip().casefold() if hasattr(
             self, 'history_search_entry') else self.history_search_var.get().strip().casefold()
         status_filter = self.history_status_var.get()
+        self._update_history_search_toggle_appearance()
         runs = self.run_history.list_runs(limit=100000)
         grouped = {}
         for run in sort_runs(runs):
@@ -4903,30 +5164,42 @@ class App(TkinterApp):
             ctk.CTkLabel(card, text=experiment['name'], font=AppTheme.section_title_font(),
                          anchor='w').pack(fill='x', padx=12, pady=(9, 2))
             meta = (f"Создано: {format_date(experiment.get('created_at'))}  ·  "
-                    f"Задач: {len(tasks)}  ·  "
-                    f"Запусков: {len(task_runs)}  ·  "
-                    f"ML: {sum(r.get('run_type') == 'ml' for r in task_runs)}")
+                    f"Задач: {len(tasks)}")
             ctk.CTkLabel(card, text=meta, text_color=AppTheme.TEXT_SECONDARY,
-                         anchor='w', font=AppTheme.caption_font()).pack(
-                             fill='x', padx=12, pady=(0, 4))
+                         anchor='w', font=AppTheme.body_font()).pack(
+                             fill='x', padx=12, pady=(2, 8))
             if experiment.get('note'):
                 ctk.CTkLabel(
                     card, text=experiment['note'][:500], anchor='w', justify='left',
                     text_color=AppTheme.TEXT_SECONDARY, wraplength=1000,
                     font=AppTheme.body_font(),
                 ).pack(fill='x', padx=12, pady=(0, 6))
-            self._history_disclosure(
-                card, f'Задачи и история запусков  ·  {len(tasks)}', experiment['id'],
-                self._history_open_researches,
-                lambda content, rows=tasks, values=task_runs:
-                    self._history_experiment_details(content, rows, values),
-                kind='research',
-            )
+            if tasks:
+                self._history_disclosure(
+                    card, 'Список задач', experiment['id'],
+                    self._history_open_researches,
+                    lambda content, rows=tasks, values=task_runs:
+                        self._history_experiment_details(content, rows, values),
+                    kind='research',
+                )
+            else:
+                # An empty study has nothing to expand: do not show a
+                # misleading zero-count accordion with an empty panel.
+                empty = ctk.CTkFrame(
+                    card, fg_color=AppTheme.NAV_SELECTED_BACKGROUND,
+                    corner_radius=7,
+                )
+                empty.pack(fill='x', padx=4, pady=3)
+                ctk.CTkLabel(
+                    empty, text='В исследовании нет сохранённых задач',
+                    anchor='w', text_color=AppTheme.TEXT_SECONDARY,
+                    font=AppTheme.body_font(),
+                ).pack(fill='x', padx=15, pady=12)
             buttons = ctk.CTkFrame(card, fg_color='transparent')
             buttons.pack(fill='x', padx=12, pady=(3, 10))
             eid = experiment['id']
             root = experiment['root_path']
-            ctk.CTkButton(buttons, text='Изменить название / заметку', width=205,
+            ctk.CTkButton(buttons, text='Редактировать название / заметку', width=245,
                           fg_color=AppTheme.NAV_SELECTED_BACKGROUND,
                           hover_color=AppTheme.NAV_HOVER,
                           command=lambda record=experiment: self._edit_research_metadata(record)
@@ -6589,7 +6862,7 @@ class App(TkinterApp):
         self._update_gram_geometry(task, has_colors, selected)
 
     def _setup_scales_section(self):
-        """Настройка секции масштабов"""
+        """Настройка масштабов: диапазон и файл — два равноправных способа."""
         self._attach_help_to_section_header(self.scales_section, "scales.range")
 
         # Поля ввода
@@ -6616,14 +6889,13 @@ class App(TkinterApp):
         ctk.CTkLabel(step_frame, text="Шаг:", width=40, anchor="w").pack(side="left")
         self.entry_step = ctk.CTkEntry(step_frame, placeholder_text="1")
         self.entry_step.pack(side="left", fill="x", expand=True)
-
         # Кнопки
         button_frame = ctk.CTkFrame(self.scales_section.content, fg_color="transparent")
         self.scales_section.add_widget(button_frame, pady=(5, 0))
 
         self.button_save_scales = ctk.CTkButton(
             button_frame,
-            text="Применить масштабы",
+            text="Применить",
             command=self.load_scales,
             height=AppTheme.BUTTON_HEIGHT
         )
@@ -6631,33 +6903,102 @@ class App(TkinterApp):
 
         self.button_load_scales_file = ctk.CTkButton(
             button_frame,
-            text="Загрузить из файла",
+            text="Загрузить",
             command=self.load_scales_from_file,
             height=AppTheme.BUTTON_HEIGHT
         )
         self.button_load_scales_file.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
-        # Отображение загруженных масштабов
-        self.label_custom_scale = ctk.CTkLabel(
-            self.scales_section.content,
-            text="",
-            font=AppTheme.caption_font(),
-            text_color=AppTheme.MUTED,
-            anchor="w",
-            wraplength=0
-        )
-        # Пустая подпись не должна резервировать целую строку под кнопками.
-        self.scales_section.add_widget(self.label_custom_scale, pady=(3, 0))
-        self.label_custom_scale.pack_forget()
+    def _set_scales_ui_mode(self, mode):
+        """Взаимоисключающие состояния редактора масштабов."""
+        if mode not in ('editing', 'applied', 'error'):
+            raise ValueError(f'Неизвестное состояние масштабов: {mode}')
+        self._scales_ui_mode = mode
+        self._render_scales_controls()
 
-    def _set_scales_status(self, text):
-        """Показывать служебную подпись масштабов только при наличии текста."""
-        if not text:
-            self.label_custom_scale.configure(text="", text_color=AppTheme.MUTED)
-            self.label_custom_scale.pack_forget()
+    def _render_scales_controls(self):
+        """Две кнопки без отдельного статус-бара.
+
+        editing: Применить / Загрузить (синие, доступные)
+        applied: Применено (зелёная, отключена) / Редактировать
+        error: Ошибка (красная, отключена) / Редактировать
+        """
+        mode = getattr(self, '_scales_ui_mode', 'editing')
+        task = getattr(self, 'current_task', None)
+        enabled = task is not None and not getattr(self, '_compute_ui_locked', False)
+        editing = mode == 'editing'
+
+        for entry in (self.entry_start, self.entry_end, self.entry_step):
+            if entry is not None:
+                entry.configure(state='normal' if enabled and editing else 'disabled')
+
+        if self.button_save_scales is None or self.button_load_scales_file is None:
             return
-        self.label_custom_scale.configure(text=text, text_color=AppTheme.TEXT_ON_DARK)
-        self.scales_section.add_widget(self.label_custom_scale, pady=(3, 0))
+        if mode == 'editing':
+            self.button_save_scales.configure(
+                text='Применить', fg_color=AppTheme.PRIMARY,
+                hover_color=AppTheme.PRIMARY_HOVER,
+                state='normal' if enabled else 'disabled',
+                command=self.load_scales,
+            )
+            self.button_load_scales_file.configure(
+                text='Загрузить', fg_color=AppTheme.PRIMARY,
+                hover_color=AppTheme.PRIMARY_HOVER,
+                state='normal' if enabled else 'disabled',
+                command=self.load_scales_from_file,
+            )
+        else:
+            success = mode == 'applied'
+            self.button_save_scales.configure(
+                text='Применено' if success else 'Ошибка',
+                fg_color=AppTheme.SUCCESS if success else AppTheme.DANGER,
+                hover_color=AppTheme.SUCCESS_HOVER if success else AppTheme.DANGER_HOVER,
+                state='disabled',
+            )
+            self.button_load_scales_file.configure(
+                text='Редактировать', fg_color=AppTheme.PRIMARY,
+                hover_color=AppTheme.PRIMARY_HOVER,
+                state='normal' if enabled else 'disabled',
+                command=self._edit_scales,
+            )
+
+    def _edit_scales(self):
+        """Вернуться к выбору диапазона или файла для той же задачи."""
+        self._set_scales_ui_mode('editing')
+        if self.entry_start is not None:
+            self.entry_start.focus_set()
+
+    def _sync_scales_range_entries(self, task):
+        """Заполнять поля только если набор выражается целым диапазоном.
+
+        Произвольный список из файла может не быть арифметической прогрессией:
+        в таком случае оставляем поля пустыми, а не показываем значения
+        от другой задачи. Актуальные масштабы видны в карточке задачи.
+        """
+        values = None
+        if task is not None:
+            scales = np.asarray(task.scales, dtype=float).reshape(-1)
+            if not scales.size:
+                values = (1, 10, 1)
+            if scales.size and np.all(np.isfinite(scales)) and np.allclose(
+                scales, np.round(scales), rtol=0, atol=1e-9,
+            ):
+                if scales.size == 1:
+                    values = (int(scales[0]), int(scales[0]), 1)
+                else:
+                    diffs = np.diff(scales)
+                    if np.all(diffs > 0) and np.allclose(
+                        diffs, diffs[0], rtol=0, atol=1e-9,
+                    ):
+                        values = (int(scales[0]), int(scales[-1]), int(diffs[0]))
+        for field, value in zip(
+            (self.entry_start, self.entry_end, self.entry_step),
+            values if values is not None else (None, None, None),
+        ):
+            field.configure(state="normal")
+            field.delete(0, "end")
+            if value is not None:
+                field.insert(0, str(value))
 
     def _setup_extremes_section(self):
         """Параметры самого 1D CWT: только выбор направлений обработки."""
@@ -6715,21 +7056,49 @@ class App(TkinterApp):
         self._restore_experiment(record['id'])
 
     def _reconnect_research_history(self):
-        """Retry and replay in a worker; DB latency must not freeze Tk."""
-        label = getattr(self, 'history_connect_status', None)
-        if label is not None:
-            label.configure(text='Синхронизация истории…')
+        """Синхронизировать файловую историю и ORM, затем обновить обе страницы.
+
+        Операции с БД выполняются в потоке; повторное нажатие не запускает
+        ещё одну синхронизацию параллельно первой.
+        """
+        if getattr(self, '_history_sync_in_progress', False):
+            return
+        self._history_sync_in_progress = True
+        button = getattr(self, 'history_sync_button', None)
+        if button is not None:
+            button.configure(state='disabled')
+        self._set_history_connection_message('Синхронизация истории…')
+
         def worker():
-            ok = self.run_history.reconnect(replay=True)
-            error = self.run_history.last_error
+            try:
+                ok = self.run_history.reconnect(replay=True)
+                error = self.run_history.last_error
+                sync_errors = dict(self.run_history.sync_errors)
+            except Exception as exc:
+                ok, error, sync_errors = False, str(exc), {}
+
             def finish():
+                self._history_sync_in_progress = False
                 if getattr(self, '_is_destroyed', False):
                     return
+                button = getattr(self, 'history_sync_button', None)
+                if button is not None and button.winfo_exists():
+                    button.configure(state='normal')
                 if not ok:
-                    self.progress_manager.log_error(f'История временно недоступна: {error}')
+                    self.progress_manager.log_error(
+                        f'История временно недоступна: {error}')
+                elif sync_errors:
+                    self.progress_manager.log_error(
+                        f'Не удалось синхронизировать {len(sync_errors)} исследований')
                 self._refresh_history_tab(force=True)
                 self._refresh_welcome_recent_runs()
+                if ok and sync_errors:
+                    self._set_history_connection_message(
+                        f'Не удалось синхронизировать {len(sync_errors)} исследований. '
+                        'Проверьте файлы их состояния.')
+
             self.after_safe(0, finish)
+
         threading.Thread(target=worker, daemon=True).start()
 
     def _restore_experiment(self, experiment_id):
@@ -7514,33 +7883,12 @@ class App(TkinterApp):
             # Обновляем KNN
             self.knn_text_var.set(str(self.current_task.k_neighbors))
 
-            # Сбрасываем состояние кнопок масштабов для новой задачи
-            if len(self.current_task.scales) == 0:
-                self.button_save_scales.configure(
-                    text="Сохранить значения",
-                    fg_color=AppTheme.PRIMARY,
-                    hover_color=AppTheme.PRIMARY_HOVER,
-                    state='normal'
-                )
-                self.button_load_scales_file.configure(
-                    text="Загрузить из файла",
-                    fg_color=AppTheme.PRIMARY,
-                    hover_color=AppTheme.PRIMARY_HOVER,
-                    state='normal'
-                )
-                self._set_scales_status("")
-
-                # Включаем поля ввода
-                self.entry_start.configure(state='normal')
-                self.entry_end.configure(state='normal')
-                self.entry_step.configure(state='normal')
-            else:
-                # Если масштабы уже загружены, показываем это
-                if len(self.current_task.scales) <= 5:
-                    scales_text = f"Масштабы: {', '.join(map(str, self.current_task.scales))}"
-                else:
-                    scales_text = f"Загружено {len(self.current_task.scales)} масштабов"
-                self._set_scales_status(scales_text)
+            # Отображаем действительные сохранённые масштабы, а не черновик
+            # другой задачи. Оба способа применения приводят к одному состоянию.
+            self._sync_scales_range_entries(self.current_task)
+            self._set_scales_ui_mode(
+                'applied' if len(self.current_task.scales) > 0 else 'editing'
+            )
 
         else:
             # Сбрасываем UI если нет активной задачи
@@ -7554,19 +7902,8 @@ class App(TkinterApp):
             if self.change_image_button is not None:
                 self.change_image_button.pack_forget()
             self._update_channel_controls_state()
-            self.button_save_scales.configure(
-                text="Применить масштабы",
-                fg_color=AppTheme.PRIMARY,
-                hover_color=AppTheme.PRIMARY_HOVER,
-                state='disabled'
-            )
-            self.button_load_scales_file.configure(
-                text="Загрузить из файла",
-                fg_color=AppTheme.PRIMARY,
-                hover_color=AppTheme.PRIMARY_HOVER,
-                state='disabled'
-            )
-            self._set_scales_status("")
+            self._sync_scales_range_entries(None)
+            self._set_scales_ui_mode('editing')
 
         self._apply_analysis_mode_ui()
         self._update_pipeline_controls_state()
@@ -7589,8 +7926,7 @@ class App(TkinterApp):
             self._set_point_analysis_controls_enabled(False)
             self.analysis_mode_selector.configure(state="disabled")
             self.load_button.configure(state="disabled")
-            self.button_save_scales.configure(state="disabled")
-            self.button_load_scales_file.configure(state="disabled")
+            self._render_scales_controls()
             self.app_start_button.configure(state="disabled")
             self._set_workflow_status(
                 "Шаг 1 из 3: создайте задачу и загрузите изображение",
@@ -7605,8 +7941,7 @@ class App(TkinterApp):
         self.load_button.configure(state="normal")
         if not task.image_path:
             self.analysis_mode_selector.configure(state="disabled")
-            self.button_save_scales.configure(state="disabled")
-            self.button_load_scales_file.configure(state="disabled")
+            self._render_scales_controls()
             self.app_start_button.configure(state="disabled")
             self._set_workflow_status(
                 "Шаг 1 из 3: загрузите изображение",
@@ -7615,8 +7950,7 @@ class App(TkinterApp):
             return
 
         self.analysis_mode_selector.configure(state="normal")
-        self.button_save_scales.configure(state="normal")
-        self.button_load_scales_file.configure(state="normal")
+        self._render_scales_controls()
 
         if (task.channel_representation == "gram_schmidt"
                 and not task.has_colors_selected()):
@@ -7765,85 +8099,52 @@ class App(TkinterApp):
         self._update_action_availability()
 
     def load_scales(self):
-        """Загрузка масштабов для текущей задачи"""
-        if not self.current_task:
-            mb.showwarning("Внимание", "Сначала создайте задачу")
+        """Применить диапазон; при ошибке оставить настройку задачи без изменений."""
+        if self.current_task is None or self._scales_ui_mode != 'editing':
             return
         try:
-            start = int(self.entry_start.get() or "1")
-            end = int(self.entry_end.get() or "10")
-            step = int(self.entry_step.get() or "1")
-            self.image_processor.load_scales_for_task(self.current_task, start, end, step)
-            self.button_save_scales.configure(
-                text="Масштабы сохранены",
-                fg_color=AppTheme.SUCCESS,
-                hover_color=AppTheme.SUCCESS_HOVER
+            raw_values = tuple(
+                field.get().strip() for field in
+                (self.entry_start, self.entry_end, self.entry_step)
             )
-            self.button_load_scales_file.configure(state='disabled')
-
-            scale_info = f"Масштабы: {start}-{end} (шаг {step})"
-            self._set_scales_status(scale_info)
-
-            self._update_tasks_display()
-            self._update_action_availability()
-
-        except ValueError as e:
-            mb.showerror("Ошибка", f"Пожалуйста, введите корректные числовые значения: {e}")
-
-    def load_scales_from_file(self):
-        """Загрузка масштабов из файла для текущей задачи"""
-        if not self.current_task:
-            mb.showwarning("Внимание", "Сначала создайте задачу")
+            if not all(raw_values):
+                raise ValueError('укажите начало, конец и шаг диапазона')
+            start, end, step = map(int, raw_values)
+            self.image_processor.load_scales_for_task(self.current_task, start, end, step)
+        except (ValueError, TypeError, OverflowError) as error:
+            self._set_scales_ui_mode('error')
+            mb.showerror('Масштабы', f'Некорректный диапазон: {error}', parent=self)
             return
 
-        # Временно блокируем поля ввода
-        self.entry_start.configure(state='disabled')
-        self.entry_step.configure(state='disabled')
-        self.entry_end.configure(state='disabled')
+        self._set_scales_ui_mode('applied')
+        self._update_tasks_display()
+        self._update_action_availability()
 
-        filetypes = (
-            ('Text files', '*.txt'),
-            ('All files', '*.*')
-        )
+    def load_scales_from_file(self):
+        """Загрузить масштабы из файла; отмена выбора не меняет состояние."""
+        if self.current_task is None or self._scales_ui_mode != 'editing':
+            return
+
         filename = tk.filedialog.askopenfilename(
             title='Выберите файл с масштабами',
-            initialdir='/',
-            filetypes=filetypes
+            filetypes=(('Text files', '*.txt'), ('All files', '*.*')),
         )
-
-        if filename:
-            try:
-                self.image_processor.load_scales_from_file_for_task(self.current_task, filename)
-            except (ValueError, OSError) as error:
-                mb.showerror("Масштабы", str(error))
-                return
-
-            if self.current_task.num_scale <= 10:
-                scales_text = f"Масштабы: {', '.join(map(str, self.current_task.scales))}"
-            else:
-                scales_text = f"Загружено {self.current_task.num_scale} масштабов"
-
-            self._set_scales_status(scales_text)
-
-            self.button_load_scales_file.configure(
-                text="Файл загружен",
-                fg_color=AppTheme.SUCCESS,
-                hover_color=AppTheme.SUCCESS_HOVER
+        if not filename:
+            return
+        try:
+            self.image_processor.load_scales_from_file_for_task(
+                self.current_task, filename,
             )
-            self.button_save_scales.configure(
-                text="Сохранить значения",
-                fg_color=AppTheme.DISABLED,
-                hover_color=AppTheme.DISABLED_HOVER,
-                state='disabled'
-            )
+        except (ValueError, OSError, UnicodeError, TypeError, OverflowError) as error:
+            self._set_scales_ui_mode('error')
+            mb.showerror('Масштабы', f'Не удалось загрузить масштабы: {error}', parent=self)
+            return
 
-            self._update_tasks_display()
-            self._update_action_availability()
-        else:
-            # Если файл не выбран, разблокируем поля ввода
-            self.entry_start.configure(state='normal')
-            self.entry_step.configure(state='normal')
-            self.entry_end.configure(state='normal')
+        # Поля для произвольного списка очищаем; значения хранятся в задаче.
+        self._sync_scales_range_entries(self.current_task)
+        self._set_scales_ui_mode('applied')
+        self._update_tasks_display()
+        self._update_action_availability()
 
     def on_entry_click(self, event=None):
         """Explicit input enables KNN; restoring task settings never does."""
@@ -8922,42 +9223,6 @@ class App(TkinterApp):
             self.centering_means_checkbox, fill="x"
         )
 
-    @staticmethod
-    def _resource_card_icon(kind, color):
-        """Draw a small antialiased resource icon; no emoji/font dependency."""
-        from math import cos, pi, sin
-
-        image = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image)
-        if kind == "ram":
-            draw.rounded_rectangle((25, 25, 71, 71), radius=7,
-                                   outline=color, width=6)
-            for pos in (34, 48, 62):
-                draw.line((pos, 14, pos, 25), fill=color, width=6)
-                draw.line((pos, 71, pos, 82), fill=color, width=6)
-                draw.line((14, pos, 25, pos), fill=color, width=6)
-                draw.line((71, pos, 82, pos), fill=color, width=6)
-            draw.rounded_rectangle((39, 39, 57, 57), radius=3,
-                                   outline=color, width=4)
-        elif kind == "gpu":
-            draw.rounded_rectangle((15, 24, 81, 70), radius=7,
-                                   outline=color, width=6)
-            draw.ellipse((34, 31, 66, 63), outline=color, width=5)
-            for step in range(4):
-                angle = step * pi / 2
-                draw.line((50 + 5 * cos(angle), 47 + 5 * sin(angle),
-                           50 + 14 * cos(angle), 47 + 14 * sin(angle)),
-                          fill=color, width=4)
-            draw.line((24, 76, 73, 76), fill=color, width=5)
-        else:
-            draw.ellipse((24, 18, 72, 42), outline=color, width=6)
-            draw.line((24, 30, 24, 69), fill=color, width=6)
-            draw.line((72, 30, 72, 69), fill=color, width=6)
-            draw.arc((24, 42, 72, 65), 0, 180, fill=color, width=6)
-            draw.arc((24, 57, 72, 81), 0, 180, fill=color, width=6)
-        image = image.resize((48, 48), Image.Resampling.LANCZOS)
-        return ctk.CTkImage(light_image=image, dark_image=image, size=(24, 24))
-
     def _setup_compute_section(self):
         """Keep the main window unchanged; display resource estimates as tiles."""
         self.compute_section.grid_columnconfigure(0, weight=1)
@@ -9006,58 +9271,34 @@ class App(TkinterApp):
         self.resource_tiles = {}
         self.resource_value_labels = {}
         self.resource_detail_labels = {}
-        self._resource_images = {}
         palette = (
-            ("ram", "RAM", "#303030", "#505050", "#d7d7d7", "#414141"),
-            ("gpu", "GPU", "#303030", "#505050", "#d7d7d7", "#414141"),
-            ("disk", "Диск", "#303030", "#505050", "#d7d7d7", "#414141"),
+            ("ram", "RAM", "#303030", "#505050"),
+            ("gpu", "GPU", "#303030", "#505050"),
+            ("disk", "Диск", "#303030", "#505050"),
         )
-        for key, heading, bg_color, border_color, accent, icon_bg in palette:
+        for key, heading, bg_color, border_color in palette:
             tile = ctk.CTkFrame(
                 tiles_frame, fg_color=bg_color,
                 border_width=1, border_color=border_color,
                 corner_radius=12,
             )
             tile.grid_columnconfigure(0, weight=1)
-            tile.grid_rowconfigure(1, weight=0)
 
-            top = ctk.CTkFrame(tile, fg_color="transparent")
-            top.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 6))
-            top.grid_columnconfigure(1, weight=1)
-
-            icon_box = ctk.CTkFrame(
-                top, fg_color=icon_bg, corner_radius=11,
-                width=48, height=48,
-            )
-            icon_box.grid(row=0, column=0, sticky="w")
-            icon_box.grid_propagate(False)
-            self._resource_images[key] = self._resource_card_icon(key, accent)
-            ctk.CTkLabel(icon_box, text="", image=self._resource_images[key]).place(
-                relx=0.5, rely=0.5, anchor="center"
-            )
-
-            title_wrap = ctk.CTkFrame(top, fg_color="transparent")
-            title_wrap.grid(row=0, column=1, sticky="w", padx=(18, 0))
-            ctk.CTkLabel(
-                title_wrap, text=heading,
-                font=ctk.CTkFont(size=13, weight="bold"),
-                text_color="#eef3f8", anchor="w",
-            ).pack(anchor="w")
-
+            # Compact text-only header; resource name and estimated size share one line.
             value = ctk.CTkLabel(
-                tile, text="—",
-                font=ctk.CTkFont(size=19, weight="bold"),
+                tile, text=f"{heading} —",
+                font=ctk.CTkFont(size=18, weight="bold"),
                 text_color="#f4f7fb", anchor="w",
             )
-            value.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
+            value.grid(row=0, column=0, sticky="w", padx=16, pady=(17, 9))
             detail = ctk.CTkLabel(
                 tile, text="",
                 font=ctk.CTkFont(size=11),
                 text_color="#b8c1cc", anchor="nw", justify="left",
                 wraplength=225,
             )
-            detail.grid(row=2, column=0, sticky="ew",
-                        padx=16, pady=(0, 14))
+            detail.grid(row=1, column=0, sticky="ew",
+                        padx=16, pady=(0, 16))
             self.resource_tiles[key] = tile
             self.resource_value_labels[key] = value
             self.resource_detail_labels[key] = detail
@@ -9067,15 +9308,6 @@ class App(TkinterApp):
         # Kept as a guard for callers of _update_action_availability().
         self.memory_label = self.resource_card
         self._layout_resource_tiles()
-
-        ctk.CTkLabel(
-            self.compute_section,
-            text=("При открытии предыдущего исследования очередь продолжается автоматически: "
-                  "готовые задачи не пересчитываются, запускаются только новые или "
-                  "незавершённые задачи, а также задачи с изменёнными параметрами."),
-            font=AppTheme.caption_font(), text_color=AppTheme.TEXT_SECONDARY,
-            anchor='w', justify='left', wraplength=620,
-        ).grid(row=1, column=0, sticky='ew', padx=5, pady=(10, 10))
 
     def _layout_resource_tiles(self, event=None):
         """Show three equal tiles horizontally, stack them on narrow panes."""
@@ -9109,18 +9341,18 @@ class App(TkinterApp):
     def _refresh_memory_estimate(self):
         try:
             if not self.current_task:
-                self.resource_value_labels['ram'].configure(text="—")
+                self.resource_value_labels['ram'].configure(text="RAM —")
                 self.resource_detail_labels['ram'].configure(
                     text="Загрузите изображение и настройте параметры.")
                 for key in ('gpu', 'disk'):
-                    self.resource_value_labels[key].configure(text="—")
+                    self.resource_value_labels[key].configure(text=f"{'GPU' if key == 'gpu' else 'Диск'} —")
                     self.resource_detail_labels[key].configure(text="")
                 return
 
             details = estimate_details(
                 [self.current_task], self.image_processor.root_folder_path)
             self.resource_value_labels['ram'].configure(
-                text=f'≈ {details["ram_total_gib"]:.2f} ГиБ')
+                text=f'RAM ≈ {details["ram_total_gib"]:.2f} ГиБ')
             if details['current_rss'] is None:
                 ram_detail = "Рабочие массивы без памяти интерфейса и библиотек."
             else:
@@ -9128,25 +9360,25 @@ class App(TkinterApp):
                               f'этапы до ≈ {details["ram_additional_gib"]:.2f} ГиБ')
             self.resource_detail_labels['ram'].configure(text=ram_detail)
             self.resource_value_labels['gpu'].configure(
-                text=f'≈ {details["gpu_gib"]:.2f} ГиБ')
+                text=f'GPU ≈ {details["gpu_gib"]:.2f} ГиБ')
             self.resource_detail_labels['gpu'].configure(
                 text="Рабочие массивы без пика VRAM и CUDA-пула.")
 
             if details['disk_forecast_gib'] is not None:
                 self.resource_value_labels['disk'].configure(
-                    text=f'≈ {details["disk_forecast_gib"]:.2f} ГиБ')
+                    text=f'Диск ≈ {details["disk_forecast_gib"]:.2f} ГиБ')
                 self.resource_detail_labels['disk'].configure(
                     text=(f'Временный запас ≈ {details["disk_temporary_gib"]:.2f} ГиБ · '
                           f'свободно ≈ {details["disk_free_gib"]:.2f} ГиБ'))
             else:
-                self.resource_value_labels['disk'].configure(text="—")
+                self.resource_value_labels['disk'].configure(text="Диск —")
                 self.resource_detail_labels['disk'].configure(
                     text="Недостаточно данных для прогноза диска.")
         except (ValueError, TypeError, OverflowError) as error:
-            self.resource_value_labels['ram'].configure(text="—")
+            self.resource_value_labels['ram'].configure(text="RAM —")
             self.resource_detail_labels['ram'].configure(text=f'Проверьте параметры: {error}')
             for key in ('gpu', 'disk'):
-                self.resource_value_labels[key].configure(text="—")
+                self.resource_value_labels[key].configure(text=f"{'GPU' if key == 'gpu' else 'Диск'} —")
                 self.resource_detail_labels[key].configure(text="")
 
     def _request_cancel(self):
