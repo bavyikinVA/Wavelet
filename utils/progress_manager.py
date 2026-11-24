@@ -14,6 +14,7 @@ import customtkinter as ctk
 
 from utils.gui import TkinterApp
 from utils.theme import AppTheme
+from utils.app_paths import log_file_path
 
 
 class LoggingHandler(logging.Handler):
@@ -216,7 +217,7 @@ class ProgressManager:
         gui_handler.setLevel(logging.INFO)
         self.logger.addHandler(gui_handler)
         file_handler = RotatingFileHandler(
-            "wavelet_analysis.log", maxBytes=16 * 1024 * 1024,
+            str(log_file_path()), maxBytes=16 * 1024 * 1024,
             backupCount=3, encoding="utf-8")
         file_handler.setFormatter(formatter)
         file_handler.setLevel(logging.DEBUG)

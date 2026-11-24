@@ -17,18 +17,29 @@ def environment():
     for name in ('numpy','scipy','numba','cupy-cuda12x','scikit-learn','customtkinter'):
         try: packages[name]=version(name)
         except PackageNotFoundError: packages[name]=None
-    from history.attempts import digest
-    root=Path(__file__).resolve().parents[1]
-    files=[root/'main.py']
-    for directory in ('compute','history','ml'):
-        files.extend((root/directory).rglob('*.py'))
-    import hashlib
-    code=hashlib.sha256()
-    for path in sorted(files):
-        code.update(path.relative_to(root).as_posix().encode())
-        code.update(digest(path).encode())
-    return {'python':sys.version.split()[0],'platform':platform.platform(),
-            'packages':packages,'implementation_sha256':code.hexdigest()}
+    # Source .py files do not exist in a PyInstaller onefile extraction.
+    # Preserve source provenance via a generated build-time manifest instead.
+    if getattr(sys, 'frozen', False):
+        manifest_path = Path(getattr(sys, '_MEIPASS', '')) / 'build_manifest.json'
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            implementation_hash = manifest['implementation_sha256']
+        except (OSError, ValueError, KeyError):
+            implementation_hash = None
+    else:
+        from history.attempts import digest
+        root = Path(__file__).resolve().parents[1]
+        files = [root / 'main.py']
+        for directory in ('compute', 'history', 'ml'):
+            files.extend((root / directory).rglob('*.py'))
+        import hashlib
+        code = hashlib.sha256()
+        for path in sorted(files):
+            code.update(path.relative_to(root).as_posix().encode())
+            code.update(digest(path).encode())
+        implementation_hash = code.hexdigest()
+    return {'python': sys.version.split()[0], 'platform': platform.platform(),
+            'packages': packages, 'implementation_sha256': implementation_hash}
 
 
 LABELS={'completed':'Готово','partial_failed':'Частично выполнено','failed':'Ошибка',

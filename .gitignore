@@ -109,8 +109,6 @@ visualizations/
 processed/
 processed_images/
 
-
-# Tests, mathematics docs and source analyses belong in version control.
 benchmarks/
 tests/
 actual*.zip

@@ -28,10 +28,12 @@ def setup_cuda_environment():
     )
 
     # Автоматический поиск пути CUDA
+    # The frozen runtime hook sets CUDA_PATH to the bundled toolkit. Respect it
+    # before any developer-specific CUDA installation on the build machine.
     cuda_paths = [
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.5",
         os.environ.get('CUDA_PATH'),
         os.environ.get('CUDA_HOME'),
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.5",
     ]
 
     for path in cuda_paths:
@@ -53,7 +55,7 @@ def setup_cuda_environment():
 
 # настройки для подавления предупреждений
 os.environ['CUPY_CUDA_DISABLE_CUBIN_CACHE'] = '1'
-os.environ['CUPY_CACHE_DIR'] = os.path.join(os.path.expanduser('~'), '.cupy', 'cache')
+os.environ.setdefault('CUPY_CACHE_DIR', os.path.join(os.path.expanduser('~'), '.cupy', 'cache'))
 
 import threading
 import time
@@ -268,7 +270,8 @@ class ImageProcessor:
         return True
 
     def create_downloads_folder(self, folder_name):
-        downloads_path = os.path.join(os.path.expanduser('~'), 'Downloads')
+        from utils.app_paths import research_downloads_dir
+        downloads_path = str(research_downloads_dir())
         self.root_folder_path = os.path.join(downloads_path, folder_name)
         try:
             os.makedirs(self.root_folder_path, exist_ok=True)
@@ -8041,10 +8044,11 @@ class App(TkinterApp):
                 label.configure(text="ROI-анализ пока доступен только в CWT 1D")
             elif task is not None and getattr(task, "has_roi", False):
                 label.configure(text=(
-                    f"Выделено: {len(task.roi_descriptors())} областей."
+                    f"ROI активны: {len(task.roi_descriptors())} областей · "
+                    "пересечения допустимы · отдельный анализ точек"
                 ))
             else:
-                label.configure(text="")
+                label.configure(text="ROI не используются — анализируется всё изображение")
 
     def open_roi_editor(self):
         task = getattr(self, "current_task", None)

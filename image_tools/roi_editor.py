@@ -6,6 +6,9 @@ scrolling and presentation-only style properties never modify scientific masks.
 from __future__ import annotations
 
 import tkinter as tk
+import os
+import time
+from collections import defaultdict
 from tkinter import colorchooser
 
 import customtkinter as ctk
@@ -49,6 +52,10 @@ class ROIEditor(ctk.CTkToplevel):
         self._image_x = 0.0
         self._image_y = 0.0
         self._cached_composite = None
+        self._source_rgb = np.asarray(self.image, dtype=np.uint8).copy()
+        # Cache mask edges by mask identity: editing a mask creates a new array.
+        # Adjusting colours/transparency must never re-apply full-image erosion.
+        self._boundary_cache = {}
         self._undo = []
         # Tk <Configure> can fire while widgets are still being constructed.
         # Ignore it until the status label and the entire editor are ready.
@@ -61,6 +68,14 @@ class ROIEditor(ctk.CTkToplevel):
         self._display_source = None
         self._display_size = None
         self._region_refresh_job = None
+        self._cards_need_refresh = False
+        self._preview_job = None  # Legacy guard: previews now update synchronously.
+        self._pending_preview_xy = None
+        self._draft_job = None  # Legacy guard: draft lines now update synchronously.
+        self._draft_rendered_index = 0
+        self._perf_enabled = os.getenv("WAVELETS_ROI_PROFILE", "").lower() in ("1", "true", "yes")
+        self._perf_stats = defaultdict(lambda: [0, 0.0, 0.0])
+        self._perf_timer = None
 
         outer = ctk.CTkFrame(self, fg_color="#25272A", corner_radius=0)
         outer.pack(fill="both", expand=True, padx=8, pady=8)
@@ -137,10 +152,13 @@ class ROIEditor(ctk.CTkToplevel):
         self._refresh_cards()
         self._set_mode("lasso")
         self.after_idle(self._fit)
+        if self._perf_enabled:
+            self._perf_timer = self.after(5000, self._print_perf)
         self.grab_set()
         self.focus_set()
 
     def _set_mode(self, mode):
+        self._cancel_draft_render()
         self.mode = mode
         for key, btn in self.mode_buttons.items():
             btn.configure(fg_color=AppTheme.PRIMARY if mode == key else "#454950")
@@ -192,11 +210,11 @@ class ROIEditor(ctk.CTkToplevel):
         return "break"
 
     def _image_point(self, event):
+        # Scalar np.clip creates a NumPy dispatch for every mouse coordinate.
         x = (self.canvas.canvasx(event.x) - self._image_x) / self.zoom
         y = (self.canvas.canvasy(event.y) - self._image_y) / self.zoom
-        x = float(np.clip(x, 0, self.image.width - 1))
-        y = float(np.clip(y, 0, self.image.height - 1))
-        return x, y
+        return (max(0., min(x, self.image.width - 1.)),
+                max(0., min(y, self.image.height - 1.)))
 
     def _inside_image(self, event):
         x = self.canvas.canvasx(event.x) - self._image_x
@@ -204,27 +222,99 @@ class ROIEditor(ctk.CTkToplevel):
         return 0 <= x < self.image.width * self.zoom and 0 <= y < self.image.height * self.zoom
 
     def _move_preview(self, event):
-        if self.mode == "lasso" or not self._inside_image(event):
+        """Move the on-canvas cursor on the input event, without ``after()``.
+
+        The preview itself takes <1 ms on typical images.  Delaying it with
+        after(8) adds Windows/Tk timer resolution (often 15-30 ms) to input
+        latency, even with an idle main thread.  The existing Canvas oval is
+        reused; moving it is independent of the mask and raster redraw.
+        """
+        if self.mode == "lasso":
             self._hide_preview()
             return
-        x, y = self._image_point(event)
-        cx = self._image_x + x * self.zoom
-        cy = self._image_y + y * self.zoom
-        radius = max(1.0, self.brush_size * self.zoom / 2)
+        self._pending_preview_xy = (event.x, event.y)
+        self._render_preview()
+
+    def _render_preview(self):
+        self._preview_job = None
+        xy = self._pending_preview_xy
+        if xy is None:
+            return
+        t0 = time.perf_counter() if getattr(self, "_perf_enabled", False) else 0.
+        x, y = xy
+        cx = self.canvas.canvasx(x)
+        cy = self.canvas.canvasy(y)
+        ix, iy = cx - self._image_x, cy - self._image_y
+        if not (0 <= ix < self.image.width * self.zoom and
+                0 <= iy < self.image.height * self.zoom):
+            self._hide_preview()
+            return
+        radius = max(1., self.brush_size * self.zoom / 2)
         coords = (cx - radius, cy - radius, cx + radius, cy + radius)
         if self._preview_id is None:
             self._preview_id = self.canvas.create_oval(
                 *coords, outline="#F0B55A", width=1, tags="brush_preview")
             self.canvas.tag_raise(self._preview_id)
         else:
-            # Moving the preview must not change the canvas stacking order.
-            # Reordering items on every mouse event is expensive in Tk.
             self.canvas.coords(self._preview_id, *coords)
+        if getattr(self, "_perf_enabled", False):
+            self._record_perf("preview", time.perf_counter() - t0)
 
     def _hide_preview(self, _event=None):
+        self._pending_preview_xy = None
+        job = getattr(self, "_preview_job", None)
+        if job is not None:
+            self.after_cancel(job)
+            self._preview_job = None
         if self._preview_id is not None:
             self.canvas.delete(self._preview_id)
             self._preview_id = None
+
+    def _cancel_draft_render(self):
+        job = getattr(self, "_draft_job", None)
+        if job is not None:
+            self.after_cancel(job)
+            self._draft_job = None
+
+    def _schedule_draft_render(self):
+        """Update the in-progress stroke immediately, without a Tk timer.
+
+        A draft consists of short, reused polylines (at most 128 coordinates
+        each), so adding a point needs only one inexpensive Canvas.coords call.
+        Full mask rasterization still waits until mouse release.
+        """
+        self._render_draft()
+
+    def _render_draft(self):
+        """Flush all collected mouse samples in bounded-size Canvas polylines."""
+        self._draft_job = None
+        if len(self._drawing) < 2:
+            return
+        start = max(1, self._draft_rendered_index)
+        dirty_segment = False
+        for index in range(start, len(self._drawing)):
+            last, point = self._drawing[index - 1], self._drawing[index]
+            xy = (self._image_x + point[0] * self.zoom,
+                  self._image_y + point[1] * self.zoom)
+            if self._draft_id is None or len(self._draft_coords) >= 128:
+                if dirty_segment:
+                    self.canvas.coords(self._draft_id, *self._draft_coords)
+                    dirty_segment = False
+                self._draft_coords = [self._image_x + last[0] * self.zoom,
+                                      self._image_y + last[1] * self.zoom, *xy]
+                line_width = (max(1, round(self.brush_size * self.zoom))
+                              if self.mode == "brush" else 2)
+                self._draft_id = self.canvas.create_line(
+                    *self._draft_coords, fill="#F0B55A", width=line_width,
+                    tags="draft", capstyle="round")
+                if self._preview_id is not None:
+                    self.canvas.tag_raise(self._preview_id)
+            else:
+                self._draft_coords.extend(xy)
+                dirty_segment = True
+        if dirty_segment:
+            self.canvas.coords(self._draft_id, *self._draft_coords)
+        self._draft_rendered_index = len(self._drawing)
 
     def _press(self, event):
         if not self._inside_image(event):
@@ -238,6 +328,7 @@ class ROIEditor(ctk.CTkToplevel):
         self.canvas.delete("draft")
         self._draft_id = None
         self._draft_coords = []
+        self._draft_rendered_index = 0
         self._drawing = [p]
         if self.mode == "brush" and self.active_id is None:
             self.status.configure(text="Создайте область инструментом «Выделение», "
@@ -258,32 +349,21 @@ class ROIEditor(ctk.CTkToplevel):
         p = self._image_point(event)
         if abs(p[0] - self._drawing[-1][0]) + abs(p[1] - self._drawing[-1][1]) < 0.7:
             return
-        last = self._drawing[-1]
         self._drawing.append(p)
-        xy = (self._image_x + p[0] * self.zoom,
-              self._image_y + p[1] * self.zoom)
-        if self._draft_id is None or len(self._draft_coords) >= 128:
-            # Keep short polyline segments, not hundreds of Canvas items nor
-            # one ever-growing Canvas.coords() payload (quadratic work).
-            self._draft_coords = [self._image_x + last[0] * self.zoom,
-                                  self._image_y + last[1] * self.zoom]
-            self._draft_coords.extend(xy)
-            line_width = (max(1, round(self.brush_size * self.zoom))
-                          if self.mode == "brush" else 2)
-            self._draft_id = self.canvas.create_line(
-                *self._draft_coords, fill="#F0B55A", width=line_width,
-                tags="draft", capstyle="round")
-            if self._preview_id is not None:
-                self.canvas.tag_raise(self._preview_id)
-        else:
-            self._draft_coords.extend(xy)
-            self.canvas.coords(self._draft_id, *self._draft_coords)
+        self._schedule_draft_render()
+        if self.mode == "brush":
+            self._move_preview(event)
 
     def _erase_between(self, start, end):
+        t0 = time.perf_counter() if getattr(self, "_perf_enabled", False) else 0.
         touched = regions_touched_by_stroke(
             self.regions, [start, end], self.brush_size, visible_only=True)
         if not touched:
+            if getattr(self, "_perf_enabled", False):
+                self._record_perf("eraser_hit_test", time.perf_counter() - t0)
             return
+        if getattr(self, "_perf_enabled", False):
+            self._record_perf("eraser_hit_test", time.perf_counter() - t0)
         if not self._erase_undo_taken:
             self._remember_undo()
             self._erase_undo_taken = True
@@ -295,26 +375,40 @@ class ROIEditor(ctk.CTkToplevel):
         self._schedule_region_refresh()
 
     def _schedule_region_refresh(self):
-        """Coalesce expensive CTk card reconstruction and PhotoImage updates."""
+        """Erase immediately, but never rebuild CustomTkinter cards during drag.
+
+        Rebuilding dozens of CTk widgets inside B1-Motion blocks the OS cursor
+        and piles up input messages.  Only the raster is refreshed while the
+        mouse is down; cards are rebuilt once after mouse release.
+        """
+        self._cards_need_refresh = True
+        self._schedule_raster_refresh()
+
+    def _schedule_raster_refresh(self):
         if not getattr(self, "_ui_ready", False):
-            # Headless/unit-test callers have no live Tk event loop.
-            self._refresh_cards()
+            if getattr(self, "_cards_need_refresh", False):
+                self._refresh_cards()
+                self._cards_need_refresh = False
             self._redraw()
-            return
-        if self._region_refresh_job is None:
-            self._region_refresh_job = self.after(35, self._commit_region_refresh)
+        elif self._region_refresh_job is None:
+            self._region_refresh_job = self.after(45, self._commit_region_refresh)
 
     def _commit_region_refresh(self):
         self._region_refresh_job = None
         if not self._ui_ready:
             return
-        self._refresh_cards()
+        # A heavy CTk rebuild is delayed until the active erase gesture ends.
+        if self._cards_need_refresh and self._last_erase_point is None:
+            self._refresh_cards()
+            self._cards_need_refresh = False
         self._redraw()
 
     def _flush_region_refresh(self):
         job = self._region_refresh_job
         if job is not None:
             self.after_cancel(job)
+            self._region_refresh_job = None
+        if self._cards_need_refresh or job is not None:
             self._commit_region_refresh()
 
     def _release(self, _event):
@@ -326,6 +420,7 @@ class ROIEditor(ctk.CTkToplevel):
         if not self._drawing:
             return
         points = self._drawing
+        self._cancel_draft_render()
         self._drawing = []
         self.canvas.delete("draft")
         self._draft_id = None
@@ -405,6 +500,7 @@ class ROIEditor(ctk.CTkToplevel):
         self._redraw()
 
     def _refresh_cards(self):
+        t0 = time.perf_counter() if getattr(self, "_perf_enabled", False) else 0.
         for child in self.card_container.winfo_children():
             child.destroy()
         self.regions_heading.configure(text=f"Выделенные области: {len(self.regions)}")
@@ -467,6 +563,8 @@ class ROIEditor(ctk.CTkToplevel):
                 fg_color=region.color, hover_color=region.color,
                 command=lambda i=region.id: self._choose_color(i),
             ).grid(row=0, column=2, sticky="e")
+        if getattr(self, "_perf_enabled", False):
+            self._record_perf("cards", time.perf_counter() - t0)
 
     def _select(self, region_id):
         self.active_id = region_id
@@ -481,19 +579,46 @@ class ROIEditor(ctk.CTkToplevel):
                 region.name = name
 
     def _composite(self):
+        """Composite outlines using cached edge coordinates, not repeated erosion.
+
+        In particular, opacity/visibility changes never scan each mask to
+        identify its boundary.  Edge cache keys use exact mask object identity;
+        brush strokes and Ctrl+Z create replacement arrays and invalidate it.
+        """
         if self._cached_composite is not None:
             return self._cached_composite
-        image = np.asarray(self.image.convert("RGBA")).copy()
+        t0 = time.perf_counter() if self._perf_enabled else 0
+        image = self._source_rgb.copy()
+        present = {region.id for region in self.regions.regions}
+        for region_id in list(self._boundary_cache):
+            if region_id not in present:
+                del self._boundary_cache[region_id]
         for region in self.regions.regions:
-            if not region.visible or not region.mask.any():
+            if not region.visible or region.opacity <= 0:
                 continue
-            outline = region.mask & ~binary_erosion(region.mask)
-            rgb = tuple(int(region.color[i:i+2], 16) for i in (1, 3, 5))
+            cache = self._boundary_cache.get(region.id)
+            if cache is None or cache[0] is not region.mask:
+                if not region.mask.any():
+                    coords = (np.empty(0, dtype=np.intp), np.empty(0, dtype=np.intp))
+                else:
+                    boundary = region.mask & ~binary_erosion(region.mask)
+                    coords = np.nonzero(boundary)
+                self._boundary_cache[region.id] = (region.mask, coords)
+            else:
+                coords = cache[1]
+            if coords[0].size == 0:
+                continue
+            rgb = np.array([int(region.color[i:i + 2], 16) for i in (1, 3, 5)],
+                           dtype=np.float32)
             alpha = region.opacity
-            if not outline.any():
-                continue
-            image[outline, :3] = np.clip(np.asarray(rgb) * alpha + image[outline, :3] * (1 - alpha), 0, 255).astype(np.uint8)
-        self._cached_composite = Image.fromarray(image, "RGBA").convert("RGB")
+            if alpha >= 1:
+                image[coords] = rgb.astype(np.uint8)
+            else:
+                original = image[coords]
+                image[coords] = (original * (1. - alpha) + rgb * alpha).astype(np.uint8)
+        self._cached_composite = Image.fromarray(image, "RGB")
+        if self._perf_enabled:
+            self._record_perf("composite", time.perf_counter() - t0)
         return self._cached_composite
 
     def _redraw(self):
@@ -505,22 +630,27 @@ class ROIEditor(ctk.CTkToplevel):
         height = max(1, int(round(self.image.height * self.zoom)))
         self._image_x = max(0, (self.canvas.winfo_width() - width) // 2)
         self._image_y = max(0, (self.canvas.winfo_height() - height) // 2)
+        t0 = time.perf_counter() if self._perf_enabled else 0
         composite = self._composite()
-        # Resize/PhotoImage are expensive, especially with multiple ROIs.
-        # Reuse the displayed raster for layout-only configure events.
-        if (self._photo is None or self._display_source is not composite or
-                self._display_size != (width, height)):
-            scaled = composite.resize((width, height), Image.Resampling.BILINEAR)
+        # Never touch Canvas image configuration if PhotoImage already matches.
+        changed = (self._photo is None or self._display_source is not composite or
+                   self._display_size != (width, height))
+        if changed:
+            scaled = (composite if composite.size == (width, height) else
+                      composite.resize((width, height), Image.Resampling.BILINEAR))
             self._photo = ImageTk.PhotoImage(scaled, master=self.canvas)
             self._display_source = composite
             self._display_size = (width, height)
         if self._image_id is None:
             self._image_id = self.canvas.create_image(self._image_x, self._image_y,
                                                       image=self._photo, anchor="nw")
+            self.canvas.tag_lower(self._image_id)
         else:
             self.canvas.coords(self._image_id, self._image_x, self._image_y)
-            self.canvas.itemconfigure(self._image_id, image=self._photo)
-        self.canvas.tag_lower(self._image_id)
+            if changed:
+                self.canvas.itemconfigure(self._image_id, image=self._photo)
+        if self._perf_enabled:
+            self._record_perf("redraw", time.perf_counter() - t0)
         self.canvas.configure(scrollregion=(0, 0, max(width, self.canvas.winfo_width()),
                                             max(height, self.canvas.winfo_height())))
         self.status.configure(text=(f"{self.image.width} × {self.image.height} пикс. · "
@@ -536,10 +666,28 @@ class ROIEditor(ctk.CTkToplevel):
         self.destroy()
 
     def _cancel_pending_refresh(self):
-        job = self._region_refresh_job
-        if job is not None:
-            self.after_cancel(job)
-            self._region_refresh_job = None
+        for name in ("_region_refresh_job", "_preview_job", "_draft_job", "_perf_timer"):
+            job = getattr(self, name, None)
+            if job is not None:
+                self.after_cancel(job)
+                setattr(self, name, None)
+
+    def _record_perf(self, label, elapsed):
+        counters = self._perf_stats[label]
+        counters[0] += 1
+        counters[1] += elapsed * 1000
+        counters[2] = max(counters[2], elapsed * 1000)
+
+    def _print_perf(self):
+        if not self._perf_enabled:
+            return
+        summary = ", ".join(
+            f"{label}: {count}x mean={total / count:.1f}ms max={worst:.1f}ms"
+            for label, (count, total, worst) in sorted(self._perf_stats.items()) if count)
+        if summary:
+            print("[ROI PERF]", summary, flush=True)
+            self._perf_stats.clear()
+        self._perf_timer = self.after(5000, self._print_perf)
 
     def _cancel(self):
         self._cancel_pending_refresh()
